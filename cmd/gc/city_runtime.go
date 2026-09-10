@@ -861,6 +861,23 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	defer pokeDB.cancelPending()
 	defer ctrlDB.cancelPending()
 
+	// Spacing gate for every full reconcile tick (patrol and event-driven
+	// fires alike). The gate, not the patrol ticker, owns when a tick may
+	// START: a tick that outlasts patrol_interval would otherwise hand the
+	// loop a buffered next tick the instant it returns — back-to-back ticks
+	// that turn the demand path's bd subprocess reads into a sustained spawn
+	// loop (see reconcile_gate.go).
+	gate := newReconcileGate(time.Now, reconcileGateJitter, nil)
+	defer gate.cancelPending()
+	gatedRunTick := func(trigger string) {
+		minGap := daemonMinTickInterval(cr.cfg)
+		if !gate.trigger(trigger, minGap) {
+			return
+		}
+		runTick(trigger)
+		gate.tickCompleted(minGap)
+	}
+
 	for {
 		// Re-read on every iteration so a hot reload of city.toml takes
 		// effect on the next event without disturbing in-flight timers.
@@ -871,14 +888,27 @@ func (cr *CityRuntime) run(ctx context.Context) {
 			// pending event-driven fires are redundant — drop them.
 			pokeDB.cancelPending()
 			ctrlDB.cancelPending()
-			runTick("patrol")
+			gatedRunTick("patrol")
+			// Rearm the patrol from the tick boundary rather than letting the
+			// ticker run free: after a tick that outlasted the interval the
+			// channel already holds a buffered fire, and starting the next
+			// tick from it is the back-to-back shape the gate exists to
+			// prevent. Resetting here paces patrol at max(interval, gate).
+			ticker.Reset(interval)
 		case <-cr.pokeCh:
 			// Event-driven wake path: sling or API assigned work to a sleeping
 			// session. Arm the debouncer; the deferred fire runs runTick("poke")
 			// once the burst settles.
 			pokeDB.arm(debounce)
 		case <-pokeDB.fired():
-			runTick("poke")
+			gatedRunTick("poke")
+		case <-gate.fired():
+			// A trigger parked by the gate (spacing window or failure backoff)
+			// became eligible; run the collapsed tick now. take() can be empty
+			// when shutdown drained the fire — nothing to run then.
+			if trigger := gate.take(); trigger != "" {
+				gatedRunTick(trigger)
+			}
 		case <-cr.nudgeWakeCh:
 			cr.safeTick(func() {
 				cr.nudgeDispatchTick(ctx)

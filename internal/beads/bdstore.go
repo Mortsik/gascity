@@ -222,6 +222,7 @@ func recordBDExecTelemetry(name, dir string, args []string, start time.Time, out
 	if name != "bd" {
 		return
 	}
+	noteBDExecOutcome(err)
 	traceExit := 0
 	if err != nil {
 		var exitErr *exec.ExitError

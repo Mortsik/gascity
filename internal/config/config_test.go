@@ -3505,6 +3505,44 @@ func TestDaemonPatrolIntervalInvalid(t *testing.T) {
 	}
 }
 
+func TestDaemonMinTickIntervalDefault(t *testing.T) {
+	if DefaultMinTickInterval != 15*time.Second {
+		t.Fatalf("DefaultMinTickInterval = %v, want 15s", DefaultMinTickInterval)
+	}
+	d := DaemonConfig{}
+	if got := d.MinTickIntervalDuration(); got != DefaultMinTickInterval {
+		t.Errorf("MinTickIntervalDuration() = %v, want default %v", got, DefaultMinTickInterval)
+	}
+}
+
+func TestDaemonMinTickIntervalCustom(t *testing.T) {
+	d := DaemonConfig{MinTickInterval: "1m"}
+	got := d.MinTickIntervalDuration()
+	if got != time.Minute {
+		t.Errorf("MinTickIntervalDuration() = %v, want 1m", got)
+	}
+}
+
+func TestDaemonMinTickIntervalInvalid(t *testing.T) {
+	d := DaemonConfig{MinTickInterval: "not-a-duration"}
+	got := d.MinTickIntervalDuration()
+	if got != DefaultMinTickInterval {
+		t.Errorf("MinTickIntervalDuration() = %v, want %v (default for invalid)", got, DefaultMinTickInterval)
+	}
+}
+
+func TestDaemonMinTickIntervalZeroDisables(t *testing.T) {
+	// "0s" and negatives disable the floor — distinct from empty/invalid,
+	// which mean "default": an operator restoring sub-second event-driven
+	// responsiveness must be able to opt out entirely.
+	for _, v := range []string{"0s", "-5s"} {
+		d := DaemonConfig{MinTickInterval: v}
+		if got := d.MinTickIntervalDuration(); got != 0 {
+			t.Errorf("MinTickInterval=%q: MinTickIntervalDuration() = %v, want 0 (disabled)", v, got)
+		}
+	}
+}
+
 func TestParseDaemonConfig(t *testing.T) {
 	data := []byte(`
 [workspace]

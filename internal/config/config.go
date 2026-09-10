@@ -2519,6 +2519,13 @@ type DaemonConfig struct {
 	GraphWorkflows bool `toml:"graph_workflows,omitempty"`
 	// PatrolInterval is the health patrol interval. Duration string (e.g., "30s", "5m", "1h"). Defaults to "30s".
 	PatrolInterval string `toml:"patrol_interval,omitempty" jsonschema:"default=30s"`
+	// MinTickInterval is the minimum spacing between reconcile ticks, measured
+	// from the END of one tick to the START of the next, for every trigger
+	// (patrol, poke, control-dispatcher). A tick that outlasts PatrolInterval
+	// otherwise fires the next one back-to-back, which turns the controller's
+	// bd subprocess reads into a sustained spawn loop. Duration string
+	// (e.g., "15s", "1m"); "0s" disables the floor. Defaults to "15s".
+	MinTickInterval string `toml:"min_tick_interval,omitempty" jsonschema:"default=15s"`
 	// MaxRestarts is the maximum number of agent restarts within RestartWindow before
 	// the agent is quarantined. 0 means unlimited (no crash loop detection). Defaults to 5.
 	MaxRestarts *int `toml:"max_restarts,omitempty" jsonschema:"default=5"`
@@ -2757,6 +2764,29 @@ func (d *DaemonConfig) AutoPruneWorkerDirEnabled() bool {
 // Defaults to 30s if empty or unparseable.
 func (d *DaemonConfig) PatrolIntervalDuration() time.Duration {
 	return durationOr(d.PatrolInterval, 30*time.Second)
+}
+
+// DefaultMinTickInterval is the default minimum spacing between reconcile
+// ticks ([daemon].min_tick_interval).
+const DefaultMinTickInterval = 15 * time.Second
+
+// MinTickIntervalDuration returns the minimum spacing between reconcile ticks
+// as a time.Duration. Defaults to 15s if empty or unparseable. An explicit
+// "0s" (or any negative value) disables the floor: an operator restoring
+// sub-second event-driven responsiveness must be able to opt out entirely,
+// which durationOr cannot express because empty already means "default".
+func (d *DaemonConfig) MinTickIntervalDuration() time.Duration {
+	if strings.TrimSpace(d.MinTickInterval) == "" {
+		return DefaultMinTickInterval
+	}
+	dur, err := time.ParseDuration(d.MinTickInterval)
+	if err != nil {
+		return DefaultMinTickInterval
+	}
+	if dur < 0 {
+		return 0
+	}
+	return dur
 }
 
 // TickDebounceDuration returns the tick-debounce window as a
@@ -4591,6 +4621,7 @@ func gastownCityWithWorkspace(_ string, ws Workspace, providers map[string]Provi
 		DefaultRigImportOrder: []string{"gastown"},
 		Daemon: DaemonConfig{
 			PatrolInterval:  "30s",
+			MinTickInterval: "15s",
 			MaxRestarts:     &maxRestarts,
 			RestartWindow:   "1h",
 			ShutdownTimeout: "5s",
