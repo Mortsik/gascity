@@ -396,10 +396,18 @@ func TestRenderSupervisorSystemdTemplate(t *testing.T) {
 		XDGRuntimeDir: "/tmp/gc-run",
 		LaunchdLabel:  defaultSupervisorLaunchdLabel,
 		Path:          "/usr/local/bin:/usr/bin:/bin",
+		// ExtraEnv carries the full merged set (the launchd render embeds it
+		// verbatim); the systemd render must only see the non-secret subset.
 		ExtraEnv: []supervisorServiceEnvVar{
 			{Name: "ANTHROPIC_API_KEY", Value: `sk-"ant"\value`},
 			{Name: "OPENAI_API_KEY", Value: "sk-openai-123"},
+			{Name: "LC_ALL", Value: "en_US.UTF-8"},
 		},
+		UnitExtraEnv: []supervisorServiceEnvVar{
+			{Name: "LC_ALL", Value: "en_US.UTF-8"},
+		},
+		SecretsEnvFile:     "/home/user/.gc/secrets.env",
+		LoadSecretsEnvFile: true,
 	}
 
 	content, err := renderSupervisorTemplate(supervisorSystemdTemplate, data)
@@ -416,11 +424,18 @@ func TestRenderSupervisorSystemdTemplate(t *testing.T) {
 		`Environment=GC_HOME="/home/user/.gc"`,
 		`Environment=XDG_RUNTIME_DIR="/tmp/gc-run"`,
 		`Environment=PATH="/usr/local/bin:/usr/bin:/bin"`,
-		`Environment=ANTHROPIC_API_KEY="sk-\"ant\"\\value"`,
-		`Environment=OPENAI_API_KEY="sk-openai-123"`,
+		`Environment=LC_ALL="en_US.UTF-8"`,
+		`EnvironmentFile=-/home/user/.gc/secrets.env`,
 	} {
 		if !strings.Contains(content, check) {
 			t.Fatalf("systemd template missing %q", check)
+		}
+	}
+	// The unit file is readable by anything running as the user
+	// (`systemctl --user cat`), so no credential value may appear in it.
+	for _, secret := range []string{`sk-"ant"\value`, "sk-openai-123", "ANTHROPIC_API_KEY=", "OPENAI_API_KEY="} {
+		if strings.Contains(content, secret) {
+			t.Fatalf("systemd template leaked secret %q", secret)
 		}
 	}
 	wantBlock := "[Service]\nType=simple\n# Signal only the main supervisor PID on stop. The systemd default\n" +

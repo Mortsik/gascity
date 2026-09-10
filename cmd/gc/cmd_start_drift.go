@@ -590,5 +590,7 @@ func spawnDetachedSupervisor(exe string, argv ...string) error {
 	child.Stderr = logFile
 	child.Env = os.Environ()
 	disableProductMetricsForChild(child)
-	return child.Start()
+	// Reaped detach so a child that exits while this (short-lived) process
+	// is still waiting on readiness cannot linger as a zombie.
+	return pidutil.StartDetached(child)
 }

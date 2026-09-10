@@ -1780,15 +1780,19 @@ func ensureNudgePoller(cityPath, agentName, sessionName string) error {
 		cmd.Stderr = io.Discard
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		disableProductMetricsForChild(cmd)
-		if err := cmd.Start(); err != nil {
+		// Reaped detach: the poller must survive this process, but its exit
+		// status still has to be collected — otherwise every poller that dies
+		// while its spawner (often the long-lived supervisor) is alive leaves
+		// a zombie behind.
+		if err := pidutil.StartDetached(cmd); err != nil {
 			return err
 		}
 		if err := writeNudgePollerPID(pidPath, cmd.Process.Pid); err != nil {
+			// The parked Wait goroutine collects the exit status.
 			_ = cmd.Process.Kill()
-			_ = cmd.Process.Release()
 			return err
 		}
-		return cmd.Process.Release()
+		return nil
 	})
 }
 

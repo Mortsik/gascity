@@ -661,15 +661,18 @@ func ensureSessionSubmitPoller(cityPath, agentName, sessionName string) error {
 		cmd.Stdout = logFile
 		cmd.Stderr = logFile
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		if err := cmd.Start(); err != nil {
+		// Reaped detach: the poller outlives this call (often running inside
+		// the long-lived supervisor), but its exit status must still be
+		// collected or every poller exit leaves a zombie under the spawner.
+		if err := pidutil.StartDetached(cmd); err != nil {
 			return err
 		}
 		if err := writeSessionSubmitPollerPID(pidPath, cmd.Process.Pid); err != nil {
+			// The parked Wait goroutine collects the exit status.
 			_ = cmd.Process.Kill()
-			_ = cmd.Process.Release()
 			return err
 		}
-		return cmd.Process.Release()
+		return nil
 	})
 }
 

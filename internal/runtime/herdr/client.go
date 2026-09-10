@@ -27,6 +27,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/pidutil"
 )
 
 // client runs `herdr` CLI verbs against a named herdr session and decodes the
@@ -745,10 +747,13 @@ func (c *client) startServer() error {
 	// stranded ephemeral pool spawns in $HOME (unprimed, re-prompted for trust).
 	// Empty cityRoot (city-less construction) leaves cwd inherited, as before.
 	cmd.Dir = c.cityRoot
-	if err := cmd.Start(); err != nil {
+	// Reaped detach: herdr owns the daemon lifetime, but the exit status
+	// still has to be collected — Release() alone leaves every daemon exit
+	// as a zombie under this process, which for the supervisor is a
+	// long-lived parent.
+	if err := pidutil.StartDetached(cmd); err != nil {
 		return fmt.Errorf("herdr server start: %w", err)
 	}
-	_ = cmd.Process.Release() // detach; herdr owns the daemon lifetime
 	for i := 0; i < 40; i++ {
 		if c.serverAlive() {
 			return nil

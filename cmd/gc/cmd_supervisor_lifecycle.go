@@ -26,6 +26,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/execenv"
+	"github.com/gastownhall/gascity/internal/pidutil"
 	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/processgroup"
 	"github.com/gastownhall/gascity/internal/searchpath"
@@ -428,7 +429,8 @@ func terminateProcessGroup(pgid int, timeout time.Duration) error {
 }
 
 func newSupervisorRunCmd(stdout, stderr io.Writer) *cobra.Command {
-	return &cobra.Command{
+	var minTickInterval time.Duration
+	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Run the machine-wide supervisor in the foreground",
 		Long: `Run the machine-wide supervisor in the foreground.
@@ -443,13 +445,24 @@ in the supervisor's environment to disable the tee when the service manager
 already captures output (e.g. a hand-managed systemd unit with
 StandardOutput=journal).`,
 		Args: cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
+		RunE: func(c *cobra.Command, _ []string) error {
+			// Publish the flag as the GC_MIN_TICK_INTERVAL override the hosted
+			// city runtimes read at their reconcile loop: tick spacing is a
+			// per-city setting in city.toml, and a process-wide flag must not
+			// rewrite those files — it wins over them for this process only,
+			// exactly like an exported env would.
+			if c.Flags().Changed("min-tick-interval") {
+				_ = os.Setenv("GC_MIN_TICK_INTERVAL", minTickInterval.String())
+			}
 			if doSupervisorRun(stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
+	cmd.Flags().DurationVar(&minTickInterval, "min-tick-interval", 15*time.Second,
+		`minimum spacing between city reconcile ticks; a tick that outlasts patrol_interval no longer fires the next one back-to-back, so bd subprocess polling stays cadenced (env: GC_MIN_TICK_INTERVAL, per-city: [daemon].min_tick_interval; "0s" disables)`)
+	return cmd
 }
 
 // runSupervisorFunc is the run-loop entry point invoked by
@@ -543,7 +556,10 @@ func doSupervisorStartJSON(stdout, stderr io.Writer, jsonOut bool) int {
 	child.Env = os.Environ()
 	disableProductMetricsForChild(child)
 
-	if err := child.Start(); err != nil {
+	// Reaped detach: this process usually exits soon after the readiness
+	// poll, but if the child dies first (port collision, bad install) it
+	// must not sit as a zombie for the rest of the wait window.
+	if err := pidutil.StartDetached(child); err != nil {
 		fmt.Fprintf(stderr, "gc supervisor start: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -997,7 +1013,27 @@ type supervisorServiceData struct {
 	LaunchdLabel  string
 	SafeName      string
 	Path          string
-	ExtraEnv      []supervisorServiceEnvVar
+	// ExtraEnv is the full merged service env, provider credentials included.
+	// Only the launchd render embeds it verbatim: launchd has no
+	// EnvironmentFile equivalent, so the plist must carry the values. The
+	// systemd render embeds UnitExtraEnv instead and points the unit at the
+	// 0600 secrets file, because a unit file is readable by anything running
+	// as the user (systemctl --user cat) and must not carry secret values.
+	ExtraEnv []supervisorServiceEnvVar
+	// UnitExtraEnv is the subset of ExtraEnv that may be embedded as
+	// Environment= lines in the systemd unit: everything except provider
+	// credentials (supervisorUnitEnv). systemd sets the rest from
+	// ${GC_HOME}/secrets.env via EnvironmentFile at start.
+	UnitExtraEnv []supervisorServiceEnvVar
+	// SecretsEnvFile is the absolute path to ${GC_HOME}/secrets.env, rendered
+	// into the systemd unit as an EnvironmentFile reference.
+	SecretsEnvFile string
+	// LoadSecretsEnvFile reports whether the systemd unit may reference the
+	// secrets file. It is false when provider-credential capture is opted out
+	// (GC_SUPERVISOR_OMIT_PROVIDER_CREDS=1): that opt-out's contract is that
+	// the operator delivers credentials by another mechanism, so consulting
+	// the file behind the opt-out's back would change its meaning.
+	LoadSecretsEnvFile bool
 	// PortInUseExitCode is the exit code the supervisor returns on a duplicate
 	// API-port collision; the systemd unit lists it in RestartPreventExitStatus
 	// so a duplicate install does not crash-loop on the shared port.
@@ -1021,16 +1057,20 @@ func buildSupervisorServiceData() (*supervisorServiceData, error) {
 	if supervisor.UsesIsolatedGCHomeOverride() {
 		xdgRuntimeDir = ""
 	}
+	extraEnv, fileTier := supervisorServiceEnvTiers()
 	return &supervisorServiceData{
-		GCPath:            gcPath,
-		LogPath:           supervisorLogPath(),
-		GCHome:            home,
-		XDGRuntimeDir:     xdgRuntimeDir,
-		LaunchdLabel:      supervisorLaunchdLabel(),
-		SafeName:          sanitizeServiceName(filepath.Base(home)),
-		Path:              searchpath.ExpandPath(homeDir, goruntime.GOOS, os.Getenv("PATH")),
-		ExtraEnv:          supervisorServiceExtraEnv(),
-		PortInUseExitCode: supervisorExitCodePortInUse,
+		GCPath:             gcPath,
+		LogPath:            supervisorLogPath(),
+		GCHome:             home,
+		XDGRuntimeDir:      xdgRuntimeDir,
+		LaunchdLabel:       supervisorLaunchdLabel(),
+		SafeName:           sanitizeServiceName(filepath.Base(home)),
+		Path:               searchpath.ExpandPath(homeDir, goruntime.GOOS, os.Getenv("PATH")),
+		ExtraEnv:           extraEnv,
+		UnitExtraEnv:       supervisorUnitEnv(extraEnv, fileTier),
+		SecretsEnvFile:     supervisorSecretsEnvFilePath(),
+		LoadSecretsEnvFile: supervisorProviderCredsCaptureEnabled(),
+		PortInUseExitCode:  supervisorExitCodePortInUse,
 	}, nil
 }
 
@@ -1136,8 +1176,15 @@ var supervisorServiceFixedEnvKeys = map[string]bool{
 	"XDG_RUNTIME_DIR":                     true,
 }
 
-func supervisorServiceExtraEnv() []supervisorServiceEnvVar {
+// supervisorServiceEnvTiers computes the merged service env plus the set of
+// keys whose value was filled from ${GC_HOME}/secrets.env (the "file tier").
+// The systemd render needs the file-tier set to keep those keys out of the
+// unit's Environment= lines: systemd already sets them from the file at
+// start, and re-embedding would copy the secret into a world-of-the-user
+// readable unit file.
+func supervisorServiceEnvTiers() ([]supervisorServiceEnvVar, map[string]bool) {
 	env := make(map[string]string)
+	fileTier := make(map[string]bool)
 	explicitEnvKeys := supervisorServiceExplicitEnvKeys(os.Getenv("GC_SUPERVISOR_ENV"))
 	explicitEnvKeySet := make(map[string]bool, len(explicitEnvKeys))
 	for _, key := range explicitEnvKeys {
@@ -1177,6 +1224,7 @@ func supervisorServiceExtraEnv() []supervisorServiceEnvVar {
 			continue
 		}
 		env[key] = val
+		fileTier[key] = true
 	}
 	// Fall back to `launchctl getenv` for known-allowlisted keys and
 	// for GC_SUPERVISOR_ENV opt-ins. Without this, launchctl-set
@@ -1219,6 +1267,54 @@ func supervisorServiceExtraEnv() []supervisorServiceEnvVar {
 	out := make([]supervisorServiceEnvVar, 0, len(keys))
 	for _, key := range keys {
 		out = append(out, supervisorServiceEnvVar{Name: key, Value: env[key]})
+	}
+	return out, fileTier
+}
+
+// supervisorProviderCredsCaptureEnabled reports whether provider-credential
+// capture from the calling shell is active. It mirrors the gate inside
+// shouldPersistSupervisorEnv so the EnvironmentFile reference and the capture
+// opt-out can never disagree: if the unit still pointed at the secrets file
+// while GC_SUPERVISOR_OMIT_PROVIDER_CREDS=1, credentials an operator placed
+// in that file would be loaded against the opt-out's intent.
+func supervisorProviderCredsCaptureEnabled() bool {
+	return os.Getenv(supervisorOmitProviderCredsEnv) != "1"
+}
+
+// supervisorUnitEnv returns the env that may be embedded as Environment=
+// lines in the systemd unit. Provider credentials never qualify: unit files
+// are readable by anything running as the user (`systemctl --user cat`), so
+// they must carry no secret values — systemd loads that class from the 0600
+// secrets file instead (EnvironmentFile). Keys whose value came from that
+// file are excluded for the same reason: re-embedding them would copy
+// machine-local secrets into the unit. When credential capture is opted out
+// the unit does not reference the file, so file-tier entries stay embedded
+// exactly as before — dropping them there would lose the value at runtime.
+func supervisorUnitEnv(extra []supervisorServiceEnvVar, fileTier map[string]bool) []supervisorServiceEnvVar {
+	if !supervisorProviderCredsCaptureEnabled() {
+		return extra
+	}
+	out := make([]supervisorServiceEnvVar, 0, len(extra))
+	for _, item := range extra {
+		if isProviderCredentialEnv(item.Name) || fileTier[item.Name] {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+// supervisorSecretTierEnv returns the provider-credential subset of the
+// merged service env — the entries `gc supervisor install` persists into
+// ${GC_HOME}/secrets.env so the systemd unit can load them via
+// EnvironmentFile instead of embedding them.
+func supervisorSecretTierEnv(extra []supervisorServiceEnvVar) []supervisorServiceEnvVar {
+	out := make([]supervisorServiceEnvVar, 0, len(extra))
+	for _, item := range extra {
+		if !isProviderCredentialEnv(item.Name) {
+			continue
+		}
+		out = append(out, item)
 	}
 	return out
 }
@@ -1272,6 +1368,139 @@ func supervisorSecretsEnvFileEntries() map[string]string {
 		return nil
 	}
 	return entries
+}
+
+// persistSupervisorSecretsEnvFile merges provider-credential entries
+// captured from the calling shell (or an existing unit being migrated) into
+// ${GC_HOME}/secrets.env, so the systemd unit can reference them via
+// EnvironmentFile instead of embedding secret values into a file that
+// anything running as the user can read. The merge is line-based and
+// idempotent: existing assignments are updated in place, unrelated lines
+// (comments, other keys) are preserved verbatim, and rewriting identical
+// content reports changed=false so reinstalls stay quiet.
+func persistSupervisorSecretsEnvFile(entries []supervisorServiceEnvVar) (bool, error) {
+	if len(entries) == 0 {
+		return false, nil
+	}
+	path := supervisorSecretsEnvFilePath()
+	existing, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return false, fmt.Errorf("reading supervisor secrets file %q: %w", path, err)
+	}
+
+	// Values are written unquoted: both processenv.ParseEnvFile (our reader)
+	// and systemd's EnvironmentFile parser consume them back verbatim. A raw
+	// newline cannot be represented in a dotenv line at all, so a value that
+	// carries one is refused loudly (name only, never the value) rather than
+	// silently truncating the file.
+	updates := make(map[string]string, len(entries))
+	for _, item := range entries {
+		if strings.ContainsAny(item.Value, "\n\r") {
+			return false, fmt.Errorf("provider env %s: value contains a newline; refusing to write it to %s", item.Name, path)
+		}
+		updates[item.Name] = item.Value
+	}
+
+	var lines []string
+	if len(existing) > 0 {
+		lines = strings.Split(strings.TrimSuffix(string(existing), "\n"), "\n")
+	}
+	updated := make(map[string]bool, len(updates))
+	for i, line := range lines {
+		key, _, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(key), "export "))
+		if _, isUpdate := updates[key]; !isUpdate {
+			continue
+		}
+		if _, done := updated[key]; done {
+			// A repeated key: blank the earlier assignment rather than leave
+			// two live copies of one secret differing in value.
+			lines[i] = "# superseded by gc supervisor install: " + key + "="
+			continue
+		}
+		lines[i] = key + "=" + updates[key]
+		updated[key] = true
+	}
+	appended := make([]string, 0, len(updates))
+	for _, item := range entries {
+		if !updated[item.Name] {
+			appended = append(appended, item.Name+"="+item.Value)
+		}
+	}
+	sort.Strings(appended)
+	if len(appended) > 0 {
+		if len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) != "" {
+			lines = append(lines, "")
+		}
+		lines = append(lines, appended...)
+	}
+
+	content := strings.Join(lines, "\n")
+	if len(content) > 0 {
+		content += "\n"
+	}
+	if content == string(existing) {
+		return false, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return false, fmt.Errorf("creating GC_HOME for supervisor secrets file: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		return false, fmt.Errorf("writing supervisor secrets file %q: %w", path, err)
+	}
+	// Chmod after write: a pre-existing file may have carried a wider mode,
+	// and the file now holds credential material.
+	if err := os.Chmod(path, 0o600); err != nil {
+		return false, fmt.Errorf("restricting supervisor secrets file %q: %w", path, err)
+	}
+	return true, nil
+}
+
+// supervisorSystemdUnitSecretEnv extracts provider-credential
+// Environment= assignments from an existing systemd unit's content. Older gc
+// versions embedded credentials straight into the unit; when such a unit is
+// replaced, that embedded copy may be the only surviving one (the reinstall
+// shell often has no token exported), so it migrates into the secrets file
+// before the new unit drops the Environment= line. Only the generator's
+// NAME=quoted-value and the hand-editable NAME=raw-value forms are parsed;
+// anything else in the unit is ignored.
+func supervisorSystemdUnitSecretEnv(unit string) []supervisorServiceEnvVar {
+	var out []supervisorServiceEnvVar
+	index := make(map[string]int)
+	for _, raw := range strings.Split(unit, "\n") {
+		line := strings.TrimSpace(raw)
+		if !strings.HasPrefix(line, "Environment=") {
+			continue
+		}
+		name, value, ok := strings.Cut(strings.TrimPrefix(line, "Environment="), "=")
+		if !ok {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		if !supervisorServiceEnvNameRE.MatchString(name) || !isProviderCredentialEnv(name) {
+			continue
+		}
+		if unquoted, err := strconv.Unquote(value); err == nil {
+			value = unquoted
+		} else {
+			value = strings.TrimSpace(value)
+		}
+		if value == "" {
+			continue
+		}
+		// Later assignments win, matching systemd's own Environment=
+		// precedence for repeated keys.
+		if i, seen := index[name]; seen {
+			out[i] = supervisorServiceEnvVar{Name: name, Value: value}
+			continue
+		}
+		index[name] = len(out)
+		out = append(out, supervisorServiceEnvVar{Name: name, Value: value})
+	}
+	return out
 }
 
 func supervisorServiceExplicitEnvKeys(raw string) []string {
@@ -1400,7 +1629,13 @@ Environment=GC_HOME="{{.GCHome}}"
 {{if .XDGRuntimeDir}}Environment=XDG_RUNTIME_DIR="{{.XDGRuntimeDir}}"
 {{end}}Environment=PATH="{{.Path}}"
 Environment=GC_SUPERVISOR_PRESERVE_SESSIONS_ON_SIGNAL="1"
-{{range .ExtraEnv}}Environment={{systemdenv .Name .Value}}
+{{if .LoadSecretsEnvFile}}# Provider credentials live in this 0600 file, never in the unit itself:
+# unit files are readable by anything running as the user
+# ('systemctl --user cat'). 'gc supervisor install' keeps the file in sync
+# with provider env captured at install time. The leading "-" keeps a
+# missing file non-fatal for installs that carry no credentials.
+EnvironmentFile=-{{systemdpath .SecretsEnvFile}}
+{{end}}{{range .UnitExtraEnv}}Environment={{systemdenv .Name .Value}}
 {{end}}
 
 [Install]
@@ -1955,6 +2190,43 @@ func installSupervisorSystemd(data *supervisorServiceData, stdout, stderr io.Wri
 				"detached (e.g. 'gc supervisor start' without service install).\n",
 			currentUsernameForSystemdHint())
 		return 1
+	}
+
+	// Persist provider credentials into ${GC_HOME}/secrets.env before the
+	// unit is rendered: the new unit no longer embeds them (unit files are
+	// readable by anything running as the user), so failing to write the
+	// file first would drop the credentials at the next supervisor start.
+	// The existing unit's embedded credentials migrate into the file too —
+	// for units written by older gc versions that embedded copy is often
+	// the only surviving one, because the reinstall shell usually has no
+	// token exported. Captured shell env wins; the embedded values only
+	// fill keys nothing else supplied.
+	if data.LoadSecretsEnvFile {
+		secretEnv := supervisorSecretTierEnv(data.ExtraEnv)
+		captured := make(map[string]bool, len(secretEnv))
+		for _, item := range secretEnv {
+			captured[item.Name] = true
+		}
+		for _, item := range supervisorSystemdUnitSecretEnv(string(existing)) {
+			if !captured[item.Name] {
+				secretEnv = append(secretEnv, item)
+				captured[item.Name] = true
+			}
+		}
+		changed, err := persistSupervisorSecretsEnvFile(secretEnv)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc supervisor install: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		if changed {
+			// Key names only: values are credentials and never reach a log.
+			names := make([]string, 0, len(secretEnv))
+			for _, item := range secretEnv {
+				names = append(names, item.Name)
+			}
+			sort.Strings(names)
+			fmt.Fprintf(stdout, "Provider credentials %s stored in %s (0600); the systemd unit loads them via EnvironmentFile and embeds no secret values. Existing units from older gc versions migrate the same way: rerun 'gc supervisor install'.\n", strings.Join(names, ", "), data.SecretsEnvFile) //nolint:errcheck // best-effort stdout
+		}
 	}
 
 	content, err := renderSupervisorTemplate(supervisorSystemdTemplate, data)
