@@ -423,9 +423,28 @@ func wrapError(err error, stderr string, args []string) error {
 	}
 
 	if stderr != "" {
-		return fmt.Errorf("%s: %s", tmuxErrorPrefix(args), stderr)
+		return fmt.Errorf("%s: %s [%s]", tmuxErrorPrefix(args), stderr, argvDigest(args))
 	}
-	return fmt.Errorf("%s: %w", tmuxErrorPrefix(args), err)
+	return fmt.Errorf("%s: %w [%s]", tmuxErrorPrefix(args), err, argvDigest(args))
+}
+
+// argvDigest renders a bounded, per-arg-truncated view of a tmux argv for
+// error suffixes. tmux arguments carry no secrets; the truncation caps how
+// much of a send-keys payload can leak into logs while still showing the
+// flag shape — which is the diagnostic point.
+func argvDigest(args []string) string {
+	parts := make([]string, 0, len(args))
+	for i, a := range args {
+		if i == 8 {
+			parts = append(parts, "...")
+			break
+		}
+		if len(a) > 24 {
+			a = a[:24] + "…"
+		}
+		parts = append(parts, a)
+	}
+	return strings.Join(parts, " ")
 }
 
 // tmuxErrorPrefix names the real subcommand (and -t target) from a full tmux

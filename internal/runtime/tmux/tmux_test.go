@@ -612,32 +612,32 @@ func TestWrapErrorNamesRealSubcommand(t *testing.T) {
 		{
 			"injected -u/-L hide the subcommand",
 			[]string{"-u", "-L", "agentforge", "send-keys", "-t", "%5", "C-u"},
-			`tmux send-keys -t %5: boom`,
+			`tmux send-keys -t %5: boom [-u -L agentforge send-keys -t %5 C-u]`,
 		},
 		{
 			"no socket pair",
 			[]string{"-u", "display-message", "-t", "s1", "-p", "#{x}"},
-			`tmux display-message -t s1: boom`,
+			`tmux display-message -t s1: boom [-u display-message -t s1 -p #{x}]`,
 		},
 		{
 			"subcommand-first argv",
 			[]string{"list-panes", "-a"},
-			`tmux list-panes: boom`,
+			`tmux list-panes: boom [list-panes -a]`,
 		},
 		{
 			"no target present",
 			[]string{"-u", "-L", "sock", "start-server"},
-			`tmux start-server: boom`,
+			`tmux start-server: boom [-u -L sock start-server]`,
 		},
 		{
 			"flags only",
 			[]string{"-u"},
-			`tmux: boom`,
+			`tmux: boom [-u]`,
 		},
 		{
 			"target-like flag after subcommand is not -t",
 			[]string{"-u", "new-session", "-d", "-s", "x"},
-			`tmux new-session: boom`,
+			`tmux new-session: boom [-u new-session -d -s x]`,
 		},
 	}
 	for _, tt := range tests {
