@@ -603,6 +603,51 @@ func TestWrapError(t *testing.T) {
 	}
 }
 
+func TestWrapErrorNamesRealSubcommand(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			"injected -u/-L hide the subcommand",
+			[]string{"-u", "-L", "agentforge", "send-keys", "-t", "%5", "C-u"},
+			`tmux send-keys -t %5: boom`,
+		},
+		{
+			"no socket pair",
+			[]string{"-u", "display-message", "-t", "s1", "-p", "#{x}"},
+			`tmux display-message -t s1: boom`,
+		},
+		{
+			"subcommand-first argv",
+			[]string{"list-panes", "-a"},
+			`tmux list-panes: boom`,
+		},
+		{
+			"no target present",
+			[]string{"-u", "-L", "sock", "start-server"},
+			`tmux start-server: boom`,
+		},
+		{
+			"flags only",
+			[]string{"-u"},
+			`tmux: boom`,
+		},
+		{
+			"target-like flag after subcommand is not -t",
+			[]string{"-u", "new-session", "-d", "-s", "x"},
+			`tmux new-session: boom`,
+		},
+	}
+	for _, tt := range tests {
+		err := wrapError(errors.New("exit status 1"), "boom", tt.args)
+		if err == nil || err.Error() != tt.want {
+			t.Errorf("%s: wrapError(args=%v) = %v, want %q", tt.name, tt.args, err, tt.want)
+		}
+	}
+}
+
 func TestEnsureSessionFresh_NoExistingSession(t *testing.T) {
 	if !hasTmux() {
 		t.Skip("tmux not installed")

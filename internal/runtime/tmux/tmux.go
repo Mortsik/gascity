@@ -423,9 +423,42 @@ func wrapError(err error, stderr string, args []string) error {
 	}
 
 	if stderr != "" {
-		return fmt.Errorf("tmux %s: %s", args[0], stderr)
+		return fmt.Errorf("%s: %s", tmuxErrorPrefix(args), stderr)
 	}
-	return fmt.Errorf("tmux %s: %w", args[0], err)
+	return fmt.Errorf("%s: %w", tmuxErrorPrefix(args), err)
+}
+
+// tmuxErrorPrefix names the real subcommand (and -t target) from a full tmux
+// argv. runCtx injects "-u [-L socket]" ahead of every invocation, so using
+// args[0] reported just "tmux -u:" — hiding which command failed exactly when
+// diagnosis needs it most (2026-09-10 live: 'tmux -u: no current client' with
+// no reproducible source call). The -t target is included when present;
+// anything after it (e.g. a send-keys payload) never is. Callers passing
+// subcommand-first argv (unit tests) get the same treatment.
+func tmuxErrorPrefix(args []string) string {
+	sub := ""
+	rest := args
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == "-L" {
+			i++ // skip the socket name that follows
+			continue
+		}
+		if strings.HasPrefix(rest[i], "-") {
+			continue
+		}
+		sub = rest[i]
+		rest = rest[i+1:]
+		break
+	}
+	if sub == "" {
+		return "tmux"
+	}
+	for j := 0; j+1 < len(rest); j++ {
+		if rest[j] == "-t" {
+			return "tmux " + sub + " -t " + rest[j+1]
+		}
+	}
+	return "tmux " + sub
 }
 
 // probeServerAlive verifies the tmux server bound to SocketName is responsive
