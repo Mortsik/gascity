@@ -1968,12 +1968,19 @@ func (t *Tmux) sendHiddenAttachedText(target, text string) (bool, error) {
 // isTransientSendKeysError returns true if the error from tmux send-keys is
 // transient and safe to retry. "not in a mode" occurs when the target pane's
 // TUI hasn't initialized its input handling yet (common during cold startup).
+// "no current client" surfaces when the target session is torn down or
+// respawned concurrently (2026-09-10 live: a sibling reconciler rollback
+// killed the session between two send-keys of the same startup nudge — C-u
+// landed, the -l paste failed) and tmux falls back to client resolution
+// mid-race; a bounded retry either lands on the respawned session or fails
+// cleanly with a can't-find error, which stays non-transient.
 func isTransientSendKeysError(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "not in a mode")
+	return strings.Contains(msg, "not in a mode") ||
+		strings.Contains(msg, "no current client")
 }
 
 func isCommandTooLongError(err error) bool {

@@ -603,6 +603,25 @@ func TestWrapError(t *testing.T) {
 	}
 }
 
+func TestIsTransientSendKeysErrorClassifiesReconcilerRace(t *testing.T) {
+	tests := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.New("not in a mode"), true},
+		{errors.New("tmux send-keys -t s: no current client"), true},
+		{errors.New("tmux send-keys -t s: no current client\nno current client"), true},
+		{errors.New("tmux send-keys -t s: can't find pane: s"), false},
+		{errors.New("tmux send-keys -t s: no server running"), false},
+	}
+	for _, tt := range tests {
+		if got := isTransientSendKeysError(tt.err); got != tt.want {
+			t.Errorf("isTransientSendKeysError(%v) = %v, want %v", tt.err, got, tt.want)
+		}
+	}
+}
+
 func TestWrapErrorNamesRealSubcommand(t *testing.T) {
 	tests := []struct {
 		name string
