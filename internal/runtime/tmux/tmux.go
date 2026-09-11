@@ -1990,6 +1990,21 @@ func isCommandTooLongError(err error) bool {
 	return strings.Contains(err.Error(), "command too long")
 }
 
+// targetAlive reports whether the nudge target (session name or %pane id)
+// still resolves. known=false means the probe itself failed and liveness is
+// undecidable — callers must treat that as "keep retrying", never as death.
+func (t *Tmux) targetAlive(target string) (alive bool, known bool) {
+	// list-panes resolves both session-name and %pane-id targets and needs no
+	// client; "can't find session/pane" classifies as ErrSessionNotFound.
+	if _, err := t.run("list-panes", "-t", target); err != nil {
+		if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
+			return false, true
+		}
+		return false, false
+	}
+	return true, true
+}
+
 func nextPasteBufferName() string {
 	seq := atomic.AddUint64(&pasteBufferSeq, 1)
 	return fmt.Sprintf("gc-nudge-%d-%d", os.Getpid(), seq)
@@ -2068,6 +2083,16 @@ func (t *Tmux) sendKeysLiteralWithRetry(target, text string, timeout time.Durati
 		}
 		if !isTransientSendKeysError(err) {
 			return err // non-transient (session gone, no server) — fail fast
+		}
+		// The transient error may mean the target was torn down mid-race
+		// (2026-09-10 live: C-u landed, the -l paste failed with "no current
+		// client", and every retry burned the full budget against a corpse a
+		// sibling reconciler had already killed). Before sleeping for another
+		// attempt, verify the target still exists: a verifiably gone target
+		// fails cleanly right now, and an undecidable probe (generic tmux
+		// failure) keeps the bounded retry as the respawn grace.
+		if alive, known := t.targetAlive(target); known && !alive {
+			return fmt.Errorf("target %q gone during nudge (last tmux error: %v): %w", target, err, ErrSessionNotFound)
 		}
 		lastErr = err
 		// Clamp sleep to remaining time so we don't overshoot the deadline.
