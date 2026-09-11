@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
 	"runtime/debug"
 	"sort"
@@ -1495,10 +1496,23 @@ func runPreparedStartCandidate(
 		startCtx, cancel = context.WithTimeout(ctx, startupTimeout)
 	}
 	defer cancel()
+	// Single-writer heartbeat: re-stamp the in-flight lease at the moment this
+	// goroutine actually begins (the enqueue-time stamp from preWakeCommit can
+	// already be old — wake budget, async limiter), and again once the spawn
+	// returns, covering the commit window. Sibling destructive arms read this
+	// same marker and defer while it is fresh.
+	var startLeaseStore beads.Store
+	if store != nil && strings.TrimSpace(item.candidate.info.ID) != "" {
+		startLeaseStore = store
+		refreshPendingStartInFlightLease(item.candidate.info.ID, sessionFrontDoor(startLeaseStore), time.Now(), os.Stderr)
+	}
 	var phases startPhaseTimings
 	startCallBegin := time.Now()
 	startedFresh, err := startPreparedStartCandidate(startCtx, item, cityPath, store, sp, cfg, &phases, sessionStaleKeyDetectionWaiter, warmClaim)
 	startCtxErr := startCtx.Err()
+	if startLeaseStore != nil {
+		refreshPendingStartInFlightLease(item.candidate.info.ID, sessionFrontDoor(startLeaseStore), time.Now(), os.Stderr)
+	}
 	// Split start_call into provider.Start and the ErrStateSync recovery
 	// branch (gc-9ha). The recovery branch hits the worker observation
 	// API which can dominate start_call when the runtime is wedged.
@@ -1774,7 +1788,7 @@ func commitAsyncStartResultWithContext(
 		// start_call / post_start_observe; only commit_refresh was
 		// stamped above. No restore needed.
 		if cleanupRuntime && !startOutcomeDefersCommit(result.outcome) {
-			stopStaleAsyncStartRuntime(result, sp, stderr)
+			stopStaleAsyncStartRuntime(result, sp, store, stderr)
 		}
 		outcome := "stale_async_start"
 		if releaseInFlight {
@@ -1797,7 +1811,7 @@ func commitAsyncStartResultWithContext(
 			return commitStartResultTraced(refreshed, sessFront, clk, rec, wave, stdout, stderr, trace)
 		}
 		if refreshed.err == nil && shouldRollbackPendingCreateInfo(refreshed.prepared.candidate.info) {
-			stopStaleAsyncStartRuntime(refreshed, sp, stderr)
+			stopStaleAsyncStartRuntime(refreshed, sp, store, stderr)
 			rollbackPendingCreate(refreshed.prepared.candidate.info, sessFront, clk.Now().UTC(), stderr)
 		}
 		logLifecycleOutcome(stderr, "start", wave, name, template, "context_canceled", refreshed.started, time.Now(), ctx.Err(), refreshed.phases)
@@ -1874,13 +1888,60 @@ func clearPendingStartInFlightLease(handle string, sessFront *sessionpkg.Store, 
 	setMeta(sessFront, handle, "last_woke_at", "", stderr) //nolint:errcheck
 }
 
-func stopStaleAsyncStartRuntime(result startResult, sp runtime.Provider, stderr io.Writer) {
+// refreshPendingStartInFlightLease re-stamps last_woke_at while a start is
+// still running: the single-writer heartbeat. The lease anchored at enqueue
+// time (preWakeCommit) expires while a slow or queued spawn is in flight —
+// startup_timeout plus the stale-key grace measured from preWakeCommit — and
+// the reconciler's destructive arms (pending-create rollback, stuck-creating
+// reap) then close the bead out from under the running start. The start
+// refreshes the same marker the arms consult, so a live start keeps its fence
+// closed. Fire-and-forget like its clear sibling; a failed stamp only widens
+// the race window the next refresh closes.
+//
+// The stamp is conditional on a FRESH claim read: a bead whose claim was
+// cleared mid-flight (rollback decided, commit pending) must not gain a fresh
+// lease — that would re-fence the rollback and orphan the decision.
+func refreshPendingStartInFlightLease(handle string, sessFront *sessionpkg.Store, now time.Time, stderr io.Writer) {
+	if strings.TrimSpace(handle) == "" || sessFront == nil {
+		return
+	}
+	store := sessFront.Store()
+	current, err := store.Get(handle)
+	if err != nil {
+		fmt.Fprintf(stderr, "session reconciler: refreshing start lease %s: %v\n", handle, err) //nolint:errcheck
+		return
+	}
+	if strings.TrimSpace(current.Metadata["pending_create_claim"]) != "true" {
+		return
+	}
+	setMeta(sessFront, handle, "last_woke_at", now.UTC().Format(time.RFC3339), stderr) //nolint:errcheck
+}
+
+// stopStaleAsyncStartRuntime stops the runtime spawned by a start whose result
+// lost its commit race. Two fences gate the kill: the runtime must still carry
+// THIS start's identity stamps (runningSessionMatchesPendingCreateInfo), and
+// the CURRENT bead must not be claimed by a DIFFERENT identity. The second
+// fence closes the re-claim window: when a rollback freed the alias and a
+// newer start re-claimed the same session name, the live tmux session still
+// reads the OLD stamps until the newcomer re-binds — stopping by name there
+// would kill the newcomer's runtime mid-nudge (2026-09-10/11 churn).
+func stopStaleAsyncStartRuntime(result startResult, sp runtime.Provider, store beads.Store, stderr io.Writer) {
 	if sp == nil || strings.TrimSpace(result.prepared.candidate.info.ID) == "" {
 		return
 	}
 	name := result.prepared.candidate.name()
 	if !runningSessionMatchesPendingCreateInfo(result.prepared.candidate.info, name, sp) {
 		return
+	}
+	if store != nil {
+		if current, _, err := sessionFrontDoor(store).GetPersistedResponse(result.prepared.candidate.info.ID); err == nil {
+			mine := sessionpkg.LeaseFromInfo(result.prepared.candidate.info)
+			currentLease := sessionpkg.LeaseFromInfo(current)
+			if currentLease.Claim && !currentLease.SameIdentity(mine) {
+				fmt.Fprintf(stderr, "session reconciler: not stopping stale async start runtime %s: bead re-claimed by a newer start\n", name) //nolint:errcheck
+				return
+			}
+		}
 	}
 	if err := sp.Stop(name); err != nil && !runtime.IsSessionGone(err) {
 		fmt.Fprintf(stderr, "session reconciler: stopping stale async start runtime %s: %v\n", name, err) //nolint:errcheck
