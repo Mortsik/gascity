@@ -149,3 +149,50 @@ store's 82-609 ms reconciles vs the rigs' ≥4.5 s floor.
   3. **Re-measure in a genuinely quiet window** (load < ~5) to certify the p50 <2 s target;
      the city store's 82-610 ms calm-second floor suggests the target is reachable there,
      while the rigs' ~4.5 s floor (dolt + size) suggests it is not, without items 1-2.
+
+## Native store dependency bump (follow-up, 01:40-02:00)
+
+Controller-approved follow-up: bump gc's vendored beads library so the `native_open` gate can
+pass against v66 rig DBs. Change is confined to `go.mod`/`go.sum` — **no `.go` source changes
+were required**: `go build ./...` compiles clean, i.e. the gc-facing API surface of the
+library did not break between v1.1.1-0.20260805 and v1.3.0-rc.2 at compile time.
+
+```
+go get github.com/steveyegge/beads@v1.3.0-rc.2 && go mod tidy
+```
+
+- `github.com/steveyegge/beads v1.1.1-0.20260805093327-bf97b73749ac => v1.3.0-rc.2`
+- Transitive upgrades pulled in (56 lines changed in go.mod, 154 in go.sum): spiffe v2.6→v2.7,
+  otel 1.44→1.45 (core/metric/sdk/trace/exporters), otlp proto 1.10→1.11, grpc 1.82→1.83,
+  google.golang.org/api 0.241→0.264, genproto snapshots →2026-06/08.
+
+### Test results (host load 30-43 during the run)
+
+| suite | result |
+|---|---|
+| `go build ./...` | PASS (clean) |
+| `go test ./internal/beads -count=1` | PASS (117 s) |
+| `go test ./cmd/gc -count=1` (first attempt, default 10 m cap) | FAIL **by package timeout** (600.5 s) under load ~40 |
+| single test from the dump, isolated: `TestOddballRootJSONInitDefaultSkipsTTYWizard` | PASS in 3.23 s |
+| full `./cmd/gc` re-run with `-timeout 30m` | FAIL after 978.6 s — exactly ONE failing test: `TestCityRuntimeTickForcesRunAfterMaxConsecutiveFSPressureSkips` (fs_pressure_test.go:506, "consecutive_skips = 1, want 2"); isolated re-runs: 3/3 PASS in 1.0-1.6 s |
+
+The first `cmd/gc` failure was a package-level 10-minute timeout, not an assertion failure:
+the goroutine dump landed mid-`run(init ...)` in one test, and that exact test passes in ~3 s
+when run alone. Host load during the window was 30-43 on 12 cores. The 30 m-cap re-run
+finished in 978.6 s with the single fs-pressure flake described above (passed 3/3 isolated);
+no beads-related test failed in either run.
+
+### Deployment risk estimate (controller judgement input)
+
+- **Low compile risk**: zero source changes; the beads types/funcs gc calls kept signatures.
+- **Behavioural risk sits inside the library, not the call sites** — the native store will
+  now open DBs at v66 (and run its own migrations if a newer schema appears). First deploy
+  should be watched for: (1) `native_store_unavailable` flipping to zero per scope (the
+  success signal), (2) any startup-time migration on first open of each rig DB (one-time
+  latency), (3) concurrent open with the old fallback path during rollout (mixed
+  native/subprocess writers until every gc process is replaced — nudge poll processes live
+  for hours, see ps).
+- **Rollback**: revert the single go.mod/go.sum commit and rebuild; no data-format change is
+  introduced by gc itself (schema ownership stays with bd).
+- **Not done here (per constraints)**: no binary build for deploy, no service restart, no
+  `bd` mutations. The controller builds (`go build -o … ./cmd/gc`) and rolls out.
