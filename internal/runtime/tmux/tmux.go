@@ -387,7 +387,11 @@ func (t *Tmux) runCtx(ctx context.Context, args ...string) (string, error) {
 		allArgs = append(allArgs, "-L", t.cfg.SocketName)
 	}
 	allArgs = append(allArgs, args...)
-	return t.exec.executeCtx(ctx, allArgs)
+	out, err := t.exec.executeCtx(ctx, allArgs)
+	if opsLogFile() != nil {
+		logTmuxOp(allArgs, err)
+	}
+	return out, err
 }
 
 // run executes a tmux command and returns stdout. All commands include -u

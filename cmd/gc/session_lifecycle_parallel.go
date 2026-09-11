@@ -789,6 +789,39 @@ func dependencySessionStartInFlight(store beads.Store, sessionName string, cfg *
 	return false
 }
 
+// foreignPendingCreateStartInFlight reports whether an OPEN bead OTHER than
+// excludeID holds a live in-flight pending-create lease on sessionName. It is
+// the zombie-recycle half of the single-writer fence (agent-forge-rryr stage
+// 2): a sibling start whose agent process is not visible yet still owns the
+// name, so a name-keyed Stop would kill its runtime mid-startup. A CLOSED
+// previous incarnation cannot match here (loadOpenSessionInfos excludes
+// closed beads), which is exactly what keeps the legacy zombie recycle
+// working. A list error defers fail-safe (treat the sibling as in flight)
+// rather than arming the destructive arm on unreadable state.
+func foreignPendingCreateStartInFlight(store beads.Store, sessionName, excludeID string, cfg *config.City) bool {
+	sessionName = strings.TrimSpace(sessionName)
+	if store == nil || sessionName == "" {
+		return false
+	}
+	infos, err := loadOpenSessionInfos(store)
+	if err != nil {
+		return true
+	}
+	var startupTimeout time.Duration
+	if cfg != nil {
+		startupTimeout = cfg.Session.StartupTimeoutDuration()
+	}
+	for _, info := range infos {
+		if info.SessionNameMetadata != sessionName || info.ID == excludeID {
+			continue
+		}
+		if pendingCreateStartInFlightInfo(info, nil, startupTimeout) {
+			return true
+		}
+	}
+	return false
+}
+
 func isSessionBead(session beads.Bead) bool {
 	if session.Type == sessionBeadType {
 		return true
@@ -1566,9 +1599,10 @@ func runPreparedStartCandidate(
 	}
 	finished := time.Now()
 	livenessUnavailable := errors.Is(err, runtime.ErrRuntimeUnavailable)
-	rollbackPending := err != nil && !livenessUnavailable && shouldRollbackPendingCreateInfo(item.candidate.info)
-	rateLimitScreen := err != nil && !livenessUnavailable && startupRateLimitScreenDetected(item, cityPath, sp, store, cfg)
-	if err != nil && rollbackPending && !rateLimitScreen && runningSessionMatchesPendingCreateInfo(item.candidate.info, item.candidate.name(), sp) {
+	deferredBySiblingLease := errors.Is(err, errStartDeferred)
+	rollbackPending := err != nil && !livenessUnavailable && !deferredBySiblingLease && shouldRollbackPendingCreateInfo(item.candidate.info)
+	rateLimitScreen := err != nil && !livenessUnavailable && !deferredBySiblingLease && startupRateLimitScreenDetected(item, cityPath, sp, store, cfg)
+	if err != nil && !deferredBySiblingLease && rollbackPending && !rateLimitScreen && runningSessionMatchesPendingCreateInfo(item.candidate.info, item.candidate.name(), sp) {
 		return startResult{
 			prepared:        item,
 			err:             nil,
@@ -1583,6 +1617,9 @@ func runPreparedStartCandidate(
 	switch {
 	case errors.Is(err, runtime.ErrSessionInitializing):
 		outcome = TraceOutcomeSessionInitializing
+		err = nil
+	case deferredBySiblingLease:
+		outcome = TraceOutcomeDeferred
 		err = nil
 	case livenessUnavailable:
 		outcome = TraceOutcomeDeferred
@@ -1937,7 +1974,14 @@ func stopStaleAsyncStartRuntime(result startResult, sp runtime.Provider, store b
 		if current, _, err := sessionFrontDoor(store).GetPersistedResponse(result.prepared.candidate.info.ID); err == nil {
 			mine := sessionpkg.LeaseFromInfo(result.prepared.candidate.info)
 			currentLease := sessionpkg.LeaseFromInfo(current)
-			if currentLease.Claim && !currentLease.SameIdentity(mine) {
+			// The veto needs BOTH a foreign claim AND that claim being live:
+			// last_woke_at inside the in-flight lease window. A foreign claim
+			// whose start is NOT in flight (no fresh last_woke_at — e.g. the
+			// claim is stale residue) no longer protects the runtime, and the
+			// runtime still carrying OUR stamps is precisely the stale spawn
+			// this cleanup exists to stop — vetoing there leaks it forever
+			// (TestCommitAsyncStartResult_StopsMatchingRuntimeForStaleSnapshot).
+			if currentLease.Claim && !currentLease.SameIdentity(mine) && pendingCreateStartInFlightInfo(current, nil, 0) {
 				fmt.Fprintf(stderr, "session reconciler: not stopping stale async start runtime %s: bead re-claimed by a newer start\n", name) //nolint:errcheck
 				return
 			}
@@ -1986,6 +2030,16 @@ func clonePreparedStartForAsync(item preparedStart) preparedStart {
 	return item
 }
 
+// errStartDeferred reports that a start was intentionally NOT performed
+// because another in-flight start holds a live lease on the session name
+// (the zombie-recycle fence, agent-forge-rryr stage 2). The classifier in
+// runPreparedStartCandidate maps it to TraceOutcomeDeferred — the same
+// deferred-commit channel ErrRuntimeUnavailable uses — so the commit layer
+// clears the lease and retries next tick instead of committing a
+// creating→active transition (hashes, creation_complete_at, claim clear) for
+// a start that never ran while the runtime on the name belongs to a sibling.
+var errStartDeferred = errors.New("start deferred: in-flight sibling lease on the session name")
+
 func startPreparedStartCandidate(
 	ctx context.Context,
 	item preparedStart,
@@ -2031,6 +2085,27 @@ func startPreparedStartCandidate(
 			// create back just recreates the bead next tick against the same
 			// zombie — so recycle it: stop the stale session and fall
 			// through to a fresh start.
+			//
+			// EXCEPT when the "zombie" is a sibling start that is still
+			// IN FLIGHT: under load the cold start's agent process is not
+			// visible yet (start_call 13-40s) while the sibling's bead is
+			// open, claimed, and inside its in-flight lease — the same
+			// visibility gap this liveness probe reports as !alive. Stopping
+			// by name at that moment kills the sibling's session mid-startup
+			// (its startup nudge then fails against a session another writer
+			// tore down), the failed start rolls back, and the next tick
+			// repeats the recycle against the same name: a cyclic same-name
+			// respawn with two writers (agent-forge-rryr, 2026-09-10/11).
+			// Defer instead: a live foreign lease means this candidate is not
+			// the single writer for the name right now. Signal it through
+			// errStartDeferred so the commit layer sees TraceOutcomeDeferred —
+			// a bare (false, nil) here is indistinguishable from a legal warm
+			// reuse and would commit a creating→active transition for this
+			// incarnation despite nothing having started (critic round 1).
+			if foreignPendingCreateStartInFlight(store, name, item.candidate.info.ID, cfg) {
+				fmt.Fprintf(os.Stderr, "session reconciler: deferring zombie recycle of %s: another in-flight start holds a live lease on the name\n", name) //nolint:errcheck
+				return false, errStartDeferred
+			}
 			recycleBegin := time.Now()
 			stopErr := sp.Stop(name)
 			if phases != nil {
