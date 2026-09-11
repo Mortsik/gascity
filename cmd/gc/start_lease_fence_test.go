@@ -97,7 +97,6 @@ func TestRefreshPendingStartInFlightLease_SkipsBeadWithoutClaim(t *testing.T) {
 // may already belong to the newcomer (the runtime-meta probe reads the OLD
 // stamp until the newcomer re-binds, so the probe alone cannot tell).
 func TestStopStaleAsyncStartRuntime_VetoesStopWhenNewerStartOwnsBead(t *testing.T) {
-	clk := &clock.Fake{Time: time.Date(2026, 9, 11, 1, 0, 0, 0, time.UTC)}
 	store := beads.NewMemStore()
 	session, err := store.Create(beads.Bead{
 		ID:     "gc-stop-veto",
@@ -109,7 +108,11 @@ func TestStopStaleAsyncStartRuntime_VetoesStopWhenNewerStartOwnsBead(t *testing.
 			"template":             "stop-veto",
 			"instance_token":       "tok-newer",
 			"pending_create_claim": "true",
-			"last_woke_at":         clk.Now().Format(time.RFC3339),
+			// Wall-clock stamp: stopStaleAsyncStartRuntime's in-flight check
+			// reads time.Now() (no clk injection on this path), so a Fake
+			// clock would read as long-expired and the veto under test would
+			// never arm.
+			"last_woke_at": time.Now().UTC().Format(time.RFC3339),
 		}),
 	})
 	if err != nil {
