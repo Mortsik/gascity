@@ -1320,8 +1320,11 @@ func ensureDrainUnitConvoy(store beads.Store, control beads.Bead, parentConvoyID
 		beadmeta.DrainUnitKeyMetadataKey:      row.UnitKey,
 	}
 	created, err := unitStore.Create(beads.Bead{
-		Title:    fmt.Sprintf("drain unit %d for %s", row.Index, member.ID),
-		Type:     "convoy",
+		Title: fmt.Sprintf("drain unit %d for %s", row.Index, member.ID),
+		Type:  "convoy",
+		// gc-protocol: unit convoy is drain bookkeeping, never actionable
+		// work — legacy ready queries exclude this label.
+		Labels:   []string{"gc-protocol"},
 		Priority: member.Priority,
 		Metadata: metadata,
 	})

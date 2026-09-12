@@ -803,9 +803,11 @@ func finalize(opts SlingOpts, deps SlingDeps, beadID, method string, result Slin
 			}
 		}
 		if createAutoConvoy {
-			var convoyLabels []string
+			// gc-protocol: auto-convoy root is sling bookkeeping, never
+			// actionable work — legacy ready queries exclude this label.
+			convoyLabels := []string{"gc-protocol"}
 			if opts.Owned {
-				convoyLabels = []string{"owned"}
+				convoyLabels = append(convoyLabels, "owned")
 			}
 			convoy, err := deps.Store.Create(beads.Bead{
 				Title:  AutoConvoyRootTitle(beadID),

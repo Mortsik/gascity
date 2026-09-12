@@ -20,9 +20,13 @@ func newSourceSpecStep(step *Step) (*Step, error) {
 		return nil, fmt.Errorf("serializing step spec for %q: %w", step.ID, err)
 	}
 	return &Step{
-		ID:          step.ID + ".spec",
-		Title:       "Step spec for " + step.Title,
-		Type:        "spec",
+		ID:    step.ID + ".spec",
+		Title: "Step spec for " + step.Title,
+		Type:  "spec",
+		// Labels inherit from the step so protocol tags (e.g. gc-protocol)
+		// reach the spec sidecar too — the sidecar is the same protocol
+		// bookkeeping as its step, not actionable work.
+		Labels:      step.Labels,
 		Description: string(specJSON),
 		Metadata: map[string]string{
 			beadmeta.KindMetadataKey:       sourceSpecKind,

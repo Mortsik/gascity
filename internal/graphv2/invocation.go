@@ -437,8 +437,11 @@ func CreateSingleItemInputConvoy(store beads.Store, target beads.Bead) (beads.Be
 		syntheticMetadataKey: "true",
 	}
 	created, err := store.Create(beads.Bead{
-		Title:    "input convoy for " + target.ID,
-		Type:     "convoy",
+		Title: "input convoy for " + target.ID,
+		Type:  "convoy",
+		// gc-protocol: synthetic convoy is protocol bookkeeping, never
+		// actionable work — legacy ready queries exclude this label.
+		Labels:   []string{"gc-protocol"},
 		Priority: target.Priority,
 		Metadata: metadata,
 	})
