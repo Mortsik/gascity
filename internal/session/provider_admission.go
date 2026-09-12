@@ -13,6 +13,17 @@ import (
 // ProviderHealthTTL bounds the lifetime of a healthy observation.
 const ProviderHealthTTL = 60 * time.Second
 
+// ProviderRefreshGrace bounds how far past the publisher's published
+// re-check deadline (next_check_at) a healthy record stays trusted. The
+// publisher re-probes at next_check_at and the refreshed write lands within
+// one probe interval, so short overruns are scheduling jitter, not a dead
+// publisher. Measured 2026-09-12 (agent-forge-769p): the publisher wrote
+// probed_at ~31-59 s behind the wall clock while probing healthy every
+// 30-55 s (probed_at carries the upstream observation instant, and cached
+// republications freeze it between real probes), so a strict probed_at TTL
+// denied healthy providers for most of every probe cycle.
+const ProviderRefreshGrace = 30 * time.Second
+
 // ErrProviderUnavailable is a deferral, not a failed delivery or start attempt.
 var ErrProviderUnavailable = errors.New("provider unavailable")
 
@@ -102,6 +113,21 @@ func LoadProviderHealthSnapshot(cityPath string, now time.Time) *ProviderHealthS
 	return s
 }
 
+// healthyEvidenceFresh reports whether a healthy record's evidence is fresh.
+// The publisher's next_check_at is its refresh contract: a healthy record is
+// trusted until the deadline plus one refresh grace, because probed_at
+// carries the upstream observation instant (observed_at = probe time minus
+// the proxy's quota-snapshot age, up to a minute old at publish) and cached
+// republications freeze it between real probes. Records without a usable
+// next_check_at keep the legacy probed_at TTL. A next_check_at implausibly
+// far in the future (no live publisher writes one) is not trusted either.
+func healthyEvidenceFresh(r providerHealthRecord, now float64) bool {
+	if r.NextCheckAt > 0 && r.NextCheckAt <= now+ProviderHealthTTL.Seconds() {
+		return now <= r.NextCheckAt+ProviderRefreshGrace.Seconds()
+	}
+	return r.ProbedAt > 0 && r.ProbedAt <= now && now-r.ProbedAt <= ProviderHealthTTL.Seconds()
+}
+
 // Check requires a fresh healthy observation for opted-in exact provider names.
 // Unhealthy required records never expire into permission; next-check is only
 // explanatory. Optional providers retain the legacy fail-open TTL behavior.
@@ -127,7 +153,7 @@ func (s *ProviderHealthSnapshot) Check(provider string) ProviderAdmission {
 		}
 		return ProviderAdmission{Allowed: true}
 	}
-	fresh := r.ProbedAt > 0 && r.ProbedAt <= s.now && s.now-r.ProbedAt <= ProviderHealthTTL.Seconds()
+	fresh := healthyEvidenceFresh(r, s.now)
 	if !required && !fresh {
 		return ProviderAdmission{Allowed: true}
 	}

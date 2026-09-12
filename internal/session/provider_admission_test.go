@@ -162,3 +162,68 @@ func TestProviderAdmissionSubmitPrecedesRuntimeMutation(t *testing.T) {
 		}
 	}
 }
+
+// Regression for agent-forge-769p (incident 2026-09-12 ~21:41-22:30 CEST):
+// the policy publisher writes probed_at with the upstream observation lag
+// (observed_at = probe time - proxy quota-snapshot age) and republishes the
+// frozen record from its cache between real probes, so a healthy record
+// legitimately reads older than ProviderHealthTTL while the publisher is
+// alive and the provider is healthy. Guard journal that night: probe run
+// 20:36:45.228 UTC published probed_at 31.1 s in the past with
+// next_check_at = probe+30s, and the next real probe landed at 20:37:39.951
+// UTC. A strict probed_at TTL denied required providers ("provider
+// health observation is stale" / JS "provider-state-unavailable") for most
+// of every probe cycle. Admission must trust the published re-check
+// deadline instead, bounded by ProviderRefreshGrace.
+func TestProviderAdmissionCheckFreshnessTrustsPublishedNextCheckAt(t *testing.T) {
+	const (
+		probedAt = 1789245405.116 // observed_at: 31.1 s before the probe run
+		// Reconcile time + 30 s = probe wall clock + 30 s = probed_at+61.1 s.
+		nextCheckAt = 1789245466.216
+	)
+	at := func(offset float64) time.Time {
+		return time.UnixMilli(1789245405116).Add(time.Duration(offset * float64(time.Second)))
+	}
+	record := func(next float64) string {
+		if next <= 0 {
+			return fmt.Sprintf(`{"providers":[{"provider":"custom","status":"healthy","probed_at":%v,"reason":"peak-open"}]}`, probedAt)
+		}
+		return fmt.Sprintf(`{"providers":[{"provider":"custom","status":"healthy","probed_at":%v,"reason":"peak-open","next_check_at":%v}]}`, probedAt, next)
+	}
+	for _, tc := range []struct {
+		name        string
+		nextCheckAt float64
+		now         time.Time
+		allowed     bool
+	}{
+		// Freshly published record reads young: allowed on both sides of the
+		// legacy TTL boundary while the refresh deadline stands.
+		{"mid-cycle", nextCheckAt, at(6), true},
+		{"past-legacy-ttl-deadline-standing", nextCheckAt, at(65), true},
+		{"late-cycle-before-deadline", nextCheckAt, at(90), true},
+		// The refresh deadline plus one grace passed without a republish:
+		// the publisher missed its contract, fail closed again.
+		{"deadline-and-grace-exhausted", nextCheckAt, at(95), false},
+		// A deadline implausibly far out is not trusted (no live publisher
+		// writes one): fall back to the legacy probed_at TTL.
+		{"far-future-deadline-untrusted", probedAt + 3600, at(65), false},
+		// Legacy record without next_check_at keeps the old TTL exactly.
+		{"no-deadline-legacy-ttl", 0, at(6), true},
+		{"no-deadline-expired", 0, at(65), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			city := t.TempDir()
+			writeAdmissionFile(t, city, "provider-health-required.json", `{"schema_version":1,"providers":["custom"]}`)
+			writeAdmissionFile(t, city, "provider-health.json", record(tc.nextCheckAt))
+			d := LoadProviderHealthSnapshot(city, tc.now).Check("custom")
+			if d.Allowed != tc.allowed {
+				t.Errorf("Check at +%.0fs (next_check_at=%v): allowed=%v reason=%q", tc.now.Sub(at(0)).Seconds(), tc.nextCheckAt, d.Allowed, d.Reason)
+			}
+			if !tc.allowed {
+				if !d.Observed || d.Reason == "" {
+					t.Errorf("denial must carry an observed reason, got %+v", d)
+				}
+			}
+		})
+	}
+}
