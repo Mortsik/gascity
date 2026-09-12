@@ -14059,7 +14059,7 @@ func TestBuildDesiredState_RigDispatcherOnLegacyCityStillProbesRigStore(t *testi
 	}
 }
 
-// SESSION-RECON-015: an API-created agent session bead carries
+// SESSION-RECON-016: an API-created agent session bead carries
 // session_origin=ephemeral with agent_name set and no pool markers
 // (pool_managed / pool_slot). On a multi-session template that bead is
 // user-created capacity, not controller-created pool capacity, so

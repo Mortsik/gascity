@@ -839,6 +839,9 @@ func (m *Manager) CreateSession(ctx context.Context, spec CreateOptions) (Info, 
 }
 
 func (m *Manager) createStarted(ctx context.Context, spec CreateOptions) (Info, error) {
+	if err := m.CheckProviderAdmission(spec.Provider); err != nil {
+		return Info{}, err
+	}
 	alias, explicitName := spec.Alias, spec.ExplicitName
 	template, title := spec.Template, spec.Title
 	command, workDir := spec.Command, spec.WorkDir

@@ -10307,7 +10307,7 @@ func TestReconcileSessionBeads_MaxSessionAgeSkippedWhenBusyWithAssignedWork(t *t
 }
 
 // TestReconcileSessionBeads_MaxAgeBusyDeferFallsThroughToIdleTimeout pins the
-// max-age half of the timer asymmetry (SESSION-RECON-009): a max-age deferral
+// max-age half of the timer asymmetry (SESSION-RECON-010): a max-age deferral
 // leaves the session in the rest of the tick instead of `continue`-ing past
 // it. The busy witness is max-age deferred on assigned work and must still
 // be idle-evaluated on the same tick. Since ga-nllza6 gave DecideIdleTimeout

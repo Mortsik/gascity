@@ -523,6 +523,9 @@ func (m *Manager) commitPendingContinuationReset(id string, b beads.Bead) (int, 
 }
 
 func (m *Manager) ensureRunning(ctx context.Context, id string, b beads.Bead, sessName, resumeCommand string, hints runtime.Config) error {
+	if err := m.CheckProviderAdmission(b.Metadata["provider"]); err != nil {
+		return err
+	}
 	transport, transportVerified := m.transportForBead(b, sessName)
 	unroute := m.routeACPIfNeeded(b.Metadata["provider"], transport, sessName)
 	if State(b.Metadata["state"]) != StateSuspended && m.sp.IsRunning(sessName) {
@@ -654,6 +657,9 @@ func (m *Manager) ensureRunning(ctx context.Context, id string, b beads.Bead, se
 }
 
 func (m *Manager) ensureRunningRuntimeOnly(ctx context.Context, id string, b beads.Bead, sessName, resumeCommand string, hints runtime.Config) error {
+	if err := m.CheckProviderAdmission(b.Metadata["provider"]); err != nil {
+		return err
+	}
 	transport, _ := m.transportForBead(b, sessName)
 	unroute := m.routeACPIfNeeded(b.Metadata["provider"], transport, sessName)
 	if m.sp.IsRunning(sessName) {
@@ -968,8 +974,11 @@ func (m *Manager) send(ctx context.Context, id, message, resumeCommand string, h
 func (m *Manager) sendLiveOnly(ctx context.Context, id, message string, immediate bool) (bool, error) {
 	var delivered bool
 	err := withSessionMutationLock(id, func() error {
-		_, sessName, err := m.sessionBead(id)
+		b, sessName, err := m.sessionBead(id)
 		if err != nil {
+			return err
+		}
+		if err := m.CheckProviderAdmission(b.Metadata["provider"]); err != nil {
 			return err
 		}
 		if !m.sp.IsRunning(sessName) {
@@ -1064,6 +1073,9 @@ func (m *Manager) TryWaitIdleNudgeLiveOnly(ctx context.Context, id, source, mess
 	err := withSessionMutationLock(id, func() error {
 		b, sessName, err := m.sessionBead(id)
 		if err != nil {
+			return err
+		}
+		if err := m.CheckProviderAdmission(b.Metadata["provider"]); err != nil {
 			return err
 		}
 		delivered, err = m.tryWaitIdleNudgeLiveOnlyLocked(ctx, b, source, sessName, message)

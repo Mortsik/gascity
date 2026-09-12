@@ -13,7 +13,7 @@ import (
 // pending_create_claim and sleep_reason; the churn lane respects both —
 // asymmetries inherited from the original predicates. Caller-side
 // characterization lives in cmd/gc/session_reconcile_test.go
-// (TestCheckStability_*, TestCheckChurn_*; SESSION-RECON-010).
+// (TestCheckStability_*, TestCheckChurn_*; SESSION-RECON-011).
 
 func exitFacts() ExitFacts {
 	now := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)

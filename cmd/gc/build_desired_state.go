@@ -4400,6 +4400,25 @@ func selectOrPlanPoolSessionBead(
 	if !bp.hasCompleteSessionSnapshot() {
 		return session.Info{}, 0, nil, errPoolSessionCreatePartial
 	}
+	provName := strings.TrimSpace(cfgAgent.Provider)
+	if provName == "" {
+		provName = strings.TrimSpace(cfgAgent.InheritedProvider)
+	}
+	if provName == "" && bp.workspace != nil {
+		provName = strings.TrimSpace(bp.workspace.Provider)
+	}
+	// Provider-health gate: refuse new creates when the snapshot reports this
+	// agent's provider red. Runs before pool-slot allocation so a denied
+	// provider never consumes a slot. Reuse paths above are unaffected (they
+	// return before reaching this point). loadProviderHealthSnapshot always
+	// returns a non-nil snapshot; check() fails open on absent or stale
+	// evidence only for providers not opted into required health — a required
+	// provider surfaces missing, malformed or stale evidence as a red
+	// observation, so the gate fails closed. Symmetric with the respawn gate
+	// in session_reconciler.go.
+	if healthy, present := bp.providerHealthSnapshot.check(provName); present && !healthy {
+		return session.Info{}, 0, nil, errPoolSessionCreateProviderRed
+	}
 	slot, err := claimFreshPoolSlotInfo(bp, cfgAgent, usedSlots)
 	if err != nil {
 		return session.Info{}, 0, nil, err
@@ -4414,23 +4433,6 @@ func selectOrPlanPoolSessionBead(
 	if bp.poolScaleCheckPartialTemplates[template] {
 		delete(usedSlots, slot)
 		return session.Info{}, 0, nil, errPoolSessionCreatePartial
-	}
-
-	// Provider-health gate: refuse new creates when the registry reports this
-	// agent's provider as red. Reuse paths above are unaffected (they return
-	// before reaching this point). loadProviderHealthSnapshot always returns a
-	// non-nil snapshot; check() fails-open when the registry is absent or stale.
-	// Symmetric with the respawn gate in session_reconciler.go:2424.
-	provName := strings.TrimSpace(cfgAgent.Provider)
-	if provName == "" {
-		provName = strings.TrimSpace(cfgAgent.InheritedProvider)
-	}
-	if provName == "" && bp.workspace != nil {
-		provName = strings.TrimSpace(bp.workspace.Provider)
-	}
-	if healthy, present := bp.providerHealthSnapshot.check(provName); present && !healthy {
-		delete(usedSlots, slot)
-		return session.Info{}, 0, nil, errPoolSessionCreateProviderRed
 	}
 
 	if !bp.tryClaimPoolSessionCreate(template) {

@@ -909,6 +909,13 @@ func prepareStartCandidateForCity(
 	stderr io.Writer,
 	workDirResolver taskWorkDirResolver,
 ) (*preparedStart, error) {
+	provider := candidate.info.Provider
+	if candidate.tp.ResolvedProvider != nil {
+		provider = candidate.tp.ResolvedProvider.Name
+	}
+	if err := sessionpkg.LoadProviderHealthSnapshot(cityPath, clk.Now()).Check(provider).Err(provider); err != nil {
+		return nil, fmt.Errorf("%w: %v", errStartDeferred, err)
+	}
 	if id := strings.TrimSpace(candidate.info.ID); id != "" && store != nil {
 		if err := sessionpkg.WithSessionMutationLock(id, func() error {
 			sessFront := sessionFrontDoor(store)
@@ -2051,6 +2058,13 @@ func startPreparedStartCandidate(
 	staleKeyDetectionWaiter sessionpkg.StaleKeyDetectionWaiter,
 	warmClaim warmClaimTriggerProbe,
 ) (bool, error) {
+	provider := item.candidate.info.Provider
+	if item.candidate.tp.ResolvedProvider != nil {
+		provider = item.candidate.tp.ResolvedProvider.Name
+	}
+	if err := sessionpkg.LoadProviderHealthSnapshot(cityPath, time.Now()).Check(provider).Err(provider); err != nil {
+		return false, fmt.Errorf("%w: %v", errStartDeferred, err)
+	}
 	name := item.candidate.name()
 	if sp != nil {
 		running, alive, err := observeRuntimeProviderLiveness(sp, name, item.cfg.ProcessNames)
@@ -3031,6 +3045,15 @@ func executePlannedStartsTraced(
 			for _, candidate := range batchCandidates {
 				if ctx != nil && ctx.Err() != nil {
 					return wakeCount
+				}
+				provider := candidate.info.Provider
+				if candidate.tp.ResolvedProvider != nil {
+					provider = candidate.tp.ResolvedProvider.Name
+				}
+				if !sessionpkg.LoadProviderHealthSnapshot(cityPath, clk.Now()).Check(provider).Allowed {
+					// A provider hold must not reserve a worker or consume the
+					// session's circuit-breaker restart budget.
+					continue
 				}
 				if !allDependenciesAliveForTemplateWithClock(candidate.logicalTemplate(cfg), cfg, desiredState, sp, cityName, store, clk) {
 					logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "blocked_on_dependencies", time.Time{}, time.Time{}, nil)

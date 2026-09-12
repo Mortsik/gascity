@@ -729,6 +729,12 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 	var missingSince time.Time
 	var lastFreeOS time.Time
 	for {
+		if !session.LoadProviderHealthSnapshot(target.cityPath, time.Now()).Check(target.providerName()).Allowed {
+			// Retain the poller and queue for recovery, but avoid repeated
+			// whole-store observation and runtime probes during a hold.
+			time.Sleep(max(interval, 30*time.Second))
+			continue
+		}
 		// Each tick that observes a changed beads.json re-parses the whole-file
 		// store, leaving several hundred MB of transient garbage. The soft
 		// memory limit caps live arena, but proactively returning freed pages to
@@ -1465,6 +1471,9 @@ func parseNudgeDeliveryMode(raw string) (nudgeDeliveryMode, error) {
 }
 
 func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.Store, sp runtime.Provider, quiescence time.Duration, obs worker.LiveObservation) (bool, error) {
+	if !session.LoadProviderHealthSnapshot(target.cityPath, time.Now()).Check(target.providerName()).Allowed {
+		return false, nil
+	}
 	matches, err := nudgeTargetLiveGenerationMatches(target, obs, sp)
 	if err != nil || !matches {
 		return false, err
@@ -1543,7 +1552,7 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 	})
 	if err != nil {
 		telemetry.RecordNudge(context.Background(), target.agentKey(), err)
-		if errors.Is(err, runtime.ErrSessionNotFound) {
+		if errors.Is(err, runtime.ErrSessionNotFound) || errors.Is(err, session.ErrProviderUnavailable) {
 			if recErr := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(items)); recErr != nil {
 				return false, errors.Join(bookkeepErr, recErr)
 			}

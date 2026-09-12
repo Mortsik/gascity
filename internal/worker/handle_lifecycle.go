@@ -374,6 +374,12 @@ func (h *SessionHandle) ensureSessionID() (string, error) {
 	if h.sessionID != "" {
 		return h.sessionID, nil
 	}
+	// Automatic start/message/nudge paths must not manufacture a deferred
+	// attempt before the manager refuses the unavailable provider. Explicit
+	// CreateModeDeferred remains available to record durable user intent.
+	if err := h.manager.CheckProviderAdmission(h.session.Provider); err != nil {
+		return "", err
+	}
 	info, err := h.createDeferredLocked()
 	if err != nil {
 		return "", err
