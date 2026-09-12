@@ -98,6 +98,12 @@ func (m *Manager) submit(ctx context.Context, id, message, resumeCommand string,
 		if err != nil {
 			return err
 		}
+		// Provider admission precedes every submit intent: a denied provider
+		// must defer before the pending-interaction probe or deferred queue
+		// touch the runtime for a session that cannot use the work anyway.
+		if err := m.CheckProviderAdmission(b.Metadata["provider"]); err != nil {
+			return err
+		}
 		switch intent {
 		case SubmitIntentFollowUp:
 			if !m.supportsFollowUpLocked(b) {

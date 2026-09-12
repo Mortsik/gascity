@@ -6,7 +6,7 @@ import "testing"
 // max-session-age and idle-timeout blocks. The precedence is a contract:
 // timer blocker beats pending interaction beats assigned work beats stop.
 // The caller-facing characterization tests for the same behavior live in
-// cmd/gc/session_reconciler_test.go (SESSION-RECON-008, SESSION-RECON-009).
+// cmd/gc/session_reconciler_test.go (SESSION-RECON-009, SESSION-RECON-010).
 
 func TestDecideMaxSessionAgeNotTriggered(t *testing.T) {
 	dec := DecideMaxSessionAge(TimerFacts{Triggered: false})

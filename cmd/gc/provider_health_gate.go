@@ -17,12 +17,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/session"
 	"github.com/google/uuid"
 )
 
@@ -38,74 +37,36 @@ const (
 
 // --- snapshot (loaded once per tick) ---
 
-// providerHealthRecord mirrors one entry in provider-health.json.
-type providerHealthRecord struct {
-	Provider string  `json:"provider"`
-	Status   string  `json:"status"`    // "healthy" | "unhealthy"
-	ProbedAt float64 `json:"probed_at"` // Unix epoch seconds (float)
-}
-
-type providerHealthFileFormat struct {
-	Providers []providerHealthRecord `json:"providers"`
-}
-
 // providerHealthSnapshot is an immutable, per-tick view of the health file.
 // It is loaded once at the top of each reconciler tick via
 // loadProviderHealthSnapshot; all per-session gate checks use the snapshot
 // (no additional file I/O).
 type providerHealthSnapshot struct {
-	// present is false when the file is absent, unreadable, or empty.
-	// A false present means the registry is unavailable — callers fail-open.
-	present bool
-	// entries maps provider name → healthy. Only entries that exist in the
-	// file and are within TTL are stored; stale or missing entries are omitted
-	// so check() returns (true, false) for them (fail-open).
-	entries map[string]bool
+	admission *session.ProviderHealthSnapshot
 }
 
 // loadProviderHealthSnapshot reads cityPath/.gc/cache/provider-health.json and
 // returns a snapshot for this reconciler tick. It is safe to call when the
-// file is absent (returns an empty snapshot with present=false).
+// file is absent; required-provider policy determines whether absence denies.
 func loadProviderHealthSnapshot(cityPath string) *providerHealthSnapshot {
-	cachePath := filepath.Join(cityPath, providerHealthCacheRelPath)
-	data, err := os.ReadFile(cachePath)
-	if err != nil {
-		return &providerHealthSnapshot{present: false}
-	}
-	var f providerHealthFileFormat
-	if err := json.Unmarshal(data, &f); err != nil {
-		return &providerHealthSnapshot{present: false}
-	}
-	snap := &providerHealthSnapshot{
-		present: len(f.Providers) > 0,
-		entries: make(map[string]bool, len(f.Providers)),
-	}
-	nowSecs := float64(time.Now().UnixNano()) / 1e9
-	for _, rec := range f.Providers {
-		ageSecs := nowSecs - rec.ProbedAt
-		if ageSecs > providerHealthTTL.Seconds() {
-			// Stale — omit so check() fails-open for this provider.
-			continue
-		}
-		snap.entries[rec.Provider] = rec.Status == "healthy"
-	}
-	return snap
+	return &providerHealthSnapshot{admission: session.LoadProviderHealthSnapshot(cityPath, time.Now())}
 }
 
 // check returns (healthy, registryPresent).
-//   - registryPresent=false: file absent, unreadable, or no fresh entry for
-//     providerName. Callers MUST treat this as healthy=true (fail-open).
+//   - registryPresent=false: no denial-scope entry for providerName — this
+//     happens only for providers not opted into required health (file absent,
+//     unreadable, or no fresh entry). Callers MUST treat this as healthy=true
+//     (fail-open).
 //   - registryPresent=true, healthy=false: provider is red; gate respawn.
+//     A required provider's missing, malformed or stale evidence is reported
+//     here as an observation, so gates fail closed for required providers.
 //   - registryPresent=true, healthy=true: provider is green; allow respawn.
 func (s *providerHealthSnapshot) check(providerName string) (healthy, registryPresent bool) {
-	if s == nil || !s.present {
+	if s == nil {
 		return true, false
 	}
-	v, ok := s.entries[providerName]
-	if !ok {
-		return true, false // no fresh entry → fail-open
-	}
-	return v, true
+	d := s.admission.Check(providerName)
+	return d.Allowed, d.Observed
 }
 
 // healthyProviders returns all provider names that are confirmed healthy in
@@ -114,13 +75,7 @@ func (s *providerHealthSnapshot) healthyProviders() []string {
 	if s == nil {
 		return nil
 	}
-	out := make([]string, 0, len(s.entries))
-	for p, healthy := range s.entries {
-		if healthy {
-			out = append(out, p)
-		}
-	}
-	return out
+	return s.admission.HealthyProviders()
 }
 
 // --- episode state (lives across ticks on CityRuntime) ---

@@ -49,7 +49,7 @@ fact-gathering order and fail-open/fail-closed mappings stay caller policy.
 `REQUIREMENTS.md` and `AGENTS.md` move from untracked working-tree files to
 committed sources on a current `origin/main` base. Evidence rows verified
 against this base; two ledger defects fixed (SESSION-WORK-003 citation,
-SESSION-RECON-007 min-floor exemption from PR #3113).
+SESSION-RECON-008 min-floor exemption from PR #3113).
 
 Exit: docs committed; every cited evidence file resolves on this branch.
 
@@ -69,7 +69,7 @@ gathering (trackers, provider probes, store queries), execution (kill, events,
 telemetry, patches), and the fail-closed store-error mapping.
 
 Exit: all existing reconciler tests pass unchanged; decider has its own unit
-tests; new `SESSION-RECON-008`/`009` ledger rows cite both.
+tests; new `SESSION-RECON-009`/`010` ledger rows cite both.
 
 ### Step 2 — Stability, churn, and rate-limit predicates (this PR)
 
