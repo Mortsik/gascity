@@ -275,6 +275,38 @@ run is finished by running it again; `--dry-run` prints the exact per-scope plan
 and writes nothing. Procedure, refusals and recovery:
 `engdocs/runbooks/beads-migrate-proxied.md`.
 
+### What "bd owns this scope" has to mean everywhere
+
+A committed handoff changes no transport. The city keeps `dolt_mode: server`,
+keeps a direct `sql-server`, and grows no `.gc/scope-ownership.json` record —
+bd's journal is the record. Every predicate that asked "is this proxied?"
+therefore answered "gc's" for a city bd runs, and each one was a separate way
+for gc to take the scope back:
+
+- `gc dolt-state allocate-port` carried no admission check at all, and it is the
+  dolt pack's first step;
+- `managedDoltLifecycleOwned`, which gates every managed runtime publication
+  including the reconcile tick's, read gc's ownership journal alone;
+- the dolt pack's order guard (`assets/scripts/bd_owned_scope.sh`, and its Go
+  twin behind `gc dolt-cleanup`) was keyed on the proxied binding;
+- and gc projected `BEADS_DOLT_AUTO_START=0` into every bd invocation, which is
+  the right guard for a server gc runs and a veto on the owner's own lifecycle
+  for one bd runs: after `gc stop` retires bd's direct server, the `bd ping`
+  that `gc start` uses for readiness could not bring it back.
+
+The shell guard and `gc dolt-cleanup` answer on two arms — the proxied binding
+or a committed handoff — not three. gc's own ownership journal records that gc
+delegated a scope's *initialisation* to bd, and the topology matrix pins the
+pack's managed verbs as still running for a journaled direct-local city;
+widening that arm is a separate decision with its own re-qualification.
+
+gc's own runtime publication is retired rather than merely not rewritten.
+`handoff-stop` deliberately leaves it alone — the captured workspace artifacts
+are the rollback's to restore, and the port mirror sync would rewrite them — so
+the first provider-owned `gc start` or `gc stop` removes
+`.gc/runtime/packs/dolt/dolt-state.json` and its provider-state twin, and
+nothing under `.beads`.
+
 ## Deliberately not done
 
 - **Native SQL over the proxy.** Proxied scopes read and write through the bd
