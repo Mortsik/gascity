@@ -304,6 +304,23 @@ func ValidateCanonicalConfigState(fs fsys.FS, cityRoot, scopeRoot string, cfg Co
 				}
 				return nil
 			}
+			// A rig that tracks no endpoint at all is inheriting, which is what
+			// the origin says, and the resolver derives its target from the
+			// city. Requiring a mirror here refused a shape nothing wrote and
+			// nothing could repair: a legacy rig under a city the ownership
+			// handoff republished as city_canonical over bd's replacement
+			// server. bd is city-root only by design and must not rewrite a rig
+			// config, so the rig keeps the endpoint-less inherited config the
+			// legacy gc gave it — and the refusal took down the whole city,
+			// because this validator gates the canonical resolver every gc
+			// command goes through.
+			//
+			// A rig that does claim an endpoint still has to claim the city's:
+			// a half or divergent endpoint is a broken mirror, not an
+			// inheritance, and is refused below.
+			if !configTracksEndpoint(cfg) {
+				return nil
+			}
 			if strings.TrimSpace(cfg.DoltHost) == "" || strings.TrimSpace(cfg.DoltPort) == "" {
 				return fmt.Errorf("canonical inherited rig config requires both dolt.host and dolt.port")
 			}
