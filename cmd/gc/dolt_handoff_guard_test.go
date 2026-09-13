@@ -139,11 +139,64 @@ func TestHandoffJournalAllowsOnlyExactRestoredLegacyControls(t *testing.T) {
 	if err := handoffJournalBlocksManagedDoltStart(city); err != nil {
 		t.Fatalf("exact restored journal blocked start: %v", err)
 	}
+
+	// Drift AFTER the admission is gc's own canonicalisation on the restart the
+	// rollback performs, and must not re-close the gate. See
+	// admitRolledBackHandoff; TestRolledBackHandoffAdmissionSurvivesGCsOwnCanonicalRewrite
+	// drives the same path through the projection.
 	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte("dolt.auto-start: true\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := handoffJournalBlocksManagedDoltStart(city); err != nil {
+		t.Fatalf("an admitted rollback blocked the managed start it had already allowed: %v", err)
+	}
+}
+
+// A restored journal whose artifacts were never byte-exact has not proven the
+// rollback completed, and never becomes an admission.
+func TestHandoffJournalRefusesARestoreItNeverSawLandFirst(t *testing.T) {
+	city := handoffGuardTestCity(t)
+	beadsDir := filepath.Join(city, ".beads")
+	if err := os.Mkdir(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metadata := []byte(`{"backend":"dolt","dolt_database":"beads"}`)
+	config := []byte("gc.endpoint_origin: managed_city\ndolt.auto-start: false\n")
+	port := []byte("3307")
+	for _, file := range []struct {
+		name string
+		body []byte
+	}{{"metadata.json", metadata}, {"config.yaml", []byte("dolt.auto-start: true\n")}, {"dolt-server.port", port}} {
+		if err := os.WriteFile(filepath.Join(beadsDir, file.name), file.body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var journal handoffProjectionJournal
+	journal.Request.CityRoot, journal.Request.Root = city, city
+	journal.Request.Database, journal.Request.Workspace = "beads", "test"
+	journal.Request.Endpoint.Host, journal.Request.Endpoint.Port = "127.0.0.1", 3307
+	journal.Request.Owner = "legacy-gc"
+	journal.Phase, journal.Owner = "legacy_config_restored", "legacy-gc"
+	journal.SnapshotCaptured, journal.MutationOccurred = true, true
+	setProjectionEligibleSnapshot(t, &journal)
+	journal.Snapshot.WorkspaceMetadata = metadata
+	journal.Snapshot.WorkspaceConfig = config
+	journal.Snapshot.WorkspacePort = port
+	journal.Snapshot.WorkspaceMetadataPresent = true
+	journal.Snapshot.WorkspaceConfigPresent = true
+	journal.Snapshot.WorkspacePortPresent = true
+	journal.Snapshot.WorkspaceMetadataMode = 0o600
+	journal.Snapshot.WorkspaceConfigMode = 0o600
+	journal.Snapshot.WorkspacePortMode = 0o600
+	body, err := json.Marshal(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "ownership-handoff.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := handoffJournalBlocksManagedDoltStart(city); err == nil {
-		t.Fatal("drifted restored config admitted managed start")
+		t.Fatal("a restore that never landed admitted the managed start")
 	}
 }
 

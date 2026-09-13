@@ -307,6 +307,30 @@ the first provider-owned `gc start` or `gc stop` removes
 `.gc/runtime/packs/dolt/dolt-state.json` and its provider-state twin, and
 nothing under `.beads`.
 
+### A rollback is an admission, not a standing invariant
+
+The compensation half of M8 is what proves this. A transfer that gets past gc's
+stop and then cannot finish must put the city back rather than leave it owned by
+nobody: bd restores metadata.json, config.yaml and the published port from its
+checkpoint, and gc restarts the legacy owner.
+
+gc's projection admits that restore only if the three files match the journal
+byte for byte. That is the correct rule for *deciding* the scope is legacy-owned
+again, and the wrong lifetime for it: the restart bd just asked for publishes
+gc's managed runtime state, which reconciles the scope's canonical config, which
+merges this build's bead vocabulary into `types.custom` — a byte the journal's
+snapshot cannot contain because it predates the restart. Re-checking on every
+later command refused `gc start` and `gc stop` forever on a city with a healthy
+legacy server.
+
+So the gate answers once. The first byte-exact match is recorded in
+`<city>/.gc/beads-handoff-rollback-admitted.json`, keyed by a digest of the
+request identity and the restored artifacts, and the scope follows the ordinary
+rules from then on. A journal whose artifacts never matched is refused and stays
+refused: nothing has proven the rollback completed. bd's own archive rename of a
+journal that reaches `rolled_back` is the other way out and needs nothing from
+gc — an archived journal is an absent journal, which is the legacy condition.
+
 ## Deliberately not done
 
 - **Native SQL over the proxy.** Proxied scopes read and write through the bd

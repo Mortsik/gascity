@@ -111,10 +111,14 @@ type handoffProjectionJournal struct {
 	Owner                string `json:"owner"`
 }
 
-// committedBeadsHandoffOwnsScope is the read-only ownership projection used
-// by GC's normal lifecycle resolver. A committed direct-local handoff is
-// provider-owned. Only a byte-exact restored rollback is legacy-owned;
-// pending, corrupt, and conflicting records fail closed.
+// committedBeadsHandoffOwnsScope is the ownership projection used by GC's
+// normal lifecycle resolver. A committed direct-local handoff is
+// provider-owned. Only an admitted restored rollback is legacy-owned; pending,
+// corrupt, and conflicting records fail closed.
+//
+// It is read-only but for one thing: the first time a rolled-back journal's
+// artifacts are found byte-exact, that admission is recorded. See
+// admitRolledBackHandoff for why the comparison cannot be a standing invariant.
 func committedBeadsHandoffOwnsScope(scopeRoot string) (bool, error) {
 	// A missing journal is the legacy condition. Do not impose physical-path
 	// requirements on a fresh scope until there is a handoff record to admit.
@@ -181,7 +185,7 @@ func committedBeadsHandoffOwnsScope(scopeRoot string) (bool, error) {
 		if err := validateRestoredProjection(journal); err != nil {
 			return false, err
 		}
-		if err := handoffJournalRestoredArtifactsMatch(scopeRoot, journal.Snapshot.WorkspaceMetadata, journal.Snapshot.WorkspaceConfig, journal.Snapshot.WorkspacePort, journal.Snapshot.WorkspaceMetadataPresent, journal.Snapshot.WorkspaceConfigPresent, journal.Snapshot.WorkspacePortPresent, journal.Snapshot.WorkspaceMetadataMode, journal.Snapshot.WorkspaceConfigMode, journal.Snapshot.WorkspacePortMode); err != nil {
+		if err := admitRolledBackHandoff(scopeRoot, journal); err != nil {
 			return false, err
 		}
 		return false, nil
