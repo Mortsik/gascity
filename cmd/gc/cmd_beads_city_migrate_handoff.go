@@ -286,9 +286,9 @@ func runMigrateHandoff(cityPath string, opts migrateHandoffOptions, report *migr
 	// forward. Whatever went wrong the first time is still what happened, and
 	// the exit from bd's fence is the rollback's own tail.
 	if migrateHandoffIsRollbackPhase(journal) {
-		endpoint, endpointErr := resolveMigrateHandoffLegacyEndpointForRollback(cityPath)
-		if endpointErr != nil {
-			fmt.Fprintf(stderr, "%s: %v\n", name, endpointErr) //nolint:errcheck
+		scope, scopeErr := resolveMigrateHandoffScopeFromJournal(cityPath)
+		if scopeErr != nil {
+			fmt.Fprintf(stderr, "%s: %v\n", name, scopeErr) //nolint:errcheck
 			report.Status = migrateHandoffStatusFailed
 			report.Failed++
 			return 1
@@ -301,7 +301,7 @@ func runMigrateHandoff(cityPath string, opts migrateHandoffOptions, report *migr
 			})
 			return 0
 		}
-		finishMigrateHandoffRollback(cityPath, endpoint, report, stderr)
+		finishMigrateHandoffRollback(cityPath, scope, report, stderr)
 		// A rollback that completes is a rollback that completed, not a
 		// transfer that happened. The exit status says the city was not handed
 		// over; the report's status says how far the compensation got.
@@ -354,8 +354,16 @@ func migrateHandoffForward(cityPath string, scope migrateHandoffScope, journal s
 	// 1. prepare. Nothing is mutated outside bd's journal, so a resume simply
 	//    re-reports the phase it already reached.
 	if !reached("prepared") {
+		// The pid hint is prepare's alone. bd resolves the legacy process from
+		// the port holder itself and records gc's belief beside what it found;
+		// repeating it later would only re-assert a belief about a process
+		// that is, by then, supposed to be gone.
+		//
+		// There is no birth hint. bd's process-birth identity is its own
+		// format — a platform-versioned boot id and start tick — and gc has no
+		// way to mint one that bd would recognize. The contract makes hints
+		// optional precisely so a caller can decline to invent one.
 		result, step := runMigrateHandoffVerb(cityPath, scope, "prepare",
-			"--legacy-endpoint", scope.Endpoint.String(),
 			"--legacy-pid", strconv.Itoa(scope.Endpoint.PID),
 			"--caller", "gc")
 		report.Steps = append(report.Steps, step)
@@ -428,7 +436,7 @@ func migrateHandoffForward(cityPath string, scope migrateHandoffScope, journal s
 		// journal, which otherwise fences every gc lifecycle command on this
 		// city with no documented way out.
 		fmt.Fprintf(stderr, "%s: rolling the transfer back\n", name) //nolint:errcheck
-		rollbackCode := finishMigrateHandoffRollback(cityPath, scope.Endpoint, report, stderr)
+		rollbackCode := finishMigrateHandoffRollback(cityPath, scope, report, stderr)
 		if rollbackCode == 0 {
 			report.Status = migrateHandoffStatusRolledBack
 		}
@@ -447,9 +455,9 @@ func migrateHandoffForward(cityPath string, scope migrateHandoffScope, journal s
 // is why it starts from `rollback` rather than assuming a phase: bd's verbs are
 // idempotent, and re-running one that has already reached its phase reports the
 // journal instead of redoing the work.
-func finishMigrateHandoffRollback(cityPath string, endpoint legacyHandoffEndpoint, report *migrateHandoffReport, stderr io.Writer) int {
+func finishMigrateHandoffRollback(cityPath string, scope migrateHandoffScope, report *migrateHandoffReport, stderr io.Writer) int {
 	const name = "gc beads city migrate-handoff"
-	scope := migrateHandoffScope{Path: cityPath, Endpoint: endpoint}
+	endpoint := scope.Endpoint
 
 	result, step := runMigrateHandoffVerb(cityPath, scope, "rollback")
 	report.Steps = append(report.Steps, step)
@@ -593,16 +601,17 @@ func restartLegacyManagedDoltForHandoff(cityPath string, endpoint legacyHandoffE
 // runMigrateHandoffVerb runs one bd phase and turns its object into a step.
 func runMigrateHandoffVerb(cityPath string, scope migrateHandoffScope, verb string, extra ...string) (bdHandoffResult, migrateHandoffStep) {
 	step := migrateHandoffStep{Step: verb, Actor: "bd"}
+	// The whole request goes on every verb, not just the first. bd rebuilds it
+	// from the command line each time and checks it against the journal, which
+	// is what makes a resume refuse a request for a different scope instead of
+	// merging it. Only the hints are prepare's.
 	args := append([]string{
 		"migrate", "ownership-handoff", verb, "--json",
 		"--root", scope.Path,
+		"--database", scope.Database,
+		"--workspace", scope.Workspace,
+		"--legacy-endpoint", scope.Endpoint.String(),
 	}, extra...)
-	if scope.Database != "" {
-		args = append(args, "--database", scope.Database)
-	}
-	if scope.Workspace != "" {
-		args = append(args, "--workspace", scope.Workspace)
-	}
 	out, runErr := runBdScopeCommand(cityPath, scope.Path, args...)
 	result, decodeErr := decodeBdHandoffResult(out)
 	if decodeErr != nil {
@@ -795,6 +804,20 @@ func classifyMigrateHandoffCity(cityPath, journalPhase string) (migrateHandoffSc
 	}
 	scope.Database, scope.Workspace = database, workspace
 
+	// A resume takes its request from bd's journal, not from gc's publication.
+	// The publication is retired as part of the stop, so past that point there
+	// is nothing left for gc to re-derive the endpoint from — and bd refuses a
+	// request that disagrees with its journal, which gc must not be the one to
+	// cause. A first run has no journal and reads gc's own live record.
+	if journalPhase != "" {
+		resumed, err := resolveMigrateHandoffScopeFromJournal(cityPath)
+		if err != nil {
+			return scope, err
+		}
+		scope.Endpoint = resumed.Endpoint
+		scope.Database, scope.Workspace = resumed.Database, resumed.Workspace
+		return scope, nil
+	}
 	endpoint, err := resolveMigrateHandoffLegacyEndpoint(cityPath)
 	if err != nil {
 		return scope, err
@@ -851,28 +874,35 @@ func migrateHandoffLoopbackHost() (string, error) {
 	return host, nil
 }
 
-// resolveMigrateHandoffLegacyEndpointForRollback recovers the endpoint for a
-// transfer already past gc's stop, where gc's publication has been retired.
+// resolveMigrateHandoffScopeFromJournal recovers bd's request for a transfer
+// already past gc's stop, where gc's own publication has been retired.
 //
-// bd's journal is the record then: it holds the request gc supplied, and the
-// rollback restores the workspace to exactly the state that endpoint belongs
-// to. The pid is not recovered — it names a process that is gone, and it is
-// only ever a hint.
-func resolveMigrateHandoffLegacyEndpointForRollback(cityPath string) (legacyHandoffEndpoint, error) {
+// bd's journal is the record then: it holds the exact request gc supplied, and
+// the rollback restores the workspace to the state that request belongs to.
+// Reading it back rather than re-deriving it is also what keeps a resume from
+// silently re-scoping the transfer — bd refuses a request that disagrees with
+// its journal, and gc should not be the one making them disagree. The pid is
+// not recovered: it names a process that is gone, and it was only ever a hint.
+func resolveMigrateHandoffScopeFromJournal(cityPath string) (migrateHandoffScope, error) {
 	path := filepath.Join(cityPath, ".beads", handoffJournalName)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return legacyHandoffEndpoint{}, fmt.Errorf("read ownership handoff journal %s: %w", path, err)
+		return migrateHandoffScope{}, fmt.Errorf("read ownership handoff journal %s: %w", path, err)
 	}
 	var journal handoffProjectionJournal
 	if err := json.Unmarshal(data, &journal); err != nil {
-		return legacyHandoffEndpoint{}, fmt.Errorf("parse ownership handoff journal %s: %w", path, err)
+		return migrateHandoffScope{}, fmt.Errorf("parse ownership handoff journal %s: %w", path, err)
 	}
-	endpoint := journal.Request.Endpoint
-	if endpoint.Host == "" || endpoint.Port <= 0 {
-		return legacyHandoffEndpoint{}, fmt.Errorf("ownership handoff journal %s records no legacy endpoint to restore", path)
+	request := journal.Request
+	if request.Endpoint.Host == "" || request.Endpoint.Port <= 0 || request.Database == "" || request.Workspace == "" {
+		return migrateHandoffScope{}, fmt.Errorf("ownership handoff journal %s records no request to resume", path)
 	}
-	return legacyHandoffEndpoint{Host: endpoint.Host, Port: endpoint.Port}, nil
+	return migrateHandoffScope{
+		Path:      cityPath,
+		Database:  request.Database,
+		Workspace: request.Workspace,
+		Endpoint:  legacyHandoffEndpoint{Host: request.Endpoint.Host, Port: request.Endpoint.Port},
+	}, nil
 }
 
 func printMigrateHandoffReport(stdout io.Writer, report migrateHandoffReport) {

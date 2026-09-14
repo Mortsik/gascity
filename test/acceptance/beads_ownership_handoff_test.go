@@ -599,9 +599,14 @@ func TestBeadsOwnershipHandoffLegacyAliveThenRollsBack(t *testing.T) {
 	})
 
 	t.Run("bd-proves-it-with-legacy-alive", func(t *testing.T) {
+		// Either code is bd saying "the old owner has not let go". The contract
+		// table folds every failing release gate into legacy_alive; bd names
+		// the data-dir gate specifically, which is the more useful of the two
+		// and still in the typed vocabulary. What must not happen is bd
+		// agreeing with gc's own report that the stop worked.
 		gone := report.step(t, "legacy-gone")
-		if gone.ErrorCode != "legacy_alive" {
-			t.Fatalf("bd answered %q, want legacy_alive — gc's stop is a belief and bd's gates are the proof: %+v",
+		if gone.ErrorCode != "legacy_alive" && gone.ErrorCode != "data_dir_locked" {
+			t.Fatalf("bd answered %q, want legacy_alive or data_dir_locked — gc's stop is a belief and bd's gates are the proof: %+v",
 				gone.ErrorCode, gone)
 		}
 		if len(gone.Evidence) == 0 {

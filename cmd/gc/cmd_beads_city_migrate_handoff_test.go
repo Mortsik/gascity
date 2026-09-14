@@ -337,11 +337,37 @@ func TestMigrateHandoffDrivesBdsPhasesInOrder(t *testing.T) {
 			t.Errorf("%s was handed a GC_BIN: %v", call.Verb, call.Args)
 		}
 	}
+	// The whole request goes on EVERY verb, not just the first. bd rebuilds it
+	// from the command line each time and checks it against the journal, so a
+	// verb missing a half of it is not a smaller request — it is an invalid one,
+	// and the transfer stops with gc's server already down.
+	for _, call := range *calls {
+		joined := strings.Join(call.Args, " ")
+		for _, want := range []string{
+			"--root " + city,
+			"--database hq",
+			"--workspace workspace-uuid",
+			"--legacy-endpoint 127.0.0.1:35402",
+		} {
+			if !strings.Contains(joined, want) {
+				t.Errorf("%s was invoked without %q: %v", call.Verb, want, call.Args)
+			}
+		}
+	}
 	// The pid is a hint and is only ever offered at prepare, where bd records
-	// it beside the identity it resolved for itself.
+	// it beside the identity it resolved for itself. Repeating it later
+	// re-asserts a belief about a process that is supposed to be gone.
 	for _, call := range (*calls)[1:] {
 		if strings.Contains(strings.Join(call.Args, " "), "--legacy-pid") {
 			t.Errorf("%s repeated the pid hint: %v", call.Verb, call.Args)
+		}
+	}
+	// gc cannot mint bd's process-birth identity — it is bd's own
+	// platform-versioned format — and the contract makes hints optional so a
+	// caller can decline to invent one rather than pass something plausible.
+	for _, call := range *calls {
+		if strings.Contains(strings.Join(call.Args, " "), "--legacy-pid-birth") {
+			t.Errorf("%s passed a birth identity gc has no way to compute: %v", call.Verb, call.Args)
 		}
 	}
 }
@@ -466,8 +492,9 @@ func TestMigrateHandoffResumesARollbackInProgress(t *testing.T) {
 	city := legacyHandoffFixtureCity(t)
 	journal := pendingHandoffJournal(city, "legacy_config_restored")
 	journal.Request.Endpoint.Port = 35402
+	journal.Request.Database = "from-the-journal"
 	writeHandoffJournal(t, city, journal)
-	_, order := stubMigrateHandoffBd(t, happyBdHandoff)
+	calls, order := stubMigrateHandoffBd(t, happyBdHandoff)
 
 	code, report, stderr := runMigrateHandoffJSON(t, city, migrateHandoffOptions{})
 	if code != 1 {
@@ -479,6 +506,15 @@ func TestMigrateHandoffResumesARollbackInProgress(t *testing.T) {
 	want := []string{"bd:rollback", "gc:restart", "bd:rollback-finish"}
 	if strings.Join(*order, ",") != strings.Join(want, ",") {
 		t.Fatalf("rollback resume ran %v, want %v", *order, want)
+	}
+	// The request comes back out of the journal, not out of a fresh
+	// classification. gc's own publication is retired by this point, so there
+	// is nothing left to re-derive it from — and bd refuses a request that
+	// disagrees with its journal, which gc must not be the one to cause.
+	for _, call := range *calls {
+		if !strings.Contains(strings.Join(call.Args, " "), "--database from-the-journal") {
+			t.Errorf("%s was resumed with a request gc invented rather than the journal's: %v", call.Verb, call.Args)
+		}
 	}
 }
 
