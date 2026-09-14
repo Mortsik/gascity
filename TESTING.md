@@ -970,6 +970,43 @@ GC_ACCEPTANCE_BD_BIN=... TMPDIR=/data/tmp make test-acceptance \
 Never point `TMPDIR` at tmpfs: these tests start real Dolt servers, and their
 data directories have to survive on a real filesystem.
 
+##### M8, the journaled ownership handoff
+
+`TestBeadsOwnershipHandoffLegacyCityToBd`,
+`TestBeadsOwnershipHandoffLegacyAliveThenRollsBack` and
+`TestBeadsOwnershipHandoffInterruptedAfterStop`
+(`test/acceptance/beads_ownership_handoff_test.go`) are the same legacy shape as
+M5, handed to bd through `gc beads city migrate-handoff` — which drives bd's
+journaled `migrate ownership-handoff` verbs — instead of migrated by gc. They
+need the same two variables plus a `bd` that has those verbs at all; the probe
+is for `--legacy-endpoint`, the flag that exists because bd no longer asks gc
+anything, so every `bd` through `v1.3.0-rc.2` skips them typed and they cost CI
+nothing today:
+
+```bash
+GC_ACCEPTANCE_BD_BIN=/path/to/bd-with-ownership-handoff \
+GC_ACCEPTANCE_LEGACY_GC_BIN=/path/to/gc-pre-journal \
+TMPDIR=/data/tmp make test-acceptance \
+  ACCEPTANCE_TIMEOUT=60m \
+  ACCEPTANCE_GO_TEST_FLAGS='-count=1 -v -run TestBeadsOwnershipHandoff'
+```
+
+These are the RC gate for the handoff: they assert that the artifact bd writes
+is the artifact gc reads — at the path gc reads it from and at the schema
+version gc will interpret — so a `bd` that performs a technically successful
+handoff gc cannot see fails them rather than passing.
+
+Neither fault is a shim. `LegacyAliveThenRollsBack` holds Dolt's exclusive store
+lock under the city's data dir, which is the genuine "a prior instance has not
+released the data dir" condition both gc's stop and bd's `legacy-gone` are
+written for: gc's stop fails, bd refuses `legacy_alive`, and the compensation
+runs because a journal stuck mid-transfer fences every gc lifecycle command on
+the city. Releasing the lock and re-running settles the rollback, archives the
+journal and hands the city back to gc. `InterruptedAfterStop` SIGKILLs the
+orchestrator's process group once bd's journal records the legacy owner gone,
+and asserts the retry converges. There is no `GC_BIN` anywhere in the file: the
+protocol that needed one is withdrawn.
+
 ##### The legacy shapes' one init path
 
 Both legacy fixtures — the matrix's M5 shape and AC-X — initialise through one
