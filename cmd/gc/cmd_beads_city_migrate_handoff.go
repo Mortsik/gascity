@@ -242,7 +242,10 @@ func doBeadsCityMigrateHandoff(cityPath string, opts migrateHandoffOptions, stdo
 		}
 	}
 	cityPath = normalizePathForCompare(cityPath)
-	report := migrateHandoffReport{City: cityPath, DryRun: opts.DryRun}
+	// Steps is non-nil from the start: a report that refuses before any step
+	// runs still has to say "no steps", and a JSON null there is not the empty
+	// array the result schema promises.
+	report := migrateHandoffReport{City: cityPath, DryRun: opts.DryRun, Steps: []migrateHandoffStep{}}
 
 	code := runMigrateHandoff(cityPath, opts, &report, stderr)
 	if opts.JSON {
