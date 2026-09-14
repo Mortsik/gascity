@@ -70,10 +70,7 @@ func admitRolledBackHandoff(scopeRoot string, journal handoffProjectionJournal) 
 	if admitted {
 		return nil
 	}
-	s := journal.Snapshot
-	if err := handoffJournalRestoredArtifactsMatch(scopeRoot, s.WorkspaceMetadata, s.WorkspaceConfig, s.WorkspacePort,
-		s.WorkspaceMetadataPresent, s.WorkspaceConfigPresent, s.WorkspacePortPresent,
-		s.WorkspaceMetadataMode, s.WorkspaceConfigMode, s.WorkspacePortMode); err != nil {
+	if err := handoffJournalRestoredArtifactsMatch(scopeRoot, restoredHandoffArtifacts(journal)); err != nil {
 		return err
 	}
 	return recordRolledBackHandoffAdmission(scopeRoot, token)
@@ -81,32 +78,20 @@ func admitRolledBackHandoff(scopeRoot string, journal handoffProjectionJournal) 
 
 // rolledBackHandoffRestoreToken names the restoration an admission covers.
 //
-// It digests the request identity and the checkpointed artifacts rather than
-// the journal's legacy inspect proof, because that proof is not stable across
-// the rollback: bd replaces the snapshot's metadata and sentinel with a fresh
-// inspect of the restarted owner when it reaches rolled_back, while the
-// artifacts it restored do not change. Keying on them also makes a stale marker
+// It digests the request identity and the checkpointed artifacts, which are the
+// only part of the journal that does not move under the rollback: the target
+// identity is retired, the evidence is re-recorded as the rollback advances,
+// and the phase itself changes between legacy_config_restored and rolled_back.
+// The bytes bd put back do not. Keying on them also makes a stale marker
 // harmless — it can only re-admit a restoration of the very same bytes into the
 // very same scope, which is the same decision gc already made.
 func rolledBackHandoffRestoreToken(scopeRoot string, journal handoffProjectionJournal) (string, error) {
-	s := journal.Snapshot
 	body, err := json.Marshal(struct {
-		Scope           string `json:"scope"`
-		Request         any    `json:"request"`
-		Metadata        []byte `json:"metadata"`
-		Config          []byte `json:"config"`
-		Port            []byte `json:"port"`
-		MetadataPresent bool   `json:"metadata_present"`
-		ConfigPresent   bool   `json:"config_present"`
-		PortPresent     bool   `json:"port_present"`
-		MetadataMode    uint32 `json:"metadata_mode"`
-		ConfigMode      uint32 `json:"config_mode"`
-		PortMode        uint32 `json:"port_mode"`
+		Scope     string                               `json:"scope"`
+		Request   any                                  `json:"request"`
+		Artifacts map[string]handoffProjectionArtifact `json:"artifacts"`
 	}{
-		Scope: scopeRoot, Request: journal.Request,
-		Metadata: s.WorkspaceMetadata, Config: s.WorkspaceConfig, Port: s.WorkspacePort,
-		MetadataPresent: s.WorkspaceMetadataPresent, ConfigPresent: s.WorkspaceConfigPresent, PortPresent: s.WorkspacePortPresent,
-		MetadataMode: s.WorkspaceMetadataMode, ConfigMode: s.WorkspaceConfigMode, PortMode: s.WorkspacePortMode,
+		Scope: scopeRoot, Request: journal.Request, Artifacts: restoredHandoffArtifacts(journal),
 	})
 	if err != nil {
 		return "", fmt.Errorf("digest restored ownership handoff artifacts: %w", err)

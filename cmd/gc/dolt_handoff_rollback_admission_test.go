@@ -39,31 +39,12 @@ func writeRestoredHandoffJournal(t *testing.T, city, phase string, drift bool, c
 		}
 	}
 
-	var journal handoffProjectionJournal
-	journal.Request.CityRoot, journal.Request.Root = city, city
-	journal.Request.Database, journal.Request.Workspace = "beads", "test"
-	journal.Request.Endpoint.Host, journal.Request.Endpoint.Port = "127.0.0.1", 3307
-	journal.Request.Owner = "legacy-gc"
-	journal.Phase, journal.Owner = phase, "legacy-gc"
-	journal.SnapshotCaptured, journal.MutationOccurred = true, true
-	setProjectionEligibleSnapshot(t, &journal)
-	journal.Snapshot.WorkspaceMetadata = metadata
-	journal.Snapshot.WorkspaceConfig = config
-	journal.Snapshot.WorkspacePort = port
-	journal.Snapshot.WorkspaceMetadataPresent = true
-	journal.Snapshot.WorkspaceConfigPresent = true
-	journal.Snapshot.WorkspacePortPresent = true
-	journal.Snapshot.WorkspaceMetadataMode = 0o600
-	journal.Snapshot.WorkspaceConfigMode = 0o600
-	journal.Snapshot.WorkspacePortMode = 0o600
+	journal := pendingHandoffJournal(city, phase)
+	journal.Snapshot.Metadata = handoffProjectionArtifact{Present: true, Data: metadata, Mode: 0o600}
+	journal.Snapshot.Config = handoffProjectionArtifact{Present: true, Data: config, Mode: 0o600}
+	journal.Snapshot.PortFile = handoffProjectionArtifact{Present: true, Data: port, Mode: 0o600}
+	writeHandoffJournal(t, city, journal)
 
-	body, err := json.Marshal(journal)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(beadsDir, "ownership-handoff.json"), body, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	return config
 }
 

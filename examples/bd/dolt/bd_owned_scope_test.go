@@ -45,7 +45,8 @@ func writeHandedOffScope(t *testing.T, cityPath string) {
 		t.Fatal(err)
 	}
 	journal := `{
-  "request": {"city_root": "` + cityPath + `", "root": "` + cityPath + `"},
+  "schema_version": 2,
+  "request": {"root": "` + cityPath + `"},
   "phase": "committed",
   "owner": "bd"
 }`
@@ -528,10 +529,15 @@ func TestHandoffOwnershipPredicateAdmitsOnlyACommittedTransfer(t *testing.T) {
 		journal string
 		bdOwned bool
 	}{
-		{"committed to bd", `{"phase":"committed","owner":"bd"}`, true},
-		{"still pending", `{"phase":"target_configured","owner":"legacy-gc"}`, false},
-		{"rolled back", `{"phase":"rolled_back","owner":"legacy-gc"}`, false},
-		{"committed but owned by the legacy side", `{"phase":"committed","owner":"legacy-gc"}`, false},
+		{"committed to bd", `{"schema_version":2,"phase":"committed","owner":"bd"}`, true},
+		{"still pending", `{"schema_version":2,"phase":"target_configured","owner":"legacy-gc"}`, false},
+		{"rolled back", `{"schema_version":2,"phase":"rolled_back","owner":"legacy-gc"}`, false},
+		{"committed but owned by the legacy side", `{"schema_version":2,"phase":"committed","owner":"legacy-gc"}`, false},
+		// The version is read before the phase, for the same reason cmd/gc
+		// reads it first: the phase names are shared across journal versions
+		// and do not mean the same thing in them.
+		{"committed with no version at all", `{"phase":"committed","owner":"bd"}`, false},
+		{"committed by a newer bd", `{"schema_version":3,"phase":"committed","owner":"bd"}`, false},
 		{"malformed", `not json`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

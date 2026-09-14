@@ -37,6 +37,15 @@ bd_scope_json_field() {
   sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$1" 2>/dev/null | head -1
 }
 
+# bd_scope_json_number <file> <key> prints a top-level integer value. The string
+# reader above cannot: it requires quotes around the value, so every number in
+# the document reads as absent, which is the difference between "this journal is
+# version 2" and "this journal has no version".
+bd_scope_json_number() {
+  [ -f "$1" ] || return 0
+  sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$1" 2>/dev/null | head -1
+}
+
 # bd_owns_proxied_scope [scope] succeeds when the scope's persisted beads
 # metadata says bd owns its Dolt topology through the proxy. Defaults to
 # GC_CITY_PATH. Only the persisted binding counts: a scope with no beads
@@ -68,11 +77,17 @@ bd_owns_proxied_scope() {
 # decides whether an order has anything to do, and every unreadable or
 # unsettled journal falls back to the managed lens — where every gc verb the
 # order would call now refuses on its own.
+# Shallow still means versioned. The schema version is read before the phase,
+# because the phase names are shared between journal versions and do not mean
+# the same thing in them. A journal of any other version is not a signal.
+GC_DOLT_HANDOFF_JOURNAL_VERSION=2
+
 bd_scope_was_handed_off() {
   _handoff_scope="${1:-${GC_CITY_PATH:-}}"
   [ -n "$_handoff_scope" ] || return 1
   _handoff_journal="$_handoff_scope/.beads/ownership-handoff.json"
   [ -f "$_handoff_journal" ] || return 1
+  [ "$(bd_scope_json_number "$_handoff_journal" schema_version)" = "$GC_DOLT_HANDOFF_JOURNAL_VERSION" ] || return 1
   [ "$(bd_scope_json_field "$_handoff_journal" phase)" = "committed" ] || return 1
   [ "$(bd_scope_json_field "$_handoff_journal" owner)" = "bd" ]
 }
