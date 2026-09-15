@@ -154,9 +154,82 @@ func handoffStep(t *testing.T, report migrateHandoffReport, name string) migrate
 
 func migrateHandoffRollbackFinishBackoffForTest(t *testing.T, backoff time.Duration) {
 	t.Helper()
-	previous := migrateHandoffRollbackFinishBackoff
+	previousFinish := migrateHandoffRollbackFinishBackoff
+	previousBusy := migrateHandoffJournalBusyBackoff
 	migrateHandoffRollbackFinishBackoff = backoff
-	t.Cleanup(func() { migrateHandoffRollbackFinishBackoff = previous })
+	migrateHandoffJournalBusyBackoff = backoff
+	t.Cleanup(func() {
+		migrateHandoffRollbackFinishBackoff = previousFinish
+		migrateHandoffJournalBusyBackoff = previousBusy
+	})
+}
+
+// gc runs every bd child in its own process group, so an operator who kills gc
+// leaves the verb it had started running to completion — and re-running then
+// meets the journal lock that verb still holds. journal_busy is "wait", not
+// "no", and waiting is the command's job.
+func TestMigrateHandoffWaitsOutABusyJournal(t *testing.T) {
+	city := legacyHandoffFixtureCity(t)
+	busy := 0
+	calls, _ := stubMigrateHandoffBd(t, func(verb string, args []string) (bdHandoffResult, error) {
+		if verb == "prepare" && busy < 3 {
+			busy++
+			return bdHandoffResult{
+				ErrorCode: "journal_busy",
+				Error:     "another ownership handoff verb holds the journal",
+			}, errors.New("exit 1")
+		}
+		return happyBdHandoff(verb, args)
+	})
+	migrateHandoffRollbackFinishBackoffForTest(t, 0)
+
+	code, report, stderr := runMigrateHandoffJSON(t, city, migrateHandoffOptions{})
+	if code != 0 {
+		t.Fatalf("a transfer behind a busy journal = %d, want 0\nstderr=%s", code, stderr)
+	}
+	if report.Status != migrateHandoffStatusHandedOff {
+		t.Fatalf("report status = %q, want %q", report.Status, migrateHandoffStatusHandedOff)
+	}
+	if got := handoffStep(t, report, "prepare").Status; got != migrateHandoffStepOK {
+		t.Fatalf("prepare status = %q after the lock cleared, want ok", got)
+	}
+	prepares := 0
+	for _, call := range *calls {
+		if call.Verb == "prepare" {
+			prepares++
+		}
+	}
+	if prepares != busy+1 {
+		t.Fatalf("prepare ran %d times, want %d (once per busy answer, then once more)", prepares, busy+1)
+	}
+}
+
+// The wait is bounded. A journal that is busy forever is a report, not a hang.
+func TestMigrateHandoffBoundsTheBusyJournalWait(t *testing.T) {
+	city := legacyHandoffFixtureCity(t)
+	attempts := 0
+	_, _ = stubMigrateHandoffBd(t, func(verb string, args []string) (bdHandoffResult, error) {
+		if verb == "prepare" {
+			attempts++
+			return bdHandoffResult{
+				ErrorCode: "journal_busy",
+				Error:     "another ownership handoff verb holds the journal",
+			}, errors.New("exit 1")
+		}
+		return happyBdHandoff(verb, args)
+	})
+	migrateHandoffRollbackFinishBackoffForTest(t, 0)
+
+	code, report, _ := runMigrateHandoffJSON(t, city, migrateHandoffOptions{})
+	if code != 1 {
+		t.Fatalf("a journal busy forever = %d, want 1", code)
+	}
+	if attempts != migrateHandoffJournalBusyAttempts {
+		t.Fatalf("prepare ran %d times, want the bound of %d", attempts, migrateHandoffJournalBusyAttempts)
+	}
+	if got := handoffStep(t, report, "prepare").ErrorCode; got != "journal_busy" {
+		t.Fatalf("the exhausted wait reports %q, want journal_busy", got)
+	}
 }
 
 func TestNewBeadsCmdIncludesCityMigrateHandoff(t *testing.T) {

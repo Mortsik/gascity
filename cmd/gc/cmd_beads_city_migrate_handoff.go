@@ -65,9 +65,24 @@ const (
 	migrateHandoffRestartTimeout         = 60 * time.Second
 )
 
-// migrateHandoffRollbackFinishBackoff is a variable so a test can drive the
-// retry without waiting out a readiness window it is not testing.
-var migrateHandoffRollbackFinishBackoff = 2 * time.Second
+// migrateHandoffJournalBusyAttempts bounds the retry of a verb that found
+// another one holding the journal.
+//
+// journal_busy is not a refusal of the request, it is "somebody else is
+// mid-verb" — and the documented recovery is to run the command again. gc runs
+// every bd child in its own process group, precisely so a timeout can kill the
+// tree, which also means an operator who kills gc leaves the bd verb it had
+// started running to completion. Re-running immediately then hits the lock that
+// verb still holds. Handing that back as a failure whose only remedy is to type
+// the same command again is work the command can do itself.
+const migrateHandoffJournalBusyAttempts = 10
+
+// The two retry backoffs are variables so a test can drive the loops without
+// waiting out windows it is not testing.
+var (
+	migrateHandoffRollbackFinishBackoff = 2 * time.Second
+	migrateHandoffJournalBusyBackoff    = 2 * time.Second
+)
 
 // The two seams that touch a real process. Production uses the concrete
 // functions below; package tests replace them with t.Cleanup and do not run
@@ -613,6 +628,12 @@ func runMigrateHandoffVerb(cityPath string, scope migrateHandoffScope, verb stri
 		"--legacy-endpoint", scope.Endpoint.String(),
 	}, extra...)
 	out, runErr := runBdScopeCommand(cityPath, scope.Path, args...)
+	// A verb that finds the journal locked has not been refused; it has been
+	// asked to wait. Waiting is this command's job, not the operator's.
+	for attempt := 1; attempt < migrateHandoffJournalBusyAttempts && handoffResultIsJournalBusy(out); attempt++ {
+		time.Sleep(migrateHandoffJournalBusyBackoff)
+		out, runErr = runBdScopeCommand(cityPath, scope.Path, args...)
+	}
 	result, decodeErr := decodeBdHandoffResult(out)
 	if decodeErr != nil {
 		step.Status = migrateHandoffStepFailed
@@ -636,6 +657,14 @@ func runMigrateHandoffVerb(cityPath string, scope migrateHandoffScope, verb stri
 	step.Status = migrateHandoffStepOK
 	step.Detail = migrateHandoffStepDetail(verb, result)
 	return result, step
+}
+
+// handoffResultIsJournalBusy reports whether bd refused because another verb
+// holds the journal lock. It reads the decoded code rather than the text so a
+// reworded message cannot silently turn the wait back into a failure.
+func handoffResultIsJournalBusy(out []byte) bool {
+	result, err := decodeBdHandoffResult(out)
+	return err == nil && result.ErrorCode == "journal_busy"
 }
 
 func migrateHandoffStepDetail(verb string, result bdHandoffResult) string {
