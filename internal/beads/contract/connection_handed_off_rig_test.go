@@ -1,6 +1,7 @@
 package contract
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -125,5 +126,89 @@ func TestInheritedRigWithHalfAnEndpointIsStillRefused(t *testing.T) {
 	}
 	if err := ValidateCanonicalConfigState(fs, city, rig, cfg); err == nil {
 		t.Fatal("an inherited rig carrying only a host was accepted")
+	}
+}
+
+// The shape the ownership handoff actually leaves behind is a `managed_city`
+// city whose gc runtime publication has been retired.
+//
+// The handoff transfers who RUNS the Dolt process, not who configured the
+// endpoint, so `gc.endpoint_origin` stays `managed_city` — and the orchestrator
+// removes `.gc/runtime/packs/dolt/dolt-state.json`, because leaving it says
+// running:true for a pid that is gone. The city's own arm has always fallen
+// through to bd's `.beads/dolt-server.pid`/`.port` when gc publishes no runtime
+// state; the inherited-rig arm did not, and demanded the file:
+//
+//	read dolt runtime state: ... dolt-state.json: no such file or directory
+//
+// That refusal is the rig's, but its blast radius is the city's: `gc doctor`
+// reports `rig:<name>:beads` as failed on a city that is working perfectly. A
+// rig under a managed city inherits the city's endpoint; which process is
+// serving it is not the rig's business, and the rig follows whichever record
+// the city currently has.
+func handedOffManagedCityWithLegacyRig(t *testing.T) (string, string) {
+	t.Helper()
+	fs := fsys.OSFS{}
+	city := t.TempDir()
+	rig := filepath.Join(city, "rigs", "testrig")
+
+	// What the legacy gc wrote, and what the handoff leaves alone: the city is
+	// still a managed city by origin, because gc configured the endpoint.
+	writeConfigLines(t, city, "issue_prefix: gc\n"+
+		"gc.endpoint_origin: managed_city\n"+
+		"gc.endpoint_status: verified\n")
+	writeCanonicalMetadata(t, fs, city, "hq")
+	writeConfigLines(t, rig, "issue_prefix: ma\n"+
+		"gc.endpoint_origin: inherited_city\n"+
+		"gc.endpoint_status: verified\n")
+	writeCanonicalMetadata(t, fs, rig, "ma")
+	return city, rig
+}
+
+func TestInheritedRigFollowsTheCityOntoBdsReplacementServer(t *testing.T) {
+	city, rig := handedOffManagedCityWithLegacyRig(t)
+	fs := fsys.OSFS{}
+	// bd's commit: the city's own server record, and no gc publication.
+	port := writeBdOwnedServerRecord(t, fs, city, os.Getpid())
+
+	target, err := ResolveDoltConnectionTarget(fs, city, rig)
+	if err != nil {
+		t.Fatalf("resolve an inherited rig under a handed-off city: %v", err)
+	}
+	if target.Host != "127.0.0.1" || target.Port != port {
+		t.Fatalf("rig target = %s:%s, want the city's replacement server 127.0.0.1:%s", target.Host, target.Port, port)
+	}
+	if target.Database != "ma" {
+		t.Errorf("rig database = %q, want its own %q", target.Database, "ma")
+	}
+}
+
+// And back again. A rollback republishes gc's runtime state and retires bd's
+// record, and the rig has to follow that too — the rule is "whichever record
+// the city currently has", not "prefer bd".
+func TestInheritedRigFollowsTheCityBackOntoTheManagedServer(t *testing.T) {
+	city, rig := handedOffManagedCityWithLegacyRig(t)
+	fs := fsys.OSFS{}
+	port := writeReachableRuntimeState(t, fs, city)
+
+	target, err := ResolveDoltConnectionTarget(fs, city, rig)
+	if err != nil {
+		t.Fatalf("resolve an inherited rig under a restored managed city: %v", err)
+	}
+	if target.Port != port {
+		t.Fatalf("rig target port = %s, want gc's republished %s", target.Port, port)
+	}
+}
+
+// A managed city with neither record is still an error: nothing is serving the
+// rig, and reporting a target would send every command at a dead endpoint.
+func TestInheritedRigUnderACityWithNoServerStillFails(t *testing.T) {
+	city, rig := handedOffManagedCityWithLegacyRig(t)
+	fs := fsys.OSFS{}
+
+	if _, err := ResolveDoltConnectionTarget(fs, city, rig); err == nil {
+		t.Fatal("an inherited rig resolved under a city with no running server at all")
+	} else if !IsManagedRuntimeUnavailable(err) {
+		t.Fatalf("error = %v, want the managed-runtime-unavailable class", err)
 	}
 }
