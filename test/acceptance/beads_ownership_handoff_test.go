@@ -1011,17 +1011,31 @@ func TestBeadsOwnershipHandoffInterruptedAfterStop(t *testing.T) {
 func waitForHandoffJournalUnlocked(t *testing.T, scopeRoot string, timeout time.Duration) {
 	t.Helper()
 	path := filepath.Join(scopeRoot, handoffJournalRelPath) + ".lock"
+	if !pollUntil(timeout, 200*time.Millisecond, func() bool {
+		free, err := handoffJournalLockIsFree(path)
+		if err != nil {
+			t.Fatalf("probe %s: %v", path, err)
+		}
+		return free
+	}) {
+		t.Fatalf("a bd verb still held %s after %s; the interrupt left a writer running", path, timeout)
+	}
+}
+
+// pollUntil is the one place this file waits on wall time. Both things it waits
+// for — a journal phase and a journal lock — are states another process reaches
+// when it reaches them, with no signal to subscribe to, so polling is the honest
+// mechanism; having one of them keeps it that way.
+func pollUntil(timeout, interval time.Duration, done func() bool) bool {
 	deadline := time.Now().Add(timeout)
 	for {
-		if free, err := handoffJournalLockIsFree(path); err != nil {
-			t.Fatalf("probe %s: %v", path, err)
-		} else if free {
-			return
+		if done() {
+			return true
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("a bd verb still held %s after %s; the interrupt left a writer running", path, timeout)
+			return false
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(interval)
 	}
 }
 
@@ -1049,22 +1063,26 @@ func waitForHandoffPhase(t *testing.T, cityRoot string, timeout time.Duration, p
 	for _, phase := range phases {
 		want[phase] = true
 	}
-	deadline := time.Now().Add(timeout)
 	last := "(no journal)"
-	for time.Now().Before(deadline) {
-		if doc, ok := readHandoffJournalQuietly(cityRoot); ok {
-			last = doc.Phase
-			if want[doc.Phase] {
-				return doc.Phase
-			}
-			if doc.Phase == "committed" {
-				t.Fatalf("the transfer committed before it could be interrupted")
-			}
+	reached := ""
+	if !pollUntil(timeout, 50*time.Millisecond, func() bool {
+		doc, ok := readHandoffJournalQuietly(cityRoot)
+		if !ok {
+			return false
 		}
-		time.Sleep(50 * time.Millisecond)
+		last = doc.Phase
+		if doc.Phase == "committed" {
+			t.Fatalf("the transfer committed before it could be interrupted")
+		}
+		if want[doc.Phase] {
+			reached = doc.Phase
+			return true
+		}
+		return false
+	}) {
+		t.Fatalf("the handoff never reached any of %v; last phase was %q", phases, last)
 	}
-	t.Fatalf("the handoff never reached any of %v; last phase was %q", phases, last)
-	return ""
+	return reached
 }
 
 // readHandoffJournalQuietly is readHandoffJournal for a poll loop: a journal

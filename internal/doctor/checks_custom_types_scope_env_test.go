@@ -2,7 +2,6 @@ package doctor
 
 import (
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -47,19 +46,6 @@ func writeScopeMetadataFile(t *testing.T, scopeRoot, database string) {
 	if err := os.WriteFile(filepath.Join(scopeRoot, ".beads", "metadata.json"), []byte(body+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-}
-
-// listenLoopback opens a listener the resolver's reachability probe can reach,
-// and keeps it alive for the test. Every record of a running server is probed
-// before it is believed, so a fixture that wants to be believed needs one.
-func listenLoopback(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	return strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
 }
 
 // legacyCityWithInheritedRig is the shape the handoff inherits: a managed city
@@ -114,7 +100,7 @@ func envPort(t *testing.T, env []string) string {
 
 func TestScopeDoltEnvSendsARigAtTheCitysManagedServer(t *testing.T) {
 	city, rig := legacyCityWithInheritedRig(t)
-	port := listenLoopback(t)
+	port := listenLoopbackPort(t)
 	writeGCRuntimeState(t, city, port)
 
 	if got := envPort(t, scopeDoltEnv(city, rig)); got != port {
@@ -127,7 +113,7 @@ func TestScopeDoltEnvSendsARigAtTheCitysManagedServer(t *testing.T) {
 // own — which is exactly why it carries no endpoint in its config.
 func TestScopeDoltEnvSendsARigAtTheCitysHandedOffServer(t *testing.T) {
 	city, rig := legacyCityWithInheritedRig(t)
-	port := listenLoopback(t)
+	port := listenLoopbackPort(t)
 	writeBdServerRecord(t, city, port)
 
 	if got := envPort(t, scopeDoltEnv(city, rig)); got != port {
@@ -138,9 +124,9 @@ func TestScopeDoltEnvSendsARigAtTheCitysHandedOffServer(t *testing.T) {
 // And a rollback puts gc's publication back, which the rig follows in turn.
 func TestScopeDoltEnvFollowsTheCityBackAfterARollback(t *testing.T) {
 	city, rig := legacyCityWithInheritedRig(t)
-	managedPort := listenLoopback(t)
+	managedPort := listenLoopbackPort(t)
 	writeGCRuntimeState(t, city, managedPort)
-	writeBdServerRecord(t, city, listenLoopback(t))
+	writeBdServerRecord(t, city, listenLoopbackPort(t))
 
 	if got := envPort(t, scopeDoltEnv(city, rig)); got != managedPort {
 		t.Fatalf("rig env port = %q, want gc's republished %q", got, managedPort)
