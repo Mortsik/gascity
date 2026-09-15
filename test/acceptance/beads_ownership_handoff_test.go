@@ -629,6 +629,9 @@ func TestBeadsOwnershipHandoffLegacyAliveThenRollsBack(t *testing.T) {
 
 	// The lock goes; everything from here is the ordinary recovery an operator
 	// performs, which is to re-run the command.
+	// Release removes exactly what the fixture created, and says so if it
+	// cannot: residue here is residue the product reads, and every assertion
+	// after this point would be failing on the fixture rather than on gc.
 	release()
 
 	var settled handoffReport
@@ -714,9 +717,20 @@ func TestBeadsOwnershipHandoffLegacyAliveThenRollsBack(t *testing.T) {
 // the root candidate as well as the per-database ones, so holding it is exactly
 // the "a prior instance has not released the data dir" condition their guards
 // are written for.
+//
+// Release puts the directory back exactly as it was found. That is not
+// tidiness: `<dataDir>/.dolt` is a thing the product READS. A multi-database
+// data dir does not have one, and a bare `.dolt` left behind makes bd treat the
+// root as a Dolt repository and fail to open it — so a fixture that creates one
+// and walks away has not injected a store lock, it has broken the store for
+// every step after it. Only what did not exist is created, and only what was
+// created is removed, deepest first, with `os.Remove` rather than `RemoveAll`
+// so that anything the product put there in the meantime refuses to be deleted
+// and is reported instead.
 func holdDoltStoreLock(t *testing.T, dataDir string) func() {
 	t.Helper()
 	path := filepath.Join(dataDir, ".dolt", "noms", "LOCK")
+	created := missingPathsUnder(t, dataDir, path)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatalf("prepare the store lock %s: %v", path, err)
 	}
@@ -736,9 +750,82 @@ func holdDoltStoreLock(t *testing.T, dataDir string) func() {
 		released = true
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		_ = f.Close()
+		for _, residue := range created {
+			if err := os.Remove(residue); err != nil && !os.IsNotExist(err) {
+				t.Errorf("the store-lock fixture could not remove what it created at %s: %v", residue, err)
+			}
+			if _, err := os.Stat(residue); !os.IsNotExist(err) {
+				t.Errorf("the store-lock fixture left %s behind (%v).\n"+
+					"Residue here is residue the product reads: a `.dolt` the multi-database root never "+
+					"had makes bd treat it as a Dolt repository and refuse to open the store.", residue, err)
+			}
+		}
 	}
 	t.Cleanup(release)
 	return release
+}
+
+// The store-lock fixture is itself worth a regression test: its residue broke
+// the case that ran after it, and the failure surfaced as bd refusing to open a
+// store rather than as anything pointing at the fixture. This needs no bd, no
+// dolt and no city, so it runs on every acceptance pass.
+func TestHoldDoltStoreLockLeavesNoResidue(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "dolt")
+	if err := os.MkdirAll(filepath.Join(dataDir, "hq", ".dolt", "noms"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	release := holdDoltStoreLock(t, dataDir)
+	if _, err := os.Stat(filepath.Join(dataDir, ".dolt", "noms", "LOCK")); err != nil {
+		t.Fatalf("the fixture did not create a lock to hold: %v", err)
+	}
+	release()
+	if _, err := os.Stat(filepath.Join(dataDir, ".dolt")); !os.IsNotExist(err) {
+		t.Fatalf("the fixture left %s behind: %v", filepath.Join(dataDir, ".dolt"), err)
+	}
+	// What it did not create, it does not remove.
+	if _, err := os.Stat(filepath.Join(dataDir, "hq", ".dolt", "noms")); err != nil {
+		t.Fatalf("the fixture removed a database directory it never created: %v", err)
+	}
+	release() // idempotent
+}
+
+// A data dir that already has its own `.dolt` keeps it. The fixture removes
+// what it created, not what it found.
+func TestHoldDoltStoreLockKeepsAnExistingStoreRoot(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "dolt")
+	nomsDir := filepath.Join(dataDir, ".dolt", "noms")
+	if err := os.MkdirAll(nomsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, ".dolt", "repo_state.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	holdDoltStoreLock(t, dataDir)()
+	for _, kept := range []string{filepath.Join(dataDir, ".dolt"), nomsDir, filepath.Join(dataDir, ".dolt", "repo_state.json")} {
+		if _, err := os.Stat(kept); err != nil {
+			t.Errorf("the fixture removed %s, which it did not create: %v", kept, err)
+		}
+	}
+}
+
+// missingPathsUnder returns path and every ancestor up to dataDir that does not
+// exist yet, deepest first — exactly the set a create has to undo, and in the
+// order it has to undo it. It stops at the first ancestor that already exists,
+// so a `.dolt` the city legitimately has is never a candidate for removal.
+func missingPathsUnder(t *testing.T, dataDir, path string) []string {
+	t.Helper()
+	var missing []string
+	for p := path; p != dataDir && p != filepath.Dir(p); p = filepath.Dir(p) {
+		if _, err := os.Lstat(p); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("probe %s: %v", p, err)
+		}
+		missing = append(missing, p)
+	}
+	return missing
 }
 
 // assertConfigRestoredThenExtendedByGC states the contract for the one restored
@@ -867,6 +954,13 @@ func TestBeadsOwnershipHandoffInterruptedAfterStop(t *testing.T) {
 	interrupt()
 	t.Logf("interrupted with the journal at %q", interruptedAt)
 
+	// Killing gc does not kill bd. gc runs every bd child in its own process
+	// group — deliberately, so a timeout can take down the tree — so the verb
+	// gc had started runs to completion holding the journal lock, exactly as it
+	// would for an operator who kills gc. Wait for it to let go before reading
+	// the journal or re-running, or both are racing a live writer.
+	waitForHandoffJournalUnlocked(t, cityRoot, 2*time.Minute)
+
 	journal, ok := readHandoffJournal(t, cityRoot)
 	if !ok {
 		t.Fatal("an interrupted handoff that stopped the legacy owner wrote no journal at all; " +
@@ -905,6 +999,45 @@ func TestBeadsOwnershipHandoffInterruptedAfterStop(t *testing.T) {
 	}
 	assertHandoffJournalIsWhereGCReadsIt(t, cityRoot, "resumed handoff")
 	assertNoManagedDoltServer(t, cityRoot, "resumed city")
+}
+
+// waitForHandoffJournalUnlocked blocks until no process holds bd's journal
+// lock, which is bd's own serialisation point between verbs.
+//
+// The probe is the lock itself rather than a process scan: bd is what holds it,
+// and a scan would have to guess which of the binaries on this box is the one
+// that matters. Taking it non-blocking and letting it go is exactly what bd's
+// next verb will do.
+func waitForHandoffJournalUnlocked(t *testing.T, scopeRoot string, timeout time.Duration) {
+	t.Helper()
+	path := filepath.Join(scopeRoot, handoffJournalRelPath) + ".lock"
+	deadline := time.Now().Add(timeout)
+	for {
+		if free, err := handoffJournalLockIsFree(path); err != nil {
+			t.Fatalf("probe %s: %v", path, err)
+		} else if free {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a bd verb still held %s after %s; the interrupt left a writer running", path, timeout)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func handoffJournalLockIsFree(path string) (bool, error) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600) //nolint:gosec // bd's lock beside its journal
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer f.Close() //nolint:errcheck // probe only
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return false, nil //nolint:nilerr // a held lock is the answer, not a failure
+	}
+	return true, syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }
 
 // waitForHandoffPhase blocks until bd's journal reaches one of phases, and
