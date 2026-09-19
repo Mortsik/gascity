@@ -135,6 +135,11 @@ var (
 	// It permits overwriting an existing service unit that references a
 	// different gc binary. Exposed as a var so tests can override it directly.
 	supervisorInstallForce bool
+	// supervisorInstallNoStart is set by --no-start. On Linux it installs or
+	// refreshes the unit definition, reloads systemd, and leaves the unit
+	// durably disabled/stopped. This is used by on-demand control planes that
+	// need a repairable unit file without standing supervisor residency.
+	supervisorInstallNoStart bool
 
 	// supervisorServiceManagerActive reports whether the platform service
 	// manager (launchd on macOS, systemd --user on Linux) considers the
@@ -1033,6 +1038,8 @@ starts on login.`,
 	}
 	cmd.Flags().BoolVar(&supervisorInstallForce, "force", false,
 		"overwrite an existing service unit even if it references a different gc binary")
+	cmd.Flags().BoolVar(&supervisorInstallNoStart, "no-start", false,
+		"install or refresh the service definition but leave it disabled and stopped (Linux only)")
 	return cmd
 }
 
@@ -1061,6 +1068,10 @@ func doSupervisorInstall(stdout, stderr io.Writer) int {
 
 	switch goruntime.GOOS {
 	case "darwin":
+		if supervisorInstallNoStart {
+			fmt.Fprintln(stderr, "gc supervisor install: --no-start is currently supported only on Linux/systemd") //nolint:errcheck // best-effort stderr
+			return 1
+		}
 		return installSupervisorLaunchd(data, stdout, stderr)
 	case "linux":
 		return installSupervisorSystemd(data, stdout, stderr)
@@ -2386,6 +2397,27 @@ func installSupervisorSystemd(data *supervisorServiceData, stdout, stderr io.Wri
 	if err := writeSupervisorServiceFile(path, []byte(content)); err != nil {
 		fmt.Fprintf(stderr, "gc supervisor install: writing unit: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+
+	if supervisorInstallNoStart {
+		if err := supervisorSystemctlRun("--user", "daemon-reload"); err != nil {
+			fmt.Fprintf(stderr, "gc supervisor install: systemctl --user daemon-reload: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		// Disable --now is intentionally stronger than merely skipping start:
+		// an already-enabled unit would otherwise return after reboot/login and
+		// violate the on-demand residency contract.
+		if err := supervisorSystemctlRun("--user", "disable", "--now", service); err != nil {
+			fmt.Fprintf(stderr, "gc supervisor install: systemctl --user disable --now %s: %v\n", service, err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		if err := unloadLegacySupervisorSystemd(true); err != nil {
+			fmt.Fprintf(stderr, "gc supervisor install: warning: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		_ = supervisorSystemctlRun("--user", "daemon-reload")
+		fmt.Fprintf(stdout, "Installed systemd service (disabled/stopped): %s\n", path) //nolint:errcheck // best-effort stdout
+		return 0
 	}
 
 	for _, args := range [][]string{

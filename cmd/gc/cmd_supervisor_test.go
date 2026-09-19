@@ -2296,6 +2296,70 @@ func TestInstallSupervisorSystemdStartsInactiveService(t *testing.T) {
 	}
 }
 
+func TestInstallSupervisorSystemdNoStartLeavesUnitDisabledAndInactive(t *testing.T) {
+	if goruntime.GOOS != "linux" {
+		t.Skip("systemd path only applies on linux")
+	}
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
+
+	var stdout, stderr bytes.Buffer
+	cmd := newSupervisorInstallCmd(&stdout, &stderr)
+	if flag := cmd.Flags().Lookup("no-start"); flag == nil {
+		t.Fatal("supervisor install command missing --no-start flag")
+	}
+	if err := cmd.Flags().Set("no-start", "true"); err != nil {
+		t.Fatalf("setting --no-start flag: %v", err)
+	}
+	t.Cleanup(func() { _ = cmd.Flags().Set("no-start", "false") })
+
+	data := &supervisorServiceData{
+		GCPath:        "/tmp/gc-new",
+		LogPath:       "/tmp/gc-home/supervisor.log",
+		GCHome:        "/tmp/gc-home",
+		XDGRuntimeDir: "/tmp/gc-run",
+		Path:          "/usr/local/bin:/usr/bin:/bin",
+	}
+
+	oldRun := supervisorSystemctlRun
+	oldActive := supervisorSystemctlActive
+	oldLingerEnabled := supervisorLingerEnabled
+	var calls []string
+	supervisorSystemctlRun = func(args ...string) error {
+		calls = append(calls, strings.Join(args, " "))
+		return nil
+	}
+	supervisorSystemctlActive = func(string) bool { return false }
+	supervisorLingerEnabled = func(string) bool { return true }
+	t.Cleanup(func() {
+		supervisorSystemctlRun = oldRun
+		supervisorSystemctlActive = oldActive
+		supervisorLingerEnabled = oldLingerEnabled
+	})
+
+	if code := installSupervisorSystemd(data, &stdout, &stderr); code != 0 {
+		t.Fatalf("installSupervisorSystemd code = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	joined := strings.Join(calls, "\n")
+	for _, want := range []string{
+		"--user daemon-reload",
+		"--user disable --now gascity-supervisor.service",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("systemctl calls = %v, want %q", calls, want)
+		}
+	}
+	for _, forbidden := range []string{
+		"--user enable gascity-supervisor.service",
+		"--user start gascity-supervisor.service",
+	} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("systemctl calls = %v, --no-start must not invoke %q", calls, forbidden)
+		}
+	}
+}
+
 func TestInstallSupervisorSystemdUsesIsolatedUnitNameForIsolatedGCHome(t *testing.T) {
 	if goruntime.GOOS != "linux" {
 		t.Skip("systemd path only applies on linux")

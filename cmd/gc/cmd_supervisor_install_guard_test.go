@@ -327,6 +327,14 @@ func TestSupervisorInstallCommandRegistersForceFlag(t *testing.T) {
 	}
 }
 
+func TestSupervisorInstallCommandRegistersNoStartFlag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	cmd := newSupervisorInstallCmd(&stdout, &stderr)
+	if cmd.Flags().Lookup("no-start") == nil {
+		t.Fatal("supervisor install command missing --no-start flag")
+	}
+}
+
 func setSupervisorInstallForceForTest(t *testing.T, force bool) {
 	t.Helper()
 	oldForce := supervisorInstallForce
