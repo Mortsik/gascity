@@ -4,7 +4,9 @@
 
 **Goal:** Make the AgentForge GasCity supervisor consume effectively zero CPU/RAM when no work or sessions exist, while preserving fail-closed liveness and automatic wake on real demand.
 
-**Architecture:** First deploy the current fork's existing Go-runtime idle CPU fix, then add a narrow idle predicate and intentional-idle shutdown path in GasCity. AgentForge deployment/watchdog logic will recognize intentional idle as healthy and only start the supervisor when actual demand exists. Unknown or partial state always keeps the daemon alive.
+**Architecture:** Final implementation ruling: AgentForge owns the legal-idle predicate and demand wake because it has the deployment/session context; GasCity stays generic and adds only the safe `gc supervisor install --no-start` lifecycle primitive plus the already-existing Go-runtime idle CPU fix. AgentForge disables supervisor/city boot entry points after bounded all-dormant grace, keeps the cheap watchdog timer alive, and re-arms supervision on real demand. Unknown or partial state always fails closed.
+
+> **Implementation note (2026-09-19):** Tasks 2-4 below document the original explored direction (idle predicate inside GasCity). Live investigation showed that duplicating AgentForge readiness semantics in GasCity would create unnecessary coupling. The accepted implementation replaces those tasks with the narrower `--no-start` primitive and moves policy entirely to AgentForge; verification criteria and safety goals remain unchanged.
 
 **Tech Stack:** Go 1.26.6, systemd user services, GasCity supervisor/runtime, AgentForge shell/TypeScript orchestration as discovered in-repo.
 
