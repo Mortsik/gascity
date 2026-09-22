@@ -3,12 +3,20 @@ title: "Tmux Agent Slice (GC_AGENT_SLICE)"
 ---
 
 Setting the `GC_AGENT_SLICE` environment variable to a systemd user slice
-(for example `gascity-agents.slice`) makes the tmux session provider wrap
-every pane's initial command in a transient systemd user scope:
+(for example `agents.slice`, the canonical fleet slice) makes the tmux
+session provider wrap every pane's initial command through the canonical
+containment entry point, `wm-cap` (installed by the dotfiles installer):
 
 ```
-systemd-run --user --scope --slice=<slice> --collect --quiet -- sh -c '<command>'
+env WM_CAP_SLICE=<slice> wm-cap --name agent-w1-<base> --weight 1 -- sh -c '<command>'
 ```
+
+The value of `GC_AGENT_SLICE` is passed through to the entry point as
+`WM_CAP_SLICE`, so the scopes land in the slice it names; deployments that
+never customized it get the entry point's own canonical default
+(`agents.slice`). Deployments that run a different entry point can override
+it with `GC_CONTAINMENT_ENTRY_POINT` (any binary implementing the same
+`[--name NAME] [--weight W] -- CMD ARGS…` interface).
 
 Default-off: when the variable is unset or empty, pane commands run
 unwrapped exactly as before.
@@ -18,9 +26,31 @@ unwrapped exactly as before.
 systemd-enabled tmux builds (stock Ubuntu) move every pane into a transient
 `tmux-spawn-*.scope` under the default user slice, so agent processes escape
 whatever slice the tmux server itself runs in. Wrapping the pane command
-re-parents the agent's process tree into a dedicated user slice where
-resource weights (`CPUWeight`, `MemoryHigh`, ...) can be applied to all
-agents collectively.
+re-parents the agent's process tree into the host containment plane.
+
+The wrap goes through `wm-cap` rather than calling `systemd-run` inline
+(agent-forge-dbl.1) so gascity duplicates no containment policy: the slice
+definition, per-scope `MemoryHigh`, OOM victim preference
+(`oom_score_adj`) and the post-mortem record (`~/.local/state/wm-cap/history.tsv`)
+all belong to the canonical plane (the dotfiles-installed helper, the
+installer's `agents.slice` drop-in, and the RES-002 policy in agent-forge).
+gascity owns only the wiring: picking the entry point, naming the scope, and
+the fail-open fallback.
+
+## Scope unit naming
+
+Each wrapped spawn creates a NAMED, COUNTED scope: `agent-w1-<base>`, where
+`<base>` is the tmux session name (new-session paths) or the pane target
+(respawn-pane), canonicalized to `[A-Za-z0-9_-]` (anything else becomes
+`-`). The `agent-w<N>-` prefix is the weight encoding parsed by host-global
+admission (`agentctl`), which counts live scopes by exact unit name — this
+shape is what makes the session visible to the host's admission accounting.
+A respawn creates a fresh scope (the previous one died with the pane), so
+the unit base differs between initial spawn and respawns.
+
+No limit values are passed through by gascity (`WM_CAP_HIGH`/`WM_CAP_MEM`
+are deliberately absent) — per-scope limits are policy owned by the
+canonical plane, not wiring.
 
 ## Scope and activation
 
@@ -43,27 +73,30 @@ agents collectively.
 
 ## Probe and fallback
 
-Before its first wrapped spawn, each tmux provider instance probes
-`systemd-run --user --scope --slice=<slice> --collect --quiet -- true`
-(bounded at 5 seconds). If the probe fails — no `systemd-run` binary, no
-reachable user manager, or an invalid slice — that instance logs one
-warning and every pane command it spawns runs unwrapped:
+Before its first wrapped spawn, each tmux provider instance probes that the
+entry point binary resolves in PATH (`GC_CONTAINMENT_ENTRY_POINT`, default
+`wm-cap`). If the probe fails — no such binary on this host — that
+instance logs one warning and every pane command it spawns runs unwrapped:
 
 ```
-tmux agent slice: GC_AGENT_SLICE="..." set but transient user scopes are unavailable; pane commands run unwrapped: ...
+tmux agent slice: GC_AGENT_SLICE="..." set but the containment entry point "wm-cap" is unavailable; pane commands run unwrapped: ...
 ```
+
+Availability beyond the binary is the entry point's own fail-open concern:
+`wm-cap` detects a missing systemd user manager up front and executes the
+wrapped command raw, so agent starts are never blocked by the containment
+plane being down.
 
 Because operations like template session starts construct fresh provider
-instances, a persistently broken host repeats this warning as new
-instances probe, while long-lived instances (the orchestrator's reconcile
-loop) keep their first verdict until restart.
+instances, a persistently broken host repeats this warning as new instances
+probe, while long-lived instances (the orchestrator's reconcile loop) keep
+their first verdict until restart.
 
 The probe runs in the gc process's environment, while pane commands execute
 with the tmux server's environment. gc normally spawns the tmux server
 itself, so the two match; if you point gc at a pre-existing tmux server
-whose global environment lacks a reachable user bus (`XDG_RUNTIME_DIR`,
-`DBUS_SESSION_BUS_ADDRESS`), wrapped spawns can fail even after a
-successful probe. The systemd-run error is visible in the dead pane's
+whose environment lacks the entry point in PATH, wrapped spawns can fail
+even after a successful probe. The failure is visible in the dead pane's
 captured output in startup diagnostics.
 
 ## User-manager lifecycle coupling
@@ -79,22 +112,15 @@ loginctl enable-linger <user>
 
 ## Resource attribution
 
-Scopes are created with systemd auto-generated names (`run-rNNNNNNNN.scope`),
-so `systemd-cgls --user` shows anonymous units under the slice rather than
-per-agent names. To attribute a scope to an agent session, list the
-processes inside it:
-
-```bash
-systemd-cgls --user --unit <slice>
-ps -o pid,args --forest -g <pid-from-cgls>
-```
-
-The agent command line (and its tmux session name, via `tmux list-panes -a
--F '#{session_name} #{pane_pid}'`) identifies the owner.
+Scopes are created with the canonical `agent-w1-<base>` names, so
+`systemd-cgls --user` attributes each scope to its agent session directly;
+the post-mortem record in `~/.local/state/wm-cap/history.tsv` (exit code,
+memory peak, OOM counter) keys on the same unit name.
 
 ## Detection
 
-A wrapped pane reports `pane_current_command = "systemd-run"` instead of
-the agent process name. All gc liveness, zombie-cleanup, and pane-finding
-paths handle this by walking pane process descendants, so health patrol
-and nudge targeting behave the same with wrapping on or off.
+A wrapped pane reports `pane_current_command` as the wrapper (`wm-cap`, or
+`systemd-run` for scopes created by an older gc) instead of the agent
+process name. All gc liveness, zombie-cleanup, and pane-finding paths
+handle this by walking pane process descendants, so health patrol and
+nudge targeting behave the same with wrapping on or off.
