@@ -345,8 +345,9 @@ type Tmux struct {
 	pokeMu sync.Mutex
 	pokes  map[string]pokeInfo
 
-	// agentSlice wraps pane commands in a transient systemd user scope when
-	// GC_AGENT_SLICE is set (see AgentSliceEnv in agent_slice.go).
+	// agentSlice wraps pane commands through the canonical containment entry
+	// point (wm-cap) when GC_AGENT_SLICE is set (see AgentSliceEnv in
+	// agent_slice.go).
 	agentSlice agentSliceWrapper
 
 	// serverSocketObserver observes a named socket only after tmux reports
@@ -611,7 +612,7 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 		args = append(args, "-c", workDir)
 	}
 	// Add the command as the last argument - tmux runs it as the pane's initial process
-	args = append(args, t.wrapPaneCommand(command))
+	args = append(args, t.wrapPaneCommand(name, command))
 	_, err := t.run(args...)
 	if err != nil {
 		return err
@@ -787,7 +788,7 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 		return err
 	}
 	// Add the command as the last argument
-	args = append(args, t.wrapPaneCommand(command))
+	args = append(args, t.wrapPaneCommand(name, command))
 	if err := t.runNewSession(args, env); err != nil {
 		return err
 	}
@@ -4494,7 +4495,7 @@ func (t *Tmux) SetMailClickBinding(_ string) error {
 // This is used for "hot reload" of agent sessions - instantly restart in place.
 // The pane parameter should be a pane ID (e.g., "%0") or session:window.pane format.
 func (t *Tmux) RespawnPane(pane, command string) error {
-	_, err := t.run("respawn-pane", "-k", "-t", pane, t.wrapPaneCommand(command))
+	_, err := t.run("respawn-pane", "-k", "-t", pane, t.wrapPaneCommand(pane, command))
 	return err
 }
 
@@ -4506,7 +4507,7 @@ func (t *Tmux) RespawnPaneWithWorkDir(pane, workDir, command string) error {
 	if workDir != "" {
 		args = append(args, "-c", workDir)
 	}
-	args = append(args, t.wrapPaneCommand(command))
+	args = append(args, t.wrapPaneCommand(pane, command))
 	_, err := t.run(args...)
 	return err
 }

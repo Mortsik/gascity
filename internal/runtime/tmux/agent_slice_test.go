@@ -12,8 +12,9 @@ import (
 	"time"
 )
 
-// newSliceTestTmux returns a Tmux backed by a fakeExecutor with the agent
-// slice probe stubbed to succeed, plus the executor for argv inspection.
+// newSliceTestTmux returns a Tmux backed by a fakeExecutor with the
+// containment entry point probe stubbed to succeed, plus the executor for
+// argv inspection.
 func newSliceTestTmux(t *testing.T) (*Tmux, *fakeExecutor) {
 	t.Helper()
 	exec := &fakeExecutor{}
@@ -36,7 +37,7 @@ func TestAgentSliceWrapsNewSessionWithCommand(t *testing.T) {
 	}
 	args := exec.calls[0]
 	got := args[len(args)-1]
-	want := "systemd-run --user --scope --slice=gascity-agents.slice --collect --quiet -- sh -c 'exec env GT_ROLE=crew claude'"
+	want := "env WM_CAP_SLICE=gascity-agents.slice wm-cap --name agent-w1-gc-test-slice --weight 1 -- sh -c 'exec env GT_ROLE=crew claude'"
 	if got != want {
 		t.Fatalf("pane command = %q, want %q", got, want)
 	}
@@ -55,9 +56,9 @@ func TestAgentSliceWrapsNewSessionWithCommandAndEnv(t *testing.T) {
 	}
 	args := exec.calls[0]
 	got := args[len(args)-1]
-	// The env -u prefix must end up INSIDE the scope wrapper so the unset
-	// still applies to the agent process.
-	want := "systemd-run --user --scope --slice=gascity-agents.slice --collect --quiet -- sh -c 'env -u LC_ALL claude'"
+	// The env -u prefix must end up INSIDE the containment wrapper so the
+	// unset still applies to the agent process.
+	want := "env WM_CAP_SLICE=gascity-agents.slice wm-cap --name agent-w1-gc-test-slice-env --weight 1 -- sh -c 'env -u LC_ALL claude'"
 	if got != want {
 		t.Fatalf("pane command = %q, want %q", got, want)
 	}
@@ -77,7 +78,9 @@ func TestAgentSliceWrapsRespawnPane(t *testing.T) {
 	}
 	args := exec.calls[0]
 	got := args[len(args)-1]
-	want := "systemd-run --user --scope --slice=gascity-agents.slice --collect --quiet -- sh -c 'claude --resume'"
+	// A respawn bases the scope unit on the pane target: each spawn gets its
+	// own counted scope ("%0" canonicalizes to "-0" in the unit charset).
+	want := "env WM_CAP_SLICE=gascity-agents.slice wm-cap --name agent-w1--0 --weight 1 -- sh -c 'claude --resume'"
 	if got != want {
 		t.Fatalf("respawn command = %q, want %q", got, want)
 	}
@@ -104,6 +107,68 @@ func TestAgentSliceUnsetLeavesCommandPlain(t *testing.T) {
 	}
 }
 
+func TestAgentSliceEntryPointOverride(t *testing.T) {
+	t.Setenv(AgentSliceEnv, "agents.slice")
+	t.Setenv(ContainmentEntryPointEnv, "/opt/gc/bin/cap")
+	tm, exec := newSliceTestTmux(t)
+
+	if err := tm.NewSessionWithCommand("gc-test-entry", "/work", "claude"); err != nil {
+		t.Fatalf("NewSessionWithCommand: %v", err)
+	}
+	args := exec.calls[0]
+	got := args[len(args)-1]
+	want := "env WM_CAP_SLICE=agents.slice /opt/gc/bin/cap --name agent-w1-gc-test-entry --weight 1 -- sh -c claude"
+	if got != want {
+		t.Fatalf("pane command = %q, want %q", got, want)
+	}
+}
+
+func TestAgentSliceSanitizesUnitNameBase(t *testing.T) {
+	// Session names are already validated to [a-zA-Z0-9_-] upstream
+	// (validSessionNameRe), so the canonicalization earns its keep on the
+	// respawn path, whose targets carry '%' or ':' — covered directly here
+	// plus through TestAgentSliceWrapsRespawnPane ("%0" -> "agent-w1--0").
+	for _, tc := range []struct{ raw, want string }{
+		{"%0", "-0"},
+		{"city:0.0", "city-0-0"},
+		{"af87.core/a b", "af87-core-a-b"},
+	} {
+		if got := sanitizeContainmentUnitBase(tc.raw); got != tc.want {
+			t.Fatalf("sanitizeContainmentUnitBase(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestSanitizeContainmentUnitBase(t *testing.T) {
+	for _, tc := range []struct{ raw, want string }{
+		{"gc-session", "gc-session"},
+		{"agent_w1", "agent_w1"},
+		{"af87.core", "af87-core"},
+		{"a b/c", "a-b-c"},
+		{"", ""},
+		{"%%", "--"},
+	} {
+		if got := sanitizeContainmentUnitBase(tc.raw); got != tc.want {
+			t.Fatalf("sanitizeContainmentUnitBase(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestContainmentUnitNameEncodesWeight(t *testing.T) {
+	for _, tc := range []struct {
+		base   string
+		weight int
+		want   string
+	}{
+		{base: "af87", weight: 1, want: "agent-w1-af87"},
+		{base: "a.b", weight: 3, want: "agent-w3-a-b"},
+	} {
+		if got := containmentUnitName(tc.base, tc.weight); got != tc.want {
+			t.Fatalf("containmentUnitName(%q, %d) = %q, want %q", tc.base, tc.weight, got, tc.want)
+		}
+	}
+}
+
 func TestAgentSliceProbeFailureFallsBackPlainWithWarning(t *testing.T) {
 	t.Setenv(AgentSliceEnv, "gascity-agents.slice")
 	probeCalls := 0
@@ -113,7 +178,7 @@ func TestAgentSliceProbeFailureFallsBackPlainWithWarning(t *testing.T) {
 	var warnings strings.Builder
 	tm.agentSlice.probe = func(string) error {
 		probeCalls++
-		return errors.New("user manager not responding")
+		return errors.New("entry point not found in PATH")
 	}
 	tm.agentSlice.warn = &warnings
 
@@ -142,11 +207,40 @@ func TestAgentSliceProbeFailureFallsBackPlainWithWarning(t *testing.T) {
 	if probeCalls != 1 {
 		t.Fatalf("probe called %d times, want 1 (result must be cached)", probeCalls)
 	}
-	if !strings.Contains(warnings.String(), "user manager not responding") {
+	if !strings.Contains(warnings.String(), "entry point not found in PATH") {
 		t.Fatalf("warning output missing probe error: %q", warnings.String())
 	}
 	if !strings.Contains(warnings.String(), AgentSliceEnv) {
 		t.Fatalf("warning output missing env var name: %q", warnings.String())
+	}
+	if !strings.Contains(warnings.String(), containmentEntryPointDefault) {
+		t.Fatalf("warning output missing entry point name: %q", warnings.String())
+	}
+}
+
+// TestContainmentProbeLooksUpRealEntryPoint pins that the production probe
+// resolves the entry point through PATH: an entry point that exists on this
+// host (sh is POSIX-everywhere) probes clean, a nonexistent one fails.
+func TestContainmentProbeLooksUpRealEntryPoint(t *testing.T) {
+	if err := probeContainmentEntry("sh"); err != nil {
+		t.Fatalf("probeContainmentEntry(sh): %v", err)
+	}
+	if err := probeContainmentEntry("definitely-not-a-binary-xyz"); err == nil {
+		t.Fatal("probeContainmentEntry(nonsense) = nil, want PATH lookup failure")
+	}
+}
+
+// TestWrapperCommandsCoverContainmentEntryPoint pins the detection contract:
+// wm-cap (canonical entry point) and systemd-run (scopes created by an older
+// gc) are both pane-root wrapper names.
+func TestWrapperCommandsCoverContainmentEntryPoint(t *testing.T) {
+	for _, w := range []string{"wm-cap", "systemd-run"} {
+		if !isWrapperCommand(w) {
+			t.Fatalf("isWrapperCommand(%q) = false, want true", w)
+		}
+	}
+	if isWrapperCommand("claude") {
+		t.Fatal("isWrapperCommand(claude) = true, want false")
 	}
 }
 
@@ -174,22 +268,22 @@ func TestAgentSliceQuotesEmbeddedSingleQuotes(t *testing.T) {
 	}
 	args := exec.calls[0]
 	got := args[len(args)-1]
-	want := `systemd-run --user --scope --slice=gascity-agents.slice --collect --quiet -- sh -c 'claude --msg '\''hi there'\'''`
+	want := `env WM_CAP_SLICE=gascity-agents.slice wm-cap --name agent-w1-gc-test-quote --weight 1 -- sh -c 'claude --msg '\''hi there'\'''`
 	if got != want {
 		t.Fatalf("pane command = %q, want %q", got, want)
 	}
 }
 
 // TestFindAgentPane_WrappedPane pins the detection contract for panes whose
-// root command is a wrapper such as systemd-run (GC_AGENT_SLICE): none of the
-// direct-name, shell-descendant, or version-as-argv[0] checks match the
-// wrapper process, so FindAgentPane must identify the agent through the
-// unconditional descendant walk, mirroring IsRuntimeRunning.
+// root command is a wrapper such as wm-cap or systemd-run (GC_AGENT_SLICE):
+// none of the direct-name, shell-descendant, or version-as-argv[0] checks
+// match the wrapper process, so FindAgentPane must identify the agent through
+// the unconditional descendant walk, mirroring IsRuntimeRunning.
 func TestFindAgentPane_WrappedPane(t *testing.T) {
 	// Real process tree: the test binary spawns "sleep 60", standing in for
-	// systemd-run spawning the agent. The fake executor reports the pane
-	// command as "systemd-run" with the test binary's PID, so only the
-	// descendant fallback can identify the agent pane.
+	// the entry point spawning the agent. The fake executor reports the pane
+	// command as "wm-cap" with the test binary's PID, so only the descendant
+	// fallback can identify the agent pane.
 	agent := osexec.Command("sleep", "60")
 	if err := agent.Start(); err != nil {
 		t.Fatalf("starting agent stand-in: %v", err)
@@ -211,7 +305,7 @@ func TestFindAgentPane_WrappedPane(t *testing.T) {
 	exec := &fakeExecutor{outs: []string{
 		// list-panes -s: a user's split pane plus the wrapped agent pane.
 		// The bogus PID has no live process, so the first pane cannot match.
-		"%1\tvim\t999999999\n%2\tsystemd-run\t" + panePID,
+		"%1\tvim\t999999999\n%2\twm-cap\t" + panePID,
 		// show-environment GT_PROCESS_NAMES
 		"GT_PROCESS_NAMES=sleep",
 	}}
@@ -227,11 +321,12 @@ func TestFindAgentPane_WrappedPane(t *testing.T) {
 	}
 }
 
-// wrappedWaitExecutor simulates a pane whose root command is the systemd-run
-// wrapper for the pane's whole lifetime. The agent descendant becomes visible
-// to the process-tree walk only after livePIDAfter pane-PID requests: earlier
-// requests return a dead PID with no descendants, modeling the startup window
-// where systemd-run exists but the agent has not exec'd yet.
+// wrappedWaitExecutor simulates a pane whose root command is the containment
+// entry point wrapper for the pane's whole lifetime. The agent descendant
+// becomes visible to the process-tree walk only after livePIDAfter pane-PID
+// requests: earlier requests return a dead PID with no descendants, modeling
+// the startup window where the wrapper exists but the agent has not exec'd
+// yet.
 type wrappedWaitExecutor struct {
 	deadPID      string
 	livePID      string
@@ -247,7 +342,7 @@ func (e *wrappedWaitExecutor) execute(args []string) (string, error) {
 		case "display-message":
 			switch args[len(args)-1] {
 			case "#{pane_current_command}":
-				return "systemd-run", nil
+				return "wm-cap", nil
 			case "#{pane_pid}":
 				e.pidRequests++
 				if e.pidRequests <= e.livePIDAfter {
@@ -268,7 +363,7 @@ func (e *wrappedWaitExecutor) executeCtx(_ context.Context, args []string) (stri
 }
 
 // TestWaitForCommand_WrappedPane pins the startup-wait contract for wrapper
-// roots (systemd-run under GC_AGENT_SLICE): the pane reports the wrapper as
+// roots (wm-cap under GC_AGENT_SLICE): the pane reports the wrapper as
 // pane_current_command for its whole lifetime, so WaitForCommand must not
 // treat first sight of the wrapper as "agent command appeared". It must keep
 // polling until the agent is detectable as a pane descendant, and time out

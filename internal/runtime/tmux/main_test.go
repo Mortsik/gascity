@@ -13,11 +13,13 @@ import (
 // TestMain neutralizes ambient tmux/session state for the whole package.
 // GC_AGENT_SLICE activates real pane-command wrapping inside any test process
 // on hosts that export it, which would break exact-argv and pane-command
-// assertions across both the unit and integration tiers. Tests that exercise
-// wrapping opt back in per-test with t.Setenv. This file is untagged so the
-// neutralization applies to every build of the package.
+// assertions across both the unit and integration tiers. GC_CONTAINMENT_ENTRY_POINT
+// would likewise reroute wrapping toward an ambient entry point. Tests that
+// exercise wrapping opt back in per-test with t.Setenv. This file is untagged
+// so the neutralization applies to every build of the package.
 func TestMain(m *testing.M) {
 	_ = os.Unsetenv(AgentSliceEnv)
+	_ = os.Unsetenv(ContainmentEntryPointEnv)
 
 	// NewSocketParentDir sweeps orphaned siblings left by a prior SIGKILL'd
 	// run before creating this run's own dir. tmuxSocketAliveSentinel must
