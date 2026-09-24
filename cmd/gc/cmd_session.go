@@ -1688,13 +1688,41 @@ func (o sessionMutationOptions) expectedState() session.State {
 	return session.State(strings.TrimSpace(o.IfState))
 }
 
-// validateSessionIfStateFlag rejects an explicitly passed but empty --if-state
-// as a usage error. The empty string is this file's "flag absent" marker, so
-// accepting `--if-state ""` would silently run the unfenced legacy path under
-// the user's explicit fence request.
+// sessionIfStateVocabulary renders the canonical lifecycle-state vocabulary
+// for --if-state usage and error text.
+func sessionIfStateVocabulary() string {
+	states := session.LifecycleStates()
+	names := make([]string, 0, len(states))
+	for _, s := range states {
+		names = append(names, string(s))
+	}
+	return strings.Join(names, ", ")
+}
+
+// sessionIfStateFlagUsage renders the --if-state flag help, naming the
+// accepted values from the canonical lifecycle vocabulary.
+func sessionIfStateFlagUsage(action string) string {
+	return fmt.Sprintf("%s only if the session is still in this state (one of: %s)", action, sessionIfStateVocabulary())
+}
+
+// validateSessionIfStateFlag rejects an invalid --if-state as a usage error
+// before any store or controller work happens. The empty string is this
+// file's "flag absent" marker, so accepting `--if-state ""` would silently
+// run the unfenced legacy path under the user's explicit fence request; any
+// other value outside the canonical lifecycle vocabulary is rejected so a
+// typo cannot silently become a valid fence against an unexpected persisted
+// state.
 func validateSessionIfStateFlag(cmd *cobra.Command, stderr io.Writer, ifState string) error {
-	if cmd.Flags().Changed("if-state") && strings.TrimSpace(ifState) == "" {
+	if !cmd.Flags().Changed("if-state") {
+		return nil
+	}
+	expected := strings.TrimSpace(ifState)
+	if expected == "" {
 		printCommandUsageError(stderr, cmd, fmt.Errorf("--if-state must not be empty"))
+		return errExit
+	}
+	if !session.IsLifecycleState(session.State(expected)) {
+		printCommandUsageError(stderr, cmd, fmt.Errorf("--if-state must be one of: %s (got %q)", sessionIfStateVocabulary(), expected))
 		return errExit
 	}
 	return nil
@@ -1762,7 +1790,7 @@ Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 		ValidArgsFunction: completeSessionIDs,
 	}
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "emit JSONL")
-	cmd.Flags().StringVar(&ifState, "if-state", "", "suspend only if the session is still in this state")
+	cmd.Flags().StringVar(&ifState, "if-state", "", sessionIfStateFlagUsage("suspend"))
 	return cmd
 }
 
@@ -1824,28 +1852,16 @@ func cmdSessionSuspendWithOptions(args []string, stdout, stderr io.Writer, opts 
 	// Only use this path when the city is managed by a standalone controller
 	// or the machine-wide supervisor — not for unmanaged ad-hoc cities.
 	if cityErr == nil && deps.cityUsesManagedReconciler(cityPath) {
-		if pokeErr := deps.pokeController(cityPath); pokeErr == nil {
-			// Controller is running — metadata-only suspend.
-			// Set held_until far in the future so the reconciler drains/stops the session.
-			heldUntil := time.Now().Add(indefiniteHoldDuration).UTC().Format(time.RFC3339)
-			applySuspendPatch := func(target beads.Store) error {
-				return sessionFrontDoor(target).ApplyPatch(sessionID, map[string]string{
-					"held_until":   heldUntil,
-					"sleep_intent": "user-hold",
-					"state":        "suspended",
-				})
-			}
-			var mutationErr error
-			if expected != "" {
-				mutationErr = session.WithExpectedStateMutation(sessStore, sessionID, expected, applySuspendPatch)
-			} else {
-				mutationErr = applySuspendPatch(sessStore)
-			}
-			if mutationErr != nil {
-				return writeSessionMutationError(stdout, stderr, "gc session suspend", asJSON, mutationErr)
-			}
-			// Poke again to trigger immediate reconciler tick.
-			_ = deps.pokeController(cityPath)
+		// Set held_until far in the future so the reconciler drains/stops the session.
+		heldUntil := time.Now().Add(indefiniteHoldDuration).UTC().Format(time.RFC3339)
+		applySuspendPatch := func(target beads.Store) error {
+			return sessionFrontDoor(target).ApplyPatch(sessionID, map[string]string{
+				"held_until":   heldUntil,
+				"sleep_intent": "user-hold",
+				"state":        "suspended",
+			})
+		}
+		emitManagedSuspend := func() int {
 			if asJSON {
 				if err := writeSessionActionJSON(stdout, sessionActionResult{
 					Action:    "suspend",
@@ -1860,6 +1876,31 @@ func cmdSessionSuspendWithOptions(args []string, stdout, stderr io.Writer, opts 
 			}
 			fmt.Fprintf(stdout, "Session %s suspended. Resume with: gc session wake %s\n", sessionID, sessionID) //nolint:errcheck // best-effort stdout
 			return 0
+		}
+		if expected != "" {
+			// Fenced managed suspend: the availability check above is
+			// side-effect-free (it pings, never pokes), and the reconciler
+			// trigger is deferred until AFTER the fenced patch succeeds — a
+			// mismatch/gone refusal must not cause any controller tick, since
+			// the tick itself can mutate runtime or durable state before the
+			// command reports the refusal.
+			if mutationErr := session.WithExpectedStateMutation(sessStore, sessionID, expected, applySuspendPatch); mutationErr != nil {
+				return writeSessionMutationError(stdout, stderr, "gc session suspend", asJSON, mutationErr)
+			}
+			// Trigger an immediate reconciler tick — only after success.
+			_ = deps.pokeController(cityPath)
+			return emitManagedSuspend()
+		}
+		// Unfenced: the pre-poke doubles as the controller-liveness probe — a
+		// failed poke falls through to the direct fallback below.
+		if pokeErr := deps.pokeController(cityPath); pokeErr == nil {
+			// Controller is running — metadata-only suspend.
+			if mutationErr := applySuspendPatch(sessStore); mutationErr != nil {
+				return writeSessionMutationError(stdout, stderr, "gc session suspend", asJSON, mutationErr)
+			}
+			// Poke again to trigger immediate reconciler tick.
+			_ = deps.pokeController(cityPath)
+			return emitManagedSuspend()
 		}
 	}
 
@@ -1938,7 +1979,7 @@ Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 		ValidArgsFunction: completeSessionIDs,
 	}
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "emit JSONL")
-	cmd.Flags().StringVar(&ifState, "if-state", "", "close only if the session is still in this state")
+	cmd.Flags().StringVar(&ifState, "if-state", "", sessionIfStateFlagUsage("close"))
 	return cmd
 }
 

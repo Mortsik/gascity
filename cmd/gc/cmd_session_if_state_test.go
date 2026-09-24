@@ -330,6 +330,11 @@ func TestCmdSessionSuspendIfStateManagedPathIsFenced(t *testing.T) {
 	if intent := afterRefusal.Metadata["sleep_intent"]; intent != "" {
 		t.Fatalf("sleep_intent after managed mismatch = %q, want empty", intent)
 	}
+	// A refusal must be poke-free: the reconciler trigger fires only after a
+	// successful fenced patch, so a mismatch cannot cause a controller tick.
+	if pokes != 0 {
+		t.Fatalf("managed mismatch poke count = %d, want 0 (no poke before the fence)", pokes)
+	}
 
 	// Match under the fence: the managed metadata-only suspend patch lands.
 	stdout.Reset()
@@ -362,8 +367,54 @@ func TestCmdSessionSuspendIfStateManagedPathIsFenced(t *testing.T) {
 	if intent := afterMatch.Metadata["sleep_intent"]; intent != "user-hold" {
 		t.Fatalf("sleep_intent after managed match = %q, want user-hold", intent)
 	}
-	if pokes < 2 {
-		t.Fatalf("managed match poke count = %d, want the pre-patch poke and the post-patch reconciler tick", pokes)
+	if pokes != 1 {
+		t.Fatalf("managed match poke count = %d, want 1 (the post-success reconciler tick; no pre-fence poke)", pokes)
+	}
+}
+
+// TestCmdSessionSuspendIfStateManagedPathGoneRefusesZeroPokes pins the gone
+// refusal on the managed path: a terminal (closed) target still resolves
+// (allow-closed resolution), the fence reports state-gone, and no controller
+// poke happens on the refusal path.
+func TestCmdSessionSuspendIfStateManagedPathGoneRefusesZeroPokes(t *testing.T) {
+	cityDir, store, sessionBead := setupSessionIfStateCity(t, "active")
+	if err := store.Close(sessionBead.ID); err != nil {
+		t.Fatalf("Close(seed): %v", err)
+	}
+	pokes := 0
+	deps := sessionSuspendDeps{
+		cityUsesManagedReconciler: func(string) bool { return true },
+		pokeController:            func(string) error { pokes++; return nil },
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdSessionSuspendWithOptions([]string{sessionBead.ID}, &stdout, &stderr, sessionMutationOptions{JSON: true, IfState: "active", SuspendDeps: &deps})
+	if code == 0 {
+		t.Fatalf("managed gone exit = 0; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	var refusal cliJSONErrorOutput
+	if err := json.Unmarshal(stdout.Bytes(), &refusal); err != nil {
+		t.Fatalf("managed gone stdout is not JSON error: %v; stdout=%q", err, stdout.String())
+	}
+	if refusal.Error.Code != "state-gone" {
+		t.Fatalf("managed gone JSON code = %q, want state-gone", refusal.Error.Code)
+	}
+	if pokes != 0 {
+		t.Fatalf("managed gone poke count = %d, want 0 on the refusal path", pokes)
+	}
+	reopened, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("reopen city store: %v", err)
+	}
+	got, err := reopened.Get(sessionBead.ID)
+	if err != nil {
+		t.Fatalf("Get(closed session): %v", err)
+	}
+	if got.Status != "closed" || got.Metadata["state"] != "active" {
+		t.Fatalf("gone refusal mutated the bead: status=%q state=%q", got.Status, got.Metadata["state"])
+	}
+	if got.Metadata["held_until"] != "" {
+		t.Fatalf("held_until after managed gone = %q, want empty (no suspend patch)", got.Metadata["held_until"])
 	}
 }
 
@@ -519,4 +570,47 @@ mode = "on_demand"
 	var stdout, stderr bytes.Buffer
 	code := cmdSessionCloseWithOptions([]string{"worker"}, &stdout, &stderr, sessionMutationOptions{IfState: "creating"})
 	assertFencedMismatchLeftBeadUntyped(t, cityDir, sessionBead, &stdout, &stderr, code)
+}
+
+// TestSessionCloseAndSuspendIfStateUnknownStateIsUsageError pins the
+// pre-flight vocabulary validation: an --if-state value outside the canonical
+// lifecycle vocabulary is a usage error on BOTH doors, before any store or
+// controller work, and the flag help names the accepted values.
+func TestSessionCloseAndSuspendIfStateUnknownStateIsUsageError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cmd  func(io.Writer, io.Writer) *cobra.Command
+	}{
+		{name: "close", cmd: newSessionCloseCmd},
+		{name: "suspend", cmd: newSessionSuspendCmd},
+	} {
+		t.Run(tc.name+" usage names vocabulary", func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			cmd := tc.cmd(&stdout, &stderr)
+			flag := cmd.Flag("if-state")
+			if flag == nil {
+				t.Fatal("--if-state flag not registered")
+			}
+			if !strings.Contains(flag.Usage, "one of: active,") || !strings.Contains(flag.Usage, "suspended") {
+				t.Fatalf("--if-state usage = %q, want the accepted lifecycle values named", flag.Usage)
+			}
+		})
+		t.Run(tc.name+" unknown value", func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			cmd := tc.cmd(&stdout, &stderr)
+			if err := cmd.Flags().Set("if-state", "garbage"); err != nil {
+				t.Fatalf("set --if-state=garbage: %v", err)
+			}
+			err := cmd.RunE(cmd, []string{"gc-1"})
+			if err == nil {
+				t.Fatal("RunE with unknown --if-state returned nil, want usage error")
+			}
+			if !strings.Contains(stderr.String(), "--if-state must be one of:") {
+				t.Fatalf("stderr = %q, want vocabulary usage error", stderr.String())
+			}
+			if !strings.Contains(stderr.String(), `"garbage"`) {
+				t.Fatalf("stderr = %q, want the rejected value echoed", stderr.String())
+			}
+		})
+	}
 }

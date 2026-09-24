@@ -111,3 +111,41 @@ func TestAllowedCommandsActiveSession(t *testing.T) {
 		t.Errorf("AllowedCommands(StateActive) = %v, want %v", got, want)
 	}
 }
+
+// TestLifecycleStatesCoversEveryStateMachineState pins the anti-drift
+// guarantee behind LifecycleStates: every State that participates in the
+// transitions table (plus the two table-external named states, StateClosed
+// and StateNone's non-empty complements) is a member of the canonical
+// vocabulary, so --if-state validation can never accept a token the state
+// machine does not know.
+func TestLifecycleStatesCoversEveryStateMachineState(t *testing.T) {
+	seen := make(map[State]bool)
+	for _, s := range LifecycleStates() {
+		if seen[s] {
+			t.Errorf("LifecycleStates lists %q twice", s)
+		}
+		seen[s] = true
+	}
+	for cmd, froms := range transitions {
+		for from := range froms {
+			if from == anyState || from == StateNone {
+				continue
+			}
+			if !seen[from] {
+				t.Errorf("transitions[%s] source state %q is missing from LifecycleStates", cmd, from)
+			}
+			to := froms[from]
+			if to != StateNone && !seen[to] {
+				t.Errorf("transitions[%s] target state %q is missing from LifecycleStates", cmd, to)
+			}
+		}
+	}
+	for _, s := range []State{StateClosed} {
+		if !seen[s] {
+			t.Errorf("state machine vocabulary state %q is missing from LifecycleStates", s)
+		}
+	}
+	if !IsLifecycleState(StateActive) || IsLifecycleState(State("garbage")) || IsLifecycleState(StateNone) {
+		t.Fatal("IsLifecycleState membership is wrong for active/garbage/none")
+	}
+}

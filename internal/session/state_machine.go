@@ -93,6 +93,39 @@ const (
 // a named value keeps the state machine vocabulary complete.
 const StateClosed State = "closed"
 
+// LifecycleStates returns every named state in the canonical lifecycle
+// vocabulary, aggregating the State constants this package owns — it is the
+// single validation source for user-supplied state tokens (e.g. the
+// `gc session close/suspend --if-state` flag), so no caller maintains a
+// second list that would drift from the state machine.
+func LifecycleStates() []State {
+	return []State{
+		StateActive,
+		StateAsleep,
+		StateSuspended,
+		StateStartPending,
+		StateCreating,
+		StateFailedCreate,
+		StateDraining,
+		StateDrained,
+		StateAwake,
+		StateArchived,
+		StateQuarantined,
+		StateClosed,
+	}
+}
+
+// IsLifecycleState reports whether s is a member of the canonical lifecycle
+// vocabulary (LifecycleStates).
+func IsLifecycleState(s State) bool {
+	for _, known := range LifecycleStates() {
+		if known == s {
+			return true
+		}
+	}
+	return false
+}
+
 // StateNone is the virtual state before a session is created. Used as the
 // source state for CmdCreate — transitions from StateNone can only go to
 // StateStartPending (via CmdCreate) and nothing else.
