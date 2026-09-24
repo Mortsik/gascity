@@ -354,6 +354,25 @@ gc.endpoint_status: unverified
 	if !strings.Contains(notices.String(), left) {
 		t.Errorf("the transition off the embedded contract did not name %q; notices=%q", left, notices.String())
 	}
+
+	// The EFFECTIVE config mode must agree too: ReadScopeDoltMode prioritizes
+	// the nested `dolt: {mode:}` form bd writes, so a transition that leaves
+	// it behind while writing the flat server key would still read embedded
+	// (agent-forge-teyh fix-loop 3).
+	effectiveMode, modeOK, err := contract.ReadScopeDoltMode(fsys.OSFS{}, filepath.Join(rigDir, ".beads", "config.yaml"))
+	if err != nil || !modeOK {
+		t.Fatalf("ReadScopeDoltMode() ok=%v err=%v, want server tracked", modeOK, err)
+	}
+	if effectiveMode != "server" {
+		t.Fatalf("effective config dolt.mode = %q, want server", effectiveMode)
+	}
+	configText := string(mustReadFile(t, filepath.Join(rigDir, ".beads", "config.yaml")))
+	if strings.Contains(configText, "mode: embedded") {
+		t.Errorf("a contradicting nested dolt.mode must not survive the transition:\n%s", configText)
+	}
+	if !strings.Contains(configText, "dolt.mode: server") {
+		t.Errorf("config should carry the flat canonical mode after the transition:\n%s", configText)
+	}
 }
 
 func TestDoRigSetEndpointInheritMirrorsExternalCity(t *testing.T) {

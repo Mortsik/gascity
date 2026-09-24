@@ -351,6 +351,48 @@ func scanScopeDoltModeFromData(data []byte) (string, bool) {
 	return "", false
 }
 
+// removeNestedDoltMode deletes the nested `dolt: {mode:}` entry so the owned
+// flat dolt.mode cannot be contradicted — ReadScopeDoltMode prioritizes the
+// nested form. Other entries of the `dolt:` section (e.g.
+// disable-event-flush) are kept, and an emptied section is dropped.
+func removeNestedDoltMode(root *yaml.Node) bool {
+	section := findValue(root, "dolt")
+	if section == nil || section.Kind != yaml.MappingNode {
+		return false
+	}
+	changed := deleteKeys(section, "mode")
+	if len(section.Content) == 0 {
+		changed = deleteKeys(root, "dolt") || changed
+	}
+	return changed
+}
+
+// reconcileNestedDoltModeAgainstFlat keeps the two dolt.mode formats from
+// contradicting each other on a preserving write: when both the nested
+// `dolt: {mode:}` form and the flat `dolt.mode:` key are present and
+// disagree, the nested form wins (it is what ReadScopeDoltMode prioritizes)
+// and the flat value is aligned to it. A single-format config is left alone —
+// preserving a mode means not inventing or reformatting it.
+func reconcileNestedDoltModeAgainstFlat(root *yaml.Node) bool {
+	section := findValue(root, "dolt")
+	if section == nil || section.Kind != yaml.MappingNode {
+		return false
+	}
+	node := findValue(section, "mode")
+	if node == nil {
+		return false
+	}
+	nested := strings.ToLower(strings.TrimSpace(node.Value))
+	if nested == "" {
+		return false
+	}
+	flat, ok := configStringValue(root, "dolt.mode")
+	if !ok || strings.EqualFold(strings.TrimSpace(flat), nested) {
+		return false
+	}
+	return setString(root, "dolt.mode", nested)
+}
+
 // ReadDoltDatabase reads the pinned dolt_database from metadata.json.
 func ReadDoltDatabase(fs fsys.FS, path string) (string, bool, error) {
 	data, err := fs.ReadFile(path)
@@ -521,7 +563,18 @@ func EnsureCanonicalConfig(fs fsys.FS, path string, state ConfigState) (bool, er
 	}
 
 	if mode := strings.TrimSpace(state.DoltMode); mode != "" {
+		// GC owns the mode here: write the canonical flat key and remove the
+		// nested `dolt: {mode:}` form bd writes, so ReadScopeDoltMode (which
+		// prioritizes the nested form) can never answer with a value that
+		// contradicts the flat one.
 		changed = setString(root, "dolt.mode", mode) || changed
+		changed = removeNestedDoltMode(root) || changed
+	} else {
+		// Preserve intent: the effective mode is whichever form
+		// ReadScopeDoltMode prioritizes, so when BOTH formats are present and
+		// disagree, the flat value is aligned to the nested one rather than
+		// left contradicting it.
+		changed = reconcileNestedDoltModeAgainstFlat(root) || changed
 	}
 
 	if len(state.CustomTypes) > 0 {
@@ -671,6 +724,17 @@ func ensureCanonicalConfigFallback(fs fsys.FS, path string, state ConfigState) (
 	}
 	if mode := strings.TrimSpace(state.DoltMode); mode != "" {
 		replacements["dolt.mode"] = "dolt.mode: " + mode
+	} else {
+		// A preserving write must still not leave the two dolt.mode formats
+		// contradicting each other: the nested form wins (ReadScopeDoltMode
+		// prioritizes it), so a disagreeing flat value is aligned to it. Only
+		// an EXISTING flat line is rewritten — preserving never invents one.
+		if nested, ok := scanNestedConfigLineValueFromData(data, "dolt", "mode"); ok && strings.TrimSpace(nested) != "" {
+			nested = strings.ToLower(strings.TrimSpace(nested))
+			if flat, flatOK := scanConfigLineValueFromData(data, "dolt.mode:"); flatOK && !strings.EqualFold(strings.TrimSpace(flat), nested) {
+				replacements["dolt.mode"] = "dolt.mode: " + nested
+			}
+		}
 	}
 	if len(state.CustomTypes) > 0 {
 		// Same never-narrow union as the main path, but sourced from the raw
@@ -750,6 +814,9 @@ func ensureCanonicalConfigFallback(fs fsys.FS, path string, state ConfigState) (
 	var doltChanged bool
 	out, doltChanged = ensureFallbackNestedDoltDisableEventFlush(out, disableEventFlush)
 	changed = doltChanged || changed
+	var nestedModeChanged bool
+	out, nestedModeChanged = removeFallbackNestedDoltMode(out, strings.TrimSpace(state.DoltMode) != "")
+	changed = nestedModeChanged || changed
 
 	if !changed {
 		return false, nil
@@ -1114,6 +1181,47 @@ func ensureFallbackNestedDoltDisableEventFlush(lines []string, value bool) ([]st
 		changed = true
 	}
 	out = append(out, lines[sectionEnd:]...)
+	return out, changed
+}
+
+// removeFallbackNestedDoltMode drops nested `mode:` lines from the `dolt:`
+// section when GC owns the mode, so the flat dolt.mode cannot be contradicted
+// — ReadScopeDoltMode prioritizes the nested form. On a preserving write
+// (owned=false) the nested mode IS the effective mode and stays; the flat
+// side is reconciled by the replacements instead. Mirrors
+// ensureFallbackNestedDoltDisableEventFlush's section walk, including its
+// last-`dolt:`-section-wins semantics.
+func removeFallbackNestedDoltMode(lines []string, owned bool) ([]string, bool) {
+	if !owned {
+		return lines, false
+	}
+	sectionIndex := -1
+	for i, line := range lines {
+		if key, _, ok := topLevelConfigLine(line); ok && key == "dolt" {
+			sectionIndex = i
+		}
+	}
+	if sectionIndex == -1 {
+		return lines, false
+	}
+	sectionEnd := len(lines)
+	for i := sectionIndex + 1; i < len(lines); i++ {
+		if _, _, ok := topLevelConfigLine(lines[i]); ok {
+			sectionEnd = i
+			break
+		}
+	}
+	out := make([]string, 0, len(lines))
+	changed := false
+	for i, line := range lines {
+		if i > sectionIndex && i < sectionEnd {
+			if key, ok := nestedConfigLineKey(line); ok && key == "mode" {
+				changed = true
+				continue
+			}
+		}
+		out = append(out, line)
+	}
 	return out, changed
 }
 

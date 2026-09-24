@@ -2055,3 +2055,165 @@ func TestReadScopeDoltModeAcceptsNestedAndFlatShapes(t *testing.T) {
 		t.Fatalf("missing config: mode ok=%v err=%v, want ok=false err=nil", ok, err)
 	}
 }
+
+// When GC owns the mode (state.DoltMode set), canonicalization must remove
+// bd's nested `dolt: {mode:}` form so ReadScopeDoltMode — which prioritizes
+// the nested shape — can never answer with a contradicting value
+// (agent-forge-teyh fix-loop 3).
+func TestEnsureCanonicalConfigOwnedModeRemovesNestedMode(t *testing.T) {
+	fs := fsys.OSFS{}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	config := "issue_prefix: af\ndolt:\n  disable-event-flush: true\n  mode: embedded\ngc.endpoint_origin: explicit\n"
+	if err := fs.WriteFile(path, []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := EnsureCanonicalConfig(fs, path, ConfigState{DoltMode: "server"})
+	if err != nil {
+		t.Fatalf("EnsureCanonicalConfig() error = %v", err)
+	}
+	if !changed {
+		t.Fatal("EnsureCanonicalConfig() should report a change")
+	}
+
+	data, err := fs.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "dolt.mode: server") {
+		t.Errorf("owned mode must be written flat:\n%s", text)
+	}
+	if strings.Contains(text, "mode: embedded") {
+		t.Errorf("nested dolt.mode must not survive an owned-mode write:\n%s", text)
+	}
+	if !strings.Contains(text, "disable-event-flush: true") {
+		t.Errorf("sibling nested dolt keys must survive:\n%s", text)
+	}
+	if mode, ok, err := ReadScopeDoltMode(fs, path); err != nil || !ok || mode != "server" {
+		t.Errorf("ReadScopeDoltMode() = (%q, %v, %v), want server", mode, ok, err)
+	}
+}
+
+// A preserving write (state.DoltMode empty) must not leave the two formats
+// contradicting each other: the nested form wins (ReadScopeDoltMode priority)
+// and the flat value is aligned to it.
+func TestEnsureCanonicalConfigPreserveAlignsContradictingFlatMode(t *testing.T) {
+	fs := fsys.OSFS{}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	config := "issue_prefix: af\ndolt:\n  mode: embedded\ndolt.mode: server\n"
+	if err := fs.WriteFile(path, []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := EnsureCanonicalConfig(fs, path, ConfigState{}); err != nil {
+		t.Fatalf("EnsureCanonicalConfig() error = %v", err)
+	}
+
+	data, err := fs.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if strings.Contains(text, "dolt.mode: server") {
+		t.Errorf("stale flat server mode must be aligned on a preserving write:\n%s", text)
+	}
+	if !strings.Contains(text, "dolt.mode: embedded") {
+		t.Errorf("flat value should be aligned to the prioritized nested mode:\n%s", text)
+	}
+	if mode, ok, err := ReadScopeDoltMode(fs, path); err != nil || !ok || mode != "embedded" {
+		t.Errorf("ReadScopeDoltMode() = (%q, %v, %v), want embedded", mode, ok, err)
+	}
+}
+
+// A preserving write never invents or reformats a mode carried in a single
+// format: only the both-formats-and-disagreeing case is reconciled.
+func TestEnsureCanonicalConfigPreserveLeavesSingleFormatAlone(t *testing.T) {
+	fs := fsys.OSFS{}
+	for _, tc := range []struct {
+		name   string
+		config string
+		want   string
+	}{
+		{name: "flat only", config: "issue_prefix: af\ndolt.mode: server\n", want: "dolt.mode: server"},
+		{name: "nested only", config: "issue_prefix: af\ndolt:\n  mode: embedded\n", want: "mode: embedded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := fs.WriteFile(path, []byte(tc.config), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := EnsureCanonicalConfig(fs, path, ConfigState{}); err != nil {
+				t.Fatalf("EnsureCanonicalConfig() error = %v", err)
+			}
+			data, err := fs.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(data), tc.want) {
+				t.Errorf("single-format mode must be preserved, want %q in:\n%s", tc.want, data)
+			}
+		})
+	}
+}
+
+// The malformed-YAML fallback canonicalizes both formats the same way: an
+// owned mode removes the nested form instead of leaving both on disk.
+func TestEnsureCanonicalConfigFallbackOwnedModeRemovesNestedMode(t *testing.T) {
+	fs := fsys.OSFS{}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	// The glued line routes this config through ensureCanonicalConfigFallback.
+	config := "sync.remote: \"git+x\"types.custom: a,b\ndolt:\n  disable-event-flush: true\n  mode: embedded\n"
+	if err := fs.WriteFile(path, []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := EnsureCanonicalConfig(fs, path, ConfigState{DoltMode: "server"}); err != nil {
+		t.Fatalf("EnsureCanonicalConfig() error = %v", err)
+	}
+
+	data, err := fs.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "dolt.mode: server") {
+		t.Errorf("owned mode must be written flat:\n%s", text)
+	}
+	if strings.Contains(text, "mode: embedded") {
+		t.Errorf("nested dolt.mode must not survive an owned-mode fallback write:\n%s", text)
+	}
+	if !strings.Contains(text, "disable-event-flush: true") || !strings.Contains(text, "types.custom") {
+		t.Errorf("sibling keys must survive the fallback write:\n%s", text)
+	}
+}
+
+// The fallback preserves a mode the same way the main path does: when both
+// formats disagree, the prioritized nested value aligns the flat one.
+func TestEnsureCanonicalConfigFallbackPreserveAlignsContradictingFlatMode(t *testing.T) {
+	fs := fsys.OSFS{}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	config := "sync.remote: \"git+x\"types.custom: a,b\ndolt:\n  mode: embedded\ndolt.mode: server\n"
+	if err := fs.WriteFile(path, []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := EnsureCanonicalConfig(fs, path, ConfigState{}); err != nil {
+		t.Fatalf("EnsureCanonicalConfig() error = %v", err)
+	}
+
+	data, err := fs.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if strings.Contains(text, "dolt.mode: server") {
+		t.Errorf("stale flat server mode must be aligned on a preserving fallback write:\n%s", text)
+	}
+	if !strings.Contains(text, "dolt.mode: embedded") {
+		t.Errorf("flat value should be aligned to the prioritized nested mode:\n%s", text)
+	}
+	if mode, ok, err := ReadScopeDoltMode(fs, path); err != nil || !ok || mode != "embedded" {
+		t.Errorf("ReadScopeDoltMode() = (%q, %v, %v), want embedded", mode, ok, err)
+	}
+}
