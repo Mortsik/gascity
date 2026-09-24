@@ -1069,6 +1069,9 @@ func validateBDStoreTarget(cityPath, scopeRoot string) (contract.DoltConnectionT
 	if scopeUsesBDDoltliteStore(cityPath, scopeRoot) {
 		return contract.DoltConnectionTarget{}, "", false, nil
 	}
+	if scopeUsesEmbeddedDoltStore(scopeRoot) {
+		return contract.DoltConnectionTarget{}, "", false, nil
+	}
 	resolved, err := contract.ResolveScopeConfigState(fsys.OSFS{}, cityPath, scopeRoot, "")
 	if err != nil {
 		return contract.DoltConnectionTarget{}, "reconcile the canonical Dolt endpoint", true, err
@@ -1119,6 +1122,19 @@ func scopeUsesBDDoltliteStore(cityPath, scopePath string) bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(cfg.Beads.Backend), "doltlite")
+}
+
+// scopeUsesEmbeddedDoltStore reports whether a scope's tracked storage
+// contract is embedded Dolt. metadata.json's dolt_mode is the routing
+// identity; config.yaml's dolt.mode corroborates only when metadata records
+// no mode. Such a scope owns its bead database under its own .beads
+// directory — no server endpoint exists to probe.
+func scopeUsesEmbeddedDoltStore(scopeRoot string) bool {
+	if mode, ok, err := contract.ReadDoltMode(fsys.OSFS{}, filepath.Join(scopeRoot, ".beads", "metadata.json")); err == nil && ok {
+		return strings.EqualFold(strings.TrimSpace(mode), "embedded")
+	}
+	mode, ok, err := contract.ReadScopeDoltMode(fsys.OSFS{}, filepath.Join(scopeRoot, ".beads", "config.yaml"))
+	return err == nil && ok && strings.EqualFold(mode, "embedded")
 }
 
 func doctorExecProviderBase(provider string) string {
@@ -1294,6 +1310,11 @@ func (c *RigDoltServerCheck) Run(_ *CheckContext) *CheckResult {
 	if scopeUsesBDDoltliteStore(c.cityPath, rigPath) {
 		r.Status = StatusOK
 		r.Message = "not required (bd backend=doltlite)"
+		return r
+	}
+	if scopeUsesEmbeddedDoltStore(rigPath) {
+		r.Status = StatusOK
+		r.Message = "not required (embedded dolt contract)"
 		return r
 	}
 	if err := contract.ValidateInheritedCityEndpointMirror(fsys.OSFS{}, c.cityPath, rigPath); err != nil {

@@ -1994,3 +1994,64 @@ func TestEnsureCanonicalMetadataPreservesAllKeysOnEmptyBackend(t *testing.T) {
 		}
 	}
 }
+
+func TestReadScopeDoltModeAcceptsNestedAndFlatShapes(t *testing.T) {
+	fs := fsys.OSFS{}
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, ".beads", "config.yaml")
+	if err := fs.MkdirAll(filepath.Dir(cfgPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name   string
+		config string
+		want   string
+		wantOK bool
+	}{
+		{
+			name:   "nested bd shape",
+			config: "issue_prefix: af\ndolt:\n  disable-event-flush: true\n  mode: embedded\n",
+			want:   "embedded",
+			wantOK: true,
+		},
+		{
+			name:   "flat gc shape",
+			config: "issue_prefix: af\ndolt.mode: server\n",
+			want:   "server",
+			wantOK: true,
+		},
+		{
+			name:   "nested wins when both present",
+			config: "dolt:\n  mode: embedded\ndolt.mode: server\n",
+			want:   "embedded",
+			wantOK: true,
+		},
+		{
+			name:   "no mode tracked",
+			config: "issue_prefix: af\ndolt.auto-start: false\n",
+			wantOK: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := fs.WriteFile(cfgPath, []byte(tc.config), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			got, ok, err := ReadScopeDoltMode(fs, cfgPath)
+			if err != nil {
+				t.Fatalf("ReadScopeDoltMode() error = %v", err)
+			}
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if got != tc.want {
+				t.Fatalf("mode = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	if _, ok, err := ReadScopeDoltMode(fs, filepath.Join(dir, "missing.yaml")); err != nil || ok {
+		t.Fatalf("missing config: mode ok=%v err=%v, want ok=false err=nil", ok, err)
+	}
+}

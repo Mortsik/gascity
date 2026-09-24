@@ -68,3 +68,56 @@ func TestConfigStateConstructorsSetDoltModeServer(t *testing.T) {
 		t.Errorf("requestedRigEndpointState (external): DoltMode = %q, want %q", externalEndpoint.DoltMode, "server")
 	}
 }
+
+// The rig's authoritative embedded contract wins over stale dolt_host/
+// dolt_port declarations in city config: the resolved state must keep the
+// explicit embedded shape and carry no server-mode rewrite intent
+// (agent-forge-teyh).
+func TestResolveDesiredRigEndpointStateKeepsEmbeddedAuthoritativeContract(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(t.TempDir(), "agent-forge")
+	writeEmbeddedRigScopeFixture(t, rigPath)
+
+	cityState := desiredCityDoltConfigState(cityPath, config.DoltConfig{}, "gc")
+	state, err := resolveDesiredRigEndpointState(cityPath, config.Rig{
+		Name: "agent-forge", Path: rigPath, Prefix: "agent-forge",
+		DoltHost: "127.0.0.1", DoltPort: "45371",
+	}, cityState)
+	if err != nil {
+		t.Fatalf("resolveDesiredRigEndpointState() error = %v", err)
+	}
+	if state.EndpointOrigin != contract.EndpointOriginExplicit {
+		t.Fatalf("state.EndpointOrigin = %q, want explicit", state.EndpointOrigin)
+	}
+	if state.DoltHost != "" || state.DoltPort != "" {
+		t.Fatalf("embedded contract must not track a server endpoint, got host=%q port=%q", state.DoltHost, state.DoltPort)
+	}
+	if state.DoltMode == "server" {
+		t.Fatal("resolved state must not carry a server-mode rewrite intent for an embedded-contract rig")
+	}
+}
+
+// A rig with no config of its own that legitimately declares a server
+// endpoint keeps resolving to the explicit server state, unchanged.
+func TestResolveDesiredRigEndpointStateKeepsDeclaredServerEndpoint(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(t.TempDir(), "frontend")
+
+	cityState := desiredCityDoltConfigState(cityPath, config.DoltConfig{}, "gc")
+	state, err := resolveDesiredRigEndpointState(cityPath, config.Rig{
+		Name: "frontend", Path: rigPath, Prefix: "fe",
+		DoltHost: "db.example.com", DoltPort: "3306",
+	}, cityState)
+	if err != nil {
+		t.Fatalf("resolveDesiredRigEndpointState() error = %v", err)
+	}
+	if state.EndpointOrigin != contract.EndpointOriginExplicit {
+		t.Fatalf("state.EndpointOrigin = %q, want explicit", state.EndpointOrigin)
+	}
+	if state.DoltHost != "db.example.com" || state.DoltPort != "3306" {
+		t.Fatalf("state endpoint = %q:%q, want db.example.com:3306", state.DoltHost, state.DoltPort)
+	}
+	if state.DoltMode != "server" {
+		t.Fatalf("state.DoltMode = %q, want server", state.DoltMode)
+	}
+}

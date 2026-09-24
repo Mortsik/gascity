@@ -308,6 +308,49 @@ func ScopeHasEndpointAuthority(fs fsys.FS, scopeRoot string) bool {
 	return ConfigHasEndpointAuthority(cfg)
 }
 
+// ReadScopeDoltMode reads the dolt storage mode a scope's config.yaml pins
+// for itself, in either shape it appears on disk: the flat `dolt.mode:` key
+// EnsureCanonicalConfig writes and the nested `dolt: {mode:}` form bd itself
+// writes. The nested form wins when both are present — it is bd's native
+// shape. ok=false when the config carries no mode. The value is returned
+// lower-cased and trimmed.
+func ReadScopeDoltMode(fs fsys.FS, path string) (string, bool, error) {
+	doc, err := readConfigDoc(fs, path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		data, readErr := fs.ReadFile(path)
+		if readErr != nil {
+			return "", false, err
+		}
+		raw, ok := scanScopeDoltModeFromData(data)
+		return raw, ok, nil
+	}
+	root := mappingRoot(doc)
+	if section := findValue(root, "dolt"); section != nil && section.Kind == yaml.MappingNode {
+		if node := findValue(section, "mode"); node != nil {
+			if mode := strings.ToLower(strings.TrimSpace(node.Value)); mode != "" {
+				return mode, true, nil
+			}
+		}
+	}
+	if mode := strings.ToLower(strings.TrimSpace(configValue(root, "dolt.mode"))); mode != "" {
+		return mode, true, nil
+	}
+	return "", false, nil
+}
+
+func scanScopeDoltModeFromData(data []byte) (string, bool) {
+	if raw, ok := scanNestedConfigLineValueFromData(data, "dolt", "mode"); ok && strings.TrimSpace(raw) != "" {
+		return strings.ToLower(strings.TrimSpace(raw)), true
+	}
+	if raw, ok := scanConfigLineValueFromData(data, "dolt.mode:"); ok && strings.TrimSpace(raw) != "" {
+		return strings.ToLower(strings.TrimSpace(raw)), true
+	}
+	return "", false
+}
+
 // ReadDoltDatabase reads the pinned dolt_database from metadata.json.
 func ReadDoltDatabase(fs fsys.FS, path string) (string, bool, error) {
 	data, err := fs.ReadFile(path)

@@ -12326,3 +12326,203 @@ provider = "bd"
 		t.Fatalf("commit rounds = %d, want 1", commits)
 	}
 }
+
+// writeEmbeddedRigScopeFixture materializes a rig whose tracked contract is
+// embedded Dolt — the live agent-forge shape: bd-written nested dolt.mode
+// embedded, explicit endpoint origin, no server host/port, and metadata
+// pinning dolt_mode/dolt_database.
+func writeEmbeddedRigScopeFixture(t *testing.T, rigPath string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(rigPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	config := `issue_prefix: agent-forge
+issue-prefix: agent-forge
+sync.remote: "git+ssh://git@github.com/example/agent-forge-beads.git"
+export.auto: false
+import.auto: false
+dolt:
+  disable-event-flush: true
+  mode: embedded
+backup.enabled: false
+dolt.auto-start: false
+gc.endpoint_origin: explicit
+gc.endpoint_status: unverified
+`
+	if err := os.WriteFile(filepath.Join(rigPath, ".beads", "config.yaml"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	metadata := `{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"agent_forge","project_id":"56a23d75-7025-415a-9cf2-6fd0875c9aad"}`
+	if err := os.WriteFile(filepath.Join(rigPath, ".beads", "metadata.json"), []byte(metadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func requireEmbeddedRigContractPreserved(t *testing.T, rigPath string) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(rigPath, ".beads", "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := string(data)
+	for _, want := range []string{"gc.endpoint_origin: explicit", "mode: embedded"} {
+		if !strings.Contains(config, want) {
+			t.Errorf("rig config missing %q:\n%s", want, config)
+		}
+	}
+	for _, forbidden := range []string{"dolt.host:", "dolt.port:", "dolt.mode: server", "gc.endpoint_origin: managed_city", "gc.endpoint_origin: inherited_city"} {
+		if strings.Contains(config, forbidden) {
+			t.Errorf("rig config must not contain %q:\n%s", forbidden, config)
+		}
+	}
+	meta, err := os.ReadFile(filepath.Join(rigPath, ".beads", "metadata.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"dolt_mode":"embedded"`, `"dolt_database":"agent_forge"`} {
+		if !strings.Contains(string(meta), want) {
+			t.Errorf("rig metadata missing %q:\n%s", want, meta)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(rigPath, ".beads", "dolt-server.port")); !os.IsNotExist(err) {
+		t.Errorf("embedded rig must not carry a dolt-server.port mirror, stat err = %v", err)
+	}
+}
+
+// An embedded-contract rig must boot a city without contacting a Dolt server
+// and without being rewritten to server mode — even when city.toml still
+// declares the rig's retired dolt_host/dolt_port (agent-forge-teyh).
+func TestStartBeadsLifecycleRespectsEmbeddedRigContract(t *testing.T) {
+	cityPath := t.TempDir()
+	callLog := filepath.Join(cityPath, "op-calls.log")
+	script := writeManagedBdTestScript(t, "#!/bin/sh\necho \"$1\" >> "+callLog+"\nexit 2\n")
+	if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`[workspace]
+name = "test-city"
+
+[dolt]
+host = "mini2.hippo-tilapia.ts.net"
+port = 3307
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rigPath := filepath.Join(t.TempDir(), "agent-forge")
+	writeEmbeddedRigScopeFixture(t, rigPath)
+
+	t.Setenv("GC_BEADS", "exec:"+script)
+	t.Setenv("GC_BEADS_SCOPE_ROOT", cityPath)
+
+	var modeAnnouncements strings.Builder
+	origSink := storageModeChangeSink
+	storageModeChangeSink = &modeAnnouncements
+	t.Cleanup(func() {
+		storageModeChangeSink = origSink
+		cityDoltConfigs.Delete(cityPath)
+	})
+
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Dolt:      config.DoltConfig{Host: "mini2.hippo-tilapia.ts.net", Port: 3307},
+		Rigs: []config.Rig{{
+			Name:     "agent-forge",
+			Path:     rigPath,
+			Prefix:   "agent-forge",
+			DoltHost: "127.0.0.1",
+			DoltPort: "45371",
+		}},
+	}
+	if err := startBeadsLifecycle(cityPath, "test-city", cfg, io.Discard); err != nil {
+		t.Fatalf("startBeadsLifecycle with embedded rig: %v", err)
+	}
+
+	requireEmbeddedRigContractPreserved(t, rigPath)
+
+	if announcement := modeAnnouncements.String(); announcement != "" {
+		t.Errorf("embedded rig must not trigger a storage-mode announcement, got:\n%s", announcement)
+	}
+
+	data, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatalf("reading call log: %v", err)
+	}
+	initCalls := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		switch strings.TrimSpace(line) {
+		case "start":
+			t.Errorf("ensureBeadsProvider('start') must not run for an external city")
+		case "init":
+			initCalls++
+		}
+	}
+	if initCalls != 1 {
+		t.Errorf("provider init called %d times, want exactly 1 (city only; the embedded rig must skip managed init)", initCalls)
+	}
+}
+
+func TestNormalizeCanonicalBdScopeFilesPreservesEmbeddedRigContract(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "agent-forge")
+	if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "config.yaml"), []byte("issue_prefix: gc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeEmbeddedRigScopeFixture(t, rigPath)
+
+	var modeAnnouncements strings.Builder
+	origSink := storageModeChangeSink
+	storageModeChangeSink = &modeAnnouncements
+	t.Cleanup(func() { storageModeChangeSink = origSink })
+
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs: []config.Rig{{
+			Name:     "agent-forge",
+			Path:     rigPath,
+			Prefix:   "agent-forge",
+			DoltHost: "127.0.0.1",
+			DoltPort: "45371",
+		}},
+	}
+	if err := normalizeCanonicalBdScopeFiles(cityPath, cfg, io.Discard); err != nil {
+		t.Fatalf("normalizeCanonicalBdScopeFiles with embedded rig: %v", err)
+	}
+
+	requireEmbeddedRigContractPreserved(t, rigPath)
+	if announcement := modeAnnouncements.String(); announcement != "" {
+		t.Errorf("embedded rig must not trigger a storage-mode announcement, got:\n%s", announcement)
+	}
+}
+
+func TestInitAndHookDirEmbeddedRigSkipsManagedInit(t *testing.T) {
+	cityPath := t.TempDir()
+	callLog := filepath.Join(cityPath, "op-calls.log")
+	script := writeManagedBdTestScript(t, "#!/bin/sh\necho \"$1\" >> "+callLog+"\nexit 2\n")
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rigPath := filepath.Join(t.TempDir(), "agent-forge")
+	writeEmbeddedRigScopeFixture(t, rigPath)
+
+	t.Setenv("GC_BEADS", "exec:"+script)
+	t.Setenv("GC_BEADS_SCOPE_ROOT", cityPath)
+
+	if err := initAndHookDir(cityPath, rigPath, "agent-forge"); err != nil {
+		t.Fatalf("initAndHookDir with embedded rig: %v", err)
+	}
+
+	if _, err := os.Stat(callLog); !os.IsNotExist(err) {
+		data, _ := os.ReadFile(callLog)
+		t.Fatalf("embedded rig must not reach the managed bd provider, calls:\n%s", data)
+	}
+	requireEmbeddedRigContractPreserved(t, rigPath)
+}

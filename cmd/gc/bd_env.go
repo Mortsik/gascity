@@ -779,6 +779,14 @@ func applyCanonicalScopeBackendEnv(env map[string]string, cityPath, scopeRoot st
 		if err != nil {
 			return true, err
 		}
+		if target.Embedded {
+			// Embedded-contract scope: bd opens the scope's own .beads
+			// database in-process. Withhold the projected server endpoint so
+			// the subprocess never inherits a host/port for a server that
+			// does not serve this scope.
+			clearProjectedDoltEnv(env)
+			return true, nil
+		}
 		applyCanonicalDoltTargetEnv(env, target)
 		applyCanonicalDoltAuthEnv(env, cityPath, scopeRoot, target)
 		mirrorBeadsDoltScopeEnv(env, target)
@@ -1255,6 +1263,11 @@ func managedBDRecoveryAllowed(cityPath, scopeRoot string, env map[string]string)
 	if target, ok, err := canonicalScopeDoltTarget(cityPath, scopeRoot); err != nil {
 		return contract.IsManagedRuntimeUnavailable(err) && managedLocalDoltEnv(env)
 	} else if ok {
+		if target.Embedded {
+			// An embedded-contract scope is not served by gc's managed Dolt
+			// server; recovering one for it must not start a server.
+			return false
+		}
 		return !target.External && managedLocalDoltHost(target.Host)
 	}
 	return managedLocalDoltEnv(env)
@@ -1382,6 +1395,9 @@ func bdScopeDoltIsGcManaged(cityPath, scopeRoot string) bool {
 	}
 	target, ok, err := canonicalScopeDoltTarget(cityPath, scopeRoot)
 	if err != nil || !ok {
+		return false
+	}
+	if target.Embedded {
 		return false
 	}
 	return !target.External && managedLocalDoltHost(target.Host)

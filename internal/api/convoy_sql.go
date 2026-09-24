@@ -831,6 +831,9 @@ func resolveDoltConnection(cityRoot, scopeRoot string) (string, int, string, str
 	if err != nil {
 		return "", 0, "", "", "", err
 	}
+	if target.Embedded {
+		return "", 0, "", "", "", fmt.Errorf("scope %s uses embedded dolt storage; no SQL server endpoint exists", scopeRoot)
+	}
 	port, err := strconv.Atoi(strings.TrimSpace(target.Port))
 	if err != nil {
 		return "", 0, "", "", "", fmt.Errorf("parse dolt port %q: %w", target.Port, err)

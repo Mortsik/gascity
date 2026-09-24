@@ -279,8 +279,12 @@ func TestCanonicalizeScopeMetadataIfPresentSkipsOnlyAbsentMetadata(t *testing.T)
 		if err := canonicalizeScopeMetadataIfPresent(fsys.OSFS{}, scopeDir); err != nil {
 			t.Fatalf("canonicalizeScopeMetadataIfPresent: %v", err)
 		}
-		if mode := readScopeDoltMode(t, scopeDir); mode != "server" {
-			t.Fatalf("dolt_mode = %q, want server", mode)
+		// The scope's tracked contract is embedded Dolt: canonicalization
+		// rewrites the canonical fields but preserves the mode it pinned
+		// (agent-forge-teyh) — same treatment as the init path and the
+		// named-scope door.
+		if mode := readScopeDoltMode(t, scopeDir); mode != "embedded" {
+			t.Fatalf("dolt_mode = %q, want the embedded contract preserved", mode)
 		}
 	})
 }

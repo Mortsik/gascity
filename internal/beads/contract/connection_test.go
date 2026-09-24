@@ -1000,6 +1000,149 @@ dolt.port: 5507
 	}
 }
 
+// writeEmbeddedRigContract materializes a rig scope whose tracked contract is
+// embedded Dolt — the shape bd itself writes: explicit endpoint origin, no
+// server host/port, dolt.mode embedded (nested by default, flat on request),
+// and metadata pinning dolt_mode/dolt_database.
+func writeEmbeddedRigContract(t *testing.T, fs fsys.FS, rig string, flatMode bool) {
+	t.Helper()
+	if err := fs.MkdirAll(filepath.Join(rig, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	modeLine := "dolt:\n  disable-event-flush: true\n  mode: embedded\n"
+	if flatMode {
+		modeLine = "dolt.mode: embedded\n"
+	}
+	config := "issue_prefix: agent-forge\nissue-prefix: agent-forge\n" +
+		"sync.remote: \"git+ssh://git@github.com/example/agent-forge-beads.git\"\n" +
+		"export.auto: false\nimport.auto: false\nbackup.enabled: false\n" +
+		"dolt.auto-start: false\n" + modeLine +
+		"gc.endpoint_origin: explicit\ngc.endpoint_status: unverified\n"
+	if err := fs.WriteFile(filepath.Join(rig, ".beads", "config.yaml"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	metadata := `{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"agent_forge"}`
+	if err := fs.WriteFile(filepath.Join(rig, ".beads", "metadata.json"), []byte(metadata), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// An embedded-contract rig with explicit endpoint origin and no port must be
+// VALID: the scope owns its bead storage under its own .beads directory, so
+// no server endpoint exists to require (agent-forge-teyh).
+func TestEmbeddedExplicitRigContractIsValidWithoutPort(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		flat bool
+	}{
+		{name: "nested dolt.mode", flat: false},
+		{name: "flat dolt.mode", flat: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := fsys.OSFS{}
+			city := t.TempDir()
+			rig := filepath.Join(t.TempDir(), "agent-forge")
+			writeEmbeddedRigContract(t, fs, rig, tc.flat)
+
+			cfg, ok, err := ReadConfigState(fs, filepath.Join(rig, ".beads", "config.yaml"))
+			if err != nil || !ok {
+				t.Fatalf("ReadConfigState() ok=%v err=%v", ok, err)
+			}
+			if err := ValidateCanonicalConfigState(fs, city, rig, cfg); err != nil {
+				t.Fatalf("ValidateCanonicalConfigState() error = %v", err)
+			}
+			if err := ValidateConnectionConfigState(fs, city, rig, cfg); err != nil {
+				t.Fatalf("ValidateConnectionConfigState() error = %v", err)
+			}
+			resolved, err := ResolveScopeConfigState(fs, city, rig, "agent-forge")
+			if err != nil {
+				t.Fatalf("ResolveScopeConfigState() error = %v", err)
+			}
+			if resolved.Kind != ScopeConfigAuthoritative || resolved.State.EndpointOrigin != EndpointOriginExplicit {
+				t.Fatalf("resolved = %+v, want authoritative explicit", resolved)
+			}
+		})
+	}
+}
+
+// The port requirement for explicit rig configs must survive unchanged for
+// rigs that do NOT pin an embedded contract.
+func TestExplicitRigConfigStillRequiresPortWithoutEmbeddedContract(t *testing.T) {
+	fs := fsys.OSFS{}
+	city := t.TempDir()
+	rig := filepath.Join(t.TempDir(), "frontend")
+	if err := fs.MkdirAll(filepath.Join(rig, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := "issue_prefix: fe\ndolt.auto-start: false\ngc.endpoint_origin: explicit\ngc.endpoint_status: verified\n"
+	if err := fs.WriteFile(filepath.Join(rig, ".beads", "config.yaml"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, ok, err := ReadConfigState(fs, filepath.Join(rig, ".beads", "config.yaml"))
+	if err != nil || !ok {
+		t.Fatalf("ReadConfigState() ok=%v err=%v", ok, err)
+	}
+	if err := ValidateConnectionConfigState(fs, city, rig, cfg); err == nil || !strings.Contains(err.Error(), "explicit rig config requires dolt.port") {
+		t.Fatalf("ValidateConnectionConfigState() error = %v, want explicit rig config requires dolt.port", err)
+	}
+	_, err = ResolveScopeConfigState(fs, city, rig, "fe")
+	if err == nil || !strings.Contains(err.Error(), "explicit rig config requires dolt.port") {
+		t.Fatalf("ResolveScopeConfigState() error = %v, want explicit rig config requires dolt.port", err)
+	}
+}
+
+func TestResolveDoltConnectionTargetEmbeddedExplicitRig(t *testing.T) {
+	fs := fsys.OSFS{}
+	city := t.TempDir()
+	rig := filepath.Join(t.TempDir(), "agent-forge")
+	writeEmbeddedRigContract(t, fs, rig, false)
+
+	target, err := ResolveDoltConnectionTarget(fs, city, rig)
+	if err != nil {
+		t.Fatalf("ResolveDoltConnectionTarget() error = %v", err)
+	}
+	if !target.Embedded {
+		t.Fatal("embedded-contract rig must resolve to an embedded target")
+	}
+	if target.External || target.Host != "" || target.Port != "" {
+		t.Fatalf("embedded target must not carry a server endpoint: %+v", target)
+	}
+	if target.EndpointOrigin != EndpointOriginExplicit || target.EndpointStatus != EndpointStatusUnverified {
+		t.Fatalf("target origin/status = %q/%q, want explicit/unverified", target.EndpointOrigin, target.EndpointStatus)
+	}
+	if target.Database != "agent_forge" {
+		t.Fatalf("target database = %q, want agent_forge from metadata", target.Database)
+	}
+}
+
+// A rig that legitimately declares a server endpoint keeps resolving to that
+// external target, embedded or not.
+func TestResolveDoltConnectionTargetExplicitServerRigUnchanged(t *testing.T) {
+	fs := fsys.OSFS{}
+	city := t.TempDir()
+	rig := filepath.Join(t.TempDir(), "frontend")
+	writeCanonicalConfig(t, fs, rig, ConfigState{
+		IssuePrefix:    "fe",
+		EndpointOrigin: EndpointOriginExplicit,
+		EndpointStatus: EndpointStatusVerified,
+		DoltHost:       "db.example.com",
+		DoltPort:       "4406",
+	})
+	writeCanonicalMetadata(t, fs, rig, "fe")
+
+	target, err := ResolveDoltConnectionTarget(fs, city, rig)
+	if err != nil {
+		t.Fatalf("ResolveDoltConnectionTarget() error = %v", err)
+	}
+	if target.Embedded {
+		t.Fatal("explicit server rig must not resolve to an embedded target")
+	}
+	if !target.External || target.Host != "db.example.com" || target.Port != "4406" {
+		t.Fatalf("target = %+v, want external db.example.com:4406", target)
+	}
+}
+
 //nolint:unparam // helper keeps FS explicit in tests
 func writeCanonicalConfig(t *testing.T, fs fsys.FS, dir string, state ConfigState) {
 	t.Helper()

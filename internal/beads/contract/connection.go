@@ -70,6 +70,12 @@ type DoltConnectionTarget struct {
 	EndpointOrigin EndpointOrigin
 	EndpointStatus EndpointStatus
 	External       bool
+	// Embedded reports that the scope's tracked contract is embedded Dolt
+	// (dolt.mode: embedded): the bead database lives under the scope's own
+	// .beads directory and bd opens it in-process, so Host and Port are empty
+	// and no server endpoint exists to connect to. Callers that need a live
+	// SQL endpoint must treat this scope as served without one.
+	Embedded bool
 }
 
 // ScopeConfigResolutionKind describes how a scope config was resolved.
@@ -153,6 +159,13 @@ func ResolveDoltConnectionTarget(fs fsys.FS, cityRoot, scopeRoot string) (DoltCo
 		target.Port = port
 		return target, nil
 	case EndpointOriginCityCanonical, EndpointOriginExplicit:
+		if cfg.EndpointOrigin == EndpointOriginExplicit && !sameScope(scopeRoot, cityRoot) && scopeTracksNoExternalEndpoint(cfg) && ScopeDoltContractIsEmbedded(fs, scopeRoot) {
+			// An embedded-contract rig owns its bead database under its own
+			// .beads directory; bd opens it in-process, so there is no server
+			// endpoint to populate and no server that must be reachable.
+			target.Embedded = true
+			return target, nil
+		}
 		return populateExternalTarget(target, cfg)
 	case EndpointOriginInheritedCity:
 		return resolveInheritedCityConnectionTarget(fs, cityRoot, target, cfg)
@@ -183,6 +196,11 @@ func ValidateCanonicalConfigState(fs fsys.FS, cityRoot, scopeRoot string, cfg Co
 	case "":
 		return nil
 	case EndpointOriginExplicit:
+		if scopeTracksNoExternalEndpoint(cfg) && ScopeDoltContractIsEmbedded(fs, scopeRoot) {
+			// An embedded-contract rig owns its bead storage under its own
+			// .beads directory; there is no server endpoint to require.
+			return nil
+		}
 		if strings.TrimSpace(cfg.DoltHost) == "" || strings.TrimSpace(cfg.DoltPort) == "" {
 			return fmt.Errorf("canonical explicit rig config requires both dolt.host and dolt.port")
 		}
@@ -428,6 +446,11 @@ func ValidateConnectionConfigState(fs fsys.FS, cityRoot, scopeRoot string, cfg C
 	case EndpointOriginManagedCity, EndpointOriginCityCanonical:
 		return fmt.Errorf("%s endpoint origin is invalid for rig scope", cfg.EndpointOrigin)
 	case EndpointOriginExplicit:
+		if scopeTracksNoExternalEndpoint(cfg) && ScopeDoltContractIsEmbedded(fs, scopeRoot) {
+			// An embedded-contract rig owns its bead storage under its own
+			// .beads directory; there is no server endpoint to require.
+			return nil
+		}
 		if strings.TrimSpace(cfg.DoltPort) == "" {
 			return fmt.Errorf("explicit rig config requires dolt.port")
 		}
@@ -644,6 +667,21 @@ func IsLegacyMinimalEndpointConfig(cfg ConfigState) bool {
 
 func configTracksEndpoint(cfg ConfigState) bool {
 	return strings.TrimSpace(cfg.DoltHost) != "" || strings.TrimSpace(cfg.DoltPort) != "" || strings.TrimSpace(cfg.DoltUser) != ""
+}
+
+// scopeTracksNoExternalEndpoint reports whether a config carries no server
+// host or port at all.
+func scopeTracksNoExternalEndpoint(cfg ConfigState) bool {
+	return strings.TrimSpace(cfg.DoltHost) == "" && strings.TrimSpace(cfg.DoltPort) == ""
+}
+
+// ScopeDoltContractIsEmbedded reports whether a scope's config.yaml pins its
+// storage contract to embedded Dolt (dolt.mode: embedded, flat or nested
+// form). Such a scope owns its bead database under its own .beads directory;
+// no server endpoint exists for it.
+func ScopeDoltContractIsEmbedded(fs fsys.FS, scopeRoot string) bool {
+	mode, ok, err := ReadScopeDoltMode(fs, filepath.Join(scopeRoot, ".beads", "config.yaml"))
+	return err == nil && ok && mode == "embedded"
 }
 
 func populateExternalTarget(target DoltConnectionTarget, cfg ConfigState) (DoltConnectionTarget, error) {

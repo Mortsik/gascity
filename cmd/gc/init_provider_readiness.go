@@ -744,6 +744,12 @@ func initScopeNeedsLocalDoltIdentity(cityPath, scopeRoot string, cfg *config.Cit
 	if bound {
 		return false
 	}
+	if scopeUsesEmbeddedDoltContract(scopeRoot) {
+		// An embedded-contract scope opens its own .beads database
+		// in-process; the managed local server's author identity is
+		// irrelevant to it.
+		return false
+	}
 	return !initScopeUsesExternalDolt(cityPath, scopeRoot, cfg)
 }
 

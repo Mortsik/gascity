@@ -66,6 +66,12 @@ func preflightDatabaseProjectIDReader(cityPath string) func(scope string) (strin
 		if err != nil || !ok {
 			return "", false, err
 		}
+		if target.Embedded {
+			// No server endpoint exists for an embedded-contract scope; the
+			// project-id identity check defers to bd's native open of the
+			// embedded store.
+			return "", false, nil
+		}
 		// Pooled handle owned by internal/doltpool; do not Close.
 		db, err := managedDoltOpenDatabase(target.Host, target.Port, target.User, target.Database)
 		if err != nil {

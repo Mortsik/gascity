@@ -297,6 +297,13 @@ func applyOrderExecCanonicalDoltEnv(cityPath, scopeRoot string, env map[string]s
 	if !ok {
 		return
 	}
+	if target.Embedded {
+		// Embedded-contract scope: bd opens the scope's own .beads database
+		// in-process. Withhold the projected server endpoint and the managed
+		// runtime layout — neither applies to a scope with no server.
+		clearProjectedDoltEnv(env)
+		return
+	}
 	applyCanonicalDoltTargetEnv(env, target)
 	applyCanonicalDoltAuthEnv(env, cityPath, scopeRoot, target)
 	if target.External {

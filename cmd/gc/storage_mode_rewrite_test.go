@@ -19,10 +19,19 @@ import (
 // the scope at a database that does not hold its beads, after which every
 // work-store read answers `[]` with exit 0.
 //
-// What landed first is the half that is DECIDABLE: the rewrite becomes visible,
-// with the path it stops reading and the durable remediation attached.
+// agent-forge-teyh closed the root cause for scopes whose TRACKED contract is
+// embedded Dolt: canonicalization now preserves their dolt_mode instead of
+// flipping it — an embedded scope owns its ledger under its own .beads
+// directory, and flipping it onto a server endpoint re-points every read at a
+// database that does not hold its rows, or at a server that no longer exists
+// (the live recurrence: `gc start` rewrote an embedded rig onto a retired
+// Dolt server and bricked boot behind "explicit rig config requires
+// dolt.port"). What remains of the rewrite is ADOPTION: a scope carrying the
+// pre-registry "legacy" backend marker, or recording no mode at all, still
+// canonicalizes to gc's managed server mode, and that flip is the one the
+// flip-time announcement still describes.
 //
-// ga-clsfl then closed the read-time half — as a NOTICE, never a refusal. The
+// ga-clsfl closed the read-time half — as a NOTICE, never a refusal. The
 // two experiment tests near the end of this file are why: they are the cases a
 // refusal keyed on "a `.dolt` directory exists under the other mode's
 // subdirectory" gets wrong, and that fact is the only evidence available
@@ -37,7 +46,7 @@ import (
 
 // embeddedScopeWithBeads builds a scope whose .beads/ is an embedded-mode bd
 // workspace with a Dolt repository under it — what `bd init -p <prefix>` leaves
-// behind, and what the live proof's city had before gc touched it.
+// behind, and what the live proof's rig had before gc touched it.
 //
 // The Dolt repository is represented by the directory shape gc itself uses to
 // recognize one (a `.dolt` subdirectory, the same test gc doctor's
@@ -52,6 +61,26 @@ func embeddedScopeWithBeads(t *testing.T, database string) string {
 	writeScopeMetadata(t, scope, map[string]string{
 		"database":      "dolt",
 		"backend":       "dolt",
+		"dolt_mode":     "embedded",
+		"dolt_database": database,
+	})
+	return scope
+}
+
+// legacyAdoptionScopeFixture builds the adoption shape: the pre-registry
+// "legacy" backend marker with a recorded embedded mode and a Dolt repository
+// under .beads/embeddeddolt. Nothing this build serves can read it, so
+// canonicalization adopts it onto gc's managed server mode — and that flip is
+// what the storage-mode announcement still exists to make loud.
+func legacyAdoptionScopeFixture(t *testing.T, database string) string {
+	t.Helper()
+	scope := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(scope, ".beads", "embeddeddolt", database, ".dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeScopeMetadata(t, scope, map[string]string{
+		"database":      "legacy",
+		"backend":       "legacy",
 		"dolt_mode":     "embedded",
 		"dolt_database": database,
 	})
@@ -89,20 +118,13 @@ func captureStorageModeChanges(t *testing.T) *bytes.Buffer {
 // database its metadata names, runs the query, and matches nothing.
 func emptyBdRunner(_, _ string, _ ...string) ([]byte, error) { return []byte("[]"), nil }
 
-// TestCanonicalizingAScopeAnnouncesAStorageModeChange is priority (1) of
-// ga-qi9km: a command that changes a city's storage mode must say so.
-//
-// The rewrite itself is kept — see announceStorageModeChange for why gc's
-// managed store cannot run a scope in embedded mode — so what this asserts is
-// the change becoming VISIBLE, and visible with the consequence attached: an
-// operator who reads "changed embedded to server" and an operator who reads
-// "…and .beads/embeddeddolt/jc will stop being read" are in two different
-// positions when their beads disappear.
-//
-// Red before the fix: the canonicalization emitted nothing at all. It flipped
-// dolt_mode, wrote the file, and returned nil, which is how the live proof
-// discovered the rewrite by diffing metadata.json rather than by being told.
-func TestCanonicalizingAScopeAnnouncesAStorageModeChange(t *testing.T) {
+// TestCanonicalizingAnEmbeddedContractScopePreservesItsModeSilently pins the
+// agent-forge-teyh root-cause fix: an embedded-contract scope is mode-correct
+// already, so canonicalization must keep its dolt_mode and stay silent —
+// every boot re-runs it, and one line per scope per boot is a line nobody
+// reads. Red before the fix: the rewrite happened on every `gc start` and the
+// announcement was the only guard.
+func TestCanonicalizingAnEmbeddedContractScopePreservesItsModeSilently(t *testing.T) {
 	scope := embeddedScopeWithBeads(t, "jc")
 	notices := captureStorageModeChanges(t)
 
@@ -110,30 +132,26 @@ func TestCanonicalizingAScopeAnnouncesAStorageModeChange(t *testing.T) {
 		t.Fatalf("ensureCanonicalScopeMetadataForInit: %v", err)
 	}
 
-	// The rewrite still happens: this fix makes it loud, it does not make the
-	// managed store unusable.
-	if mode := readScopeDoltMode(t, scope); mode != "server" {
-		t.Fatalf("dolt_mode = %q after canonicalization, want %q", mode, "server")
+	if mode := readScopeDoltMode(t, scope); mode != "embedded" {
+		t.Fatalf("dolt_mode = %q after canonicalization, want the embedded contract preserved", mode)
 	}
-	left := filepath.Join(scope, ".beads", "embeddeddolt", "jc")
-	for _, want := range []string{scope, "embedded", "server", left, "STOP reading"} {
-		if !strings.Contains(notices.String(), want) {
-			t.Errorf("the storage-mode change never names %q; notices=%q", want, notices.String())
-		}
+	if notices.Len() != 0 {
+		t.Errorf("preserving an embedded contract announced a storage-mode change: %q", notices.String())
 	}
 }
 
-// TestTheStorageModeAnnouncementNamesARecoveryThatSURVIVESTheNextBoot is the
-// operator-guidance half of ga-qi9km, and it pins the two ways this message can
-// be worse than useless.
+// TestTheAdoptionAnnouncementNamesARecoveryThatSURVIVESTheNextBoot is the
+// operator-guidance half of ga-qi9km, now scoped to the only flip that still
+// happens: adopting a scope canonicalization cannot serve (the pre-registry
+// "legacy" marker) onto gc's managed server mode.
 //
-// The first is advice gc itself undoes. ensureCanonicalScopeMetadata forces
-// dolt_mode=server unconditionally, and `gc start`, `gc rig add`, `gc supervisor
+// It pins the two ways this message can be worse than useless. The first is
+// advice gc itself undoes: ensureCanonicalScopeMetadata re-canonicalizes
+// adopted scopes to server mode, and `gc start`, `gc rig add`, `gc supervisor
 // run` and the controller's rig-create handler all run it — so "point
 // metadata.json back at the embedded database" works until the next boot and
-// then silently stops, leaving the operator in a loop and, in between, on a
-// mode internal/beads/contract's preflight checker FAILS the native store on.
-// The message must not offer it, and must say the edit does not hold.
+// then silently stops. The message must not offer it, and must say the edit
+// does not hold.
 //
 // The second is overstating what is on disk. `bd init` creates the embedded
 // repository before a single bead exists, so "holds a Dolt bead database" is
@@ -144,14 +162,20 @@ func TestCanonicalizingAScopeAnnouncesAStorageModeChange(t *testing.T) {
 // The remediation named is `gc doctor`'s own (splitStoreFixHint), word for
 // word on the load-bearing clause, so the two do not send an operator in
 // different directions about the same two directories.
-func TestTheStorageModeAnnouncementNamesARecoveryThatSURVIVESTheNextBoot(t *testing.T) {
-	scope := embeddedScopeWithBeads(t, "jc")
+func TestTheAdoptionAnnouncementNamesARecoveryThatSURVIVESTheNextBoot(t *testing.T) {
+	scope := legacyAdoptionScopeFixture(t, "jc")
 	notices := captureStorageModeChanges(t)
 	if err := ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, scope, "jc"); err != nil {
 		t.Fatalf("ensureCanonicalScopeMetadataForInit: %v", err)
 	}
 	notice := notices.String()
 
+	left := filepath.Join(scope, ".beads", "embeddeddolt", "jc")
+	for _, want := range []string{scope, "embedded", "server", left, "STOP reading"} {
+		if !strings.Contains(notice, want) {
+			t.Errorf("the announcement never names %q; notices=%q", want, notice)
+		}
+	}
 	for _, want := range []string{
 		"gc doctor",
 		"bd import --dry-run",
@@ -190,17 +214,18 @@ func TestTheStorageModeAnnouncementNamesARecoveryThatSURVIVESTheNextBoot(t *test
 }
 
 // TestEveryDoorThatFlipsTheStorageModeAnnouncesIt closes the gap a
-// per-command warning always has.
+// per-command warning always has — and, since agent-forge-teyh, pins that
+// none of the doors rewrites an embedded contract.
 //
 // `gc rig set-endpoint` and `gc beads city use-managed`/`use-external` reach
 // their own canonicalizers (requireCanonicalizedScopeMetadata for the scope the
 // command names, canonicalizeScopeMetadataIfPresent for the inherited rigs a
 // city endpoint change sweeps along, both in cmd_rig_endpoint.go) rather than
-// the init one, and they perform the identical embedded→server rewrite. A
-// warning that depends on which command the operator happened to run — or on
-// which of the two endpoint doors the scope arrived through — is a warning
-// nobody can rely on.
-func TestEveryDoorThatFlipsTheStorageModeAnnouncesIt(t *testing.T) {
+// the init one. All three doors must preserve an embedded-contract scope
+// silently: a warning that depends on which command the operator happened to
+// run — or on which of the three doors the scope arrived through — is a
+// warning nobody can rely on.
+func TestEveryDoorTreatsAnEmbeddedContractTheSame(t *testing.T) {
 	for name, canonicalize := range map[string]func(scope string) error{
 		"init path": func(scope string) error {
 			return ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, scope, "jc")
@@ -218,12 +243,11 @@ func TestEveryDoorThatFlipsTheStorageModeAnnouncesIt(t *testing.T) {
 			if err := canonicalize(scope); err != nil {
 				t.Fatalf("canonicalize: %v", err)
 			}
-			if mode := readScopeDoltMode(t, scope); mode != "server" {
-				t.Fatalf("dolt_mode = %q, want %q", mode, "server")
+			if mode := readScopeDoltMode(t, scope); mode != "embedded" {
+				t.Fatalf("dolt_mode = %q, want the embedded contract preserved", mode)
 			}
-			left := filepath.Join(scope, ".beads", "embeddeddolt", "jc")
-			if !strings.Contains(notices.String(), left) {
-				t.Fatalf("the rewrite did not name %q; notices=%q", left, notices.String())
+			if notices.Len() != 0 {
+				t.Fatalf("preserving an embedded contract announced a change: %q", notices.String())
 			}
 		})
 	}
@@ -252,16 +276,12 @@ func TestCanonicalizingAnAlreadyCanonicalScopeIsSilent(t *testing.T) {
 	}
 }
 
-// TestTheStorageModeRewriteNeverChangesWhatAReadAnswers is the mutation proof
-// for both halves: the flip-time announcement and the read-time notice are
-// WARNINGS, and a warning that changes the answer is not a warning.
-//
-// A scope whose metadata was just re-pointed away from the database holding its
-// rows still answers `[]` with nil, exactly as it did before either change, on
-// every read shape. Closing the fail-open by REFUSING needs evidence gc does
-// not have (see the two experiment tests below), so what changed is that the
-// flip says so when it happens and the empty read says so when it is paid for.
-func TestTheStorageModeRewriteNeverChangesWhatAReadAnswers(t *testing.T) {
+// TestPreservingAnEmbeddedContractNeverChangesWhatAReadAnswers is the mutation
+// proof for both halves of the read story: with the contract preserved there is
+// no re-pointed read to warn about, so every read still answers `[]` with nil —
+// now through the embedded database the metadata still names — and nothing is
+// printed, because nothing changed.
+func TestPreservingAnEmbeddedContractNeverChangesWhatAReadAnswers(t *testing.T) {
 	scope := embeddedScopeWithBeads(t, "jc")
 	captureStorageModeChanges(t)
 	if err := ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, scope, "jc"); err != nil {
@@ -283,11 +303,9 @@ func TestTheStorageModeRewriteNeverChangesWhatAReadAnswers(t *testing.T) {
 			}
 		})
 	}
-	// And the empty answer is no longer confident: the whole-ledger reads carry
-	// the notice naming the database this scope stopped reading.
-	left := filepath.Join(scope, ".beads", "embeddeddolt", "jc")
-	if !strings.Contains(notices.String(), left) {
-		t.Fatalf("no read-time notice naming %q; notices=%q", left, notices.String())
+	// No flip, nothing left behind, nothing to announce at read time either.
+	if notices.Len() != 0 {
+		t.Fatalf("a preserved embedded contract produced a read-time notice: %q", notices.String())
 	}
 }
 
@@ -373,37 +391,22 @@ func TestAnEmptyReadIsNotEvidenceTheScopeIsReadingTheWrongDatabase(t *testing.T)
 //
 // `bd init` defaults to embedded mode and creates .beads/embeddeddolt/<db>/.dolt
 // before a single bead exists (bd's own cmd/bd/init_embedded_test.go asserts
-// that file). Adopting such a workspace with `gc rig add` canonicalizes it to
-// server mode, and from that moment BOTH databases are empty — which is the
-// same on-disk shape as a populated workspace that was re-pointed at an empty
-// server store. Presence of a `.dolt` directory cannot tell them apart; only
-// opening the second database can, and that is a store open, a lock and a
-// possible schema migration on a directory the operator was told to preserve.
-//
-// So the fresh rig reads as a fresh rig: zero beads, nil error. Refusing here
-// would break the adoption path this change's own announcement exists to keep
-// usable, and would fail `gc rig add` itself —
-// verifyCanonicalBdScopeStoreReady requires List(AllowScan, Limit 1) to return
-// a nil error, retried 20 times at 500ms, so a guard that fired here would
-// break adoption after a ten-second stall. That whole gate runs below, and it
-// must complete without sleeping once.
-//
-// What the read-time notice does here is SAY so, once, and let the read
-// through: a fresh adoption and a re-pointed workspace are the same shape on
-// disk, and describing the shape is the most that is knowable.
-//
-// Red before ga-clsfl's predecessor:
-//
-//	List(AllowScan, Limit 1) = (0 beads, bead store read returned empty while an unread bead database sits beside it…)
-//	Ready()                  = (0 beads, bead store read returned empty while an unread bead database sits beside it…)
+// that file). Since agent-forge-teyh, adopting such a workspace PRESERVES its
+// embedded contract — the readiness gate `gc rig add` and `gc start` block on
+// opens the embedded database the metadata still names, so a fresh rig reads as
+// a fresh rig: zero beads, nil error, no sleep, and no announcement, because
+// nothing was rewritten.
 func TestAdoptingAFreshlyInitializedWorkspaceStillReads(t *testing.T) {
 	scope := embeddedScopeWithBeads(t, "jkq") // `bd init -p jkq`: empty repo, embedded mode
 	notices := captureStorageModeChanges(t)
 	if err := ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, scope, "jkq"); err != nil {
 		t.Fatalf("ensureCanonicalScopeMetadataForInit: %v", err)
 	}
-	if notices.Len() == 0 {
-		t.Fatal("adopting a bd-initialized workspace changed its storage mode silently")
+	if mode := readScopeDoltMode(t, scope); mode != "embedded" {
+		t.Fatalf("dolt_mode = %q after adoption, want the embedded contract preserved", mode)
+	}
+	if notices.Len() != 0 {
+		t.Fatalf("preserving a fresh workspace's embedded contract announced a change: %q", notices.String())
 	}
 
 	var readNotices bytes.Buffer
@@ -419,9 +422,9 @@ func TestAdoptingAFreshlyInitializedWorkspaceStillReads(t *testing.T) {
 	if got, err := store.Ready(); err != nil || len(got) != 0 {
 		t.Fatalf("Ready = (%d beads, %v), want (0, nil)", len(got), err)
 	}
-	// Said once, for the whole store, however many reads it answers.
-	if n := strings.Count(readNotices.String(), "does not point at"); n != 1 {
-		t.Fatalf("the read-time notice printed %d times across the adoption gate and a Ready, want exactly 1:\n%s", n, readNotices.String())
+	// Nothing was re-pointed, so the read-time notice has nothing to say.
+	if readNotices.Len() != 0 {
+		t.Fatalf("a preserved embedded contract produced a read-time notice:\n%s", readNotices.String())
 	}
 }
 
@@ -432,7 +435,7 @@ func TestAdoptingAFreshlyInitializedWorkspaceStillReads(t *testing.T) {
 // The fixture carries no [storage] section and no relocated coordination class.
 // Everything about the defect — the metadata rewrite, the re-pointed workspace,
 // the `[]` with exit 0 — happens on a city with exactly one store, and the
-// announcement fires there.
+// preservation lands there too: one store, mode kept, silence kept.
 func TestTheStorageModeAnnouncementIsNotSplitStoreSpecific(t *testing.T) {
 	scope := embeddedScopeWithBeads(t, "hq")
 	if _, present := beads.BeadDatabaseDirForDoltMode(scope, "server", "hq"); present {
@@ -443,29 +446,29 @@ func TestTheStorageModeAnnouncementIsNotSplitStoreSpecific(t *testing.T) {
 	if err := ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, scope, "hq"); err != nil {
 		t.Fatalf("ensureCanonicalScopeMetadataForInit: %v", err)
 	}
-	if notices.Len() == 0 {
-		t.Fatal("the rewrite was silent on a single-store city")
+	if mode := readScopeDoltMode(t, scope); mode != "embedded" {
+		t.Fatalf("dolt_mode = %q on a single-store city, want the embedded contract preserved", mode)
 	}
-	left, present := beads.BeadDatabaseDirForDoltMode(scope, "embedded", "hq")
-	if !present {
-		t.Fatal("the embedded database gc stopped reading is no longer resolvable")
+	if notices.Len() != 0 {
+		t.Fatalf("preservation announced a change on a single-store city: %q", notices.String())
 	}
-	if !strings.Contains(notices.String(), left) {
-		t.Errorf("the announcement does not name %q; notices=%q", left, notices.String())
+	if _, present := beads.BeadDatabaseDirForDoltMode(scope, "embedded", "hq"); !present {
+		t.Fatal("the embedded database the scope still reads is no longer resolvable")
 	}
 }
 
 // TestTheThreeMessagesAboutOneUnreadDatabaseAgree is the reconciliation pin for
-// ga-clsfl's fourth acceptance criterion.
+// ga-clsfl's fourth acceptance criterion, scoped to the adoption flip — the one
+// rewrite that still produces an unread database.
 //
 // Three things now talk about the same two directories, at three different
-// moments: the announcement when gc flips the mode, `gc doctor`'s
-// bd-split-store check when an operator goes looking, and the read-time notice
-// when an empty answer is actually paid for. They were written months apart and
-// nothing but this test stops them drifting into three different stories about
-// one scope — which is the failure mode that produced the bug: `gc doctor`
-// telling an operator to "keep both directories until reconciled" while a guard
-// turned that exact state into a hard error.
+// moments: the announcement when gc adopts a legacy scope onto the managed
+// server, `gc doctor`'s bd-split-store check when an operator goes looking, and
+// the read-time notice when an empty answer is actually paid for. They were
+// written months apart and nothing but this test stops them drifting into three
+// different stories about one scope — which is the failure mode that produced
+// the bug: `gc doctor` telling an operator to "keep both directories until
+// reconciled" while a guard turned that exact state into a hard error.
 //
 // So all three run against ONE scope here, and the claims that have to line up
 // are asserted across them: the same remediation clause, the same directory,
@@ -473,7 +476,7 @@ func TestTheStorageModeAnnouncementIsNotSplitStoreSpecific(t *testing.T) {
 // naming the override the notice tells the operator to set — because doctor's
 // advice is what parks them in the shape the notice describes.
 func TestTheThreeMessagesAboutOneUnreadDatabaseAgree(t *testing.T) {
-	scope := embeddedScopeWithBeads(t, "jc")
+	scope := legacyAdoptionScopeFixture(t, "jc")
 	announcement := captureStorageModeChanges(t)
 	if err := ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, scope, "jc"); err != nil {
 		t.Fatalf("ensureCanonicalScopeMetadataForInit: %v", err)

@@ -141,6 +141,11 @@ func rigSharesResolvedDoltServer(rig resolverRig, opts cleanupOptions) bool {
 		target, err := contract.ResolveDoltConnectionTarget(opts.FS, opts.CityPath, rig.Path)
 		switch {
 		case err == nil:
+			if target.Embedded {
+				// An embedded-contract rig owns its bead database under its
+				// own .beads directory; it cannot share the cleanup server.
+				return false
+			}
 			port, perr := strconv.Atoi(strings.TrimSpace(target.Port))
 			return perr == nil && port == opts.PortResolution.Port
 		case !contract.IsManagedRuntimeUnavailable(err):
