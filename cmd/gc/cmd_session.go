@@ -1714,11 +1714,21 @@ func writeSessionMutationError(stdout, stderr io.Writer, command string, asJSON 
 	return 1
 }
 
+// resolveSessionIDForMutation resolves the mutation target. Under --if-state
+// the resolution must be strictly read-only (allowClosed so a terminal target
+// still resolves and the fence can report state-gone; readOnly so no
+// resolution door persists an empty-type repair before the fence is acquired)
+// — zero-mutation-on-mismatch would otherwise be violated by the configured
+// named-session lookup and the qualified-alias scan, both of which heal the
+// bead type on ordinary paths.
 func resolveSessionIDForMutation(cityPath string, cfg *config.City, store beads.Store, identifier string, expected session.State) (string, error) {
 	if expected == "" {
 		return resolveSessionIDWithConfig(cityPath, cfg, store, identifier)
 	}
-	id, err := resolveSessionIDAllowClosedWithConfig(cityPath, cfg, store, identifier)
+	id, err := resolveSessionIDWithOptions(cityPath, cfg, store, identifier, namedSessionResolveOptions{
+		allowClosed: true,
+		readOnly:    true,
+	})
 	if err == nil {
 		return id, nil
 	}

@@ -402,3 +402,121 @@ func TestValidateSessionIfStateFlagPassesWhenFlagAbsent(t *testing.T) {
 		t.Fatalf("stderr = %q, want no usage error for absent flag", stderr.String())
 	}
 }
+
+// seedUntypedFencedSession creates a session bead whose type is empty (the
+// crash/migration-damaged shape that read paths treat as repairable) in a
+// file-backed city, ready for a fenced mutation attempt.
+func seedUntypedFencedSession(t *testing.T, cityToml string, metadata map[string]string) (string, beads.Store, beads.Bead) {
+	t.Helper()
+	cityDir := t.TempDir()
+	writePhase0InterfaceCity(t, cityDir, cityToml)
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_DIR", t.TempDir())
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_SESSION", "fake")
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	seed := map[string]string{"template": "worker", "state": "active"}
+	for k, v := range metadata {
+		seed[k] = v
+	}
+	b, err := store.Create(beads.Bead{
+		Title:    "untyped fenced worker",
+		Labels:   []string{session.LabelSession},
+		Metadata: seed,
+	})
+	if err != nil {
+		t.Fatalf("Create(untyped session): %v", err)
+	}
+	// FileStore.Create inherits MemStore's empty-Type default to "task". Rewrite
+	// it to empty after creation to model the damaged shape the read path
+	// recognizes as repairable.
+	emptyType := ""
+	if err := store.Update(b.ID, beads.UpdateOpts{Type: &emptyType}); err != nil {
+		t.Fatalf("clear type on untyped session: %v", err)
+	}
+	return cityDir, store, b
+}
+
+func assertFencedMismatchLeftBeadUntyped(t *testing.T, cityDir string, b beads.Bead, stdout, stderr *bytes.Buffer, code int) {
+	t.Helper()
+	if code == 0 {
+		t.Fatalf("fenced mismatch exit = 0; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "state-mismatch:") {
+		t.Fatalf("stderr = %q, want machine-readable state-mismatch", stderr.String())
+	}
+	reopened, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("reopen city store: %v", err)
+	}
+	got, err := reopened.Get(b.ID)
+	if err != nil {
+		t.Fatalf("Get(untyped session): %v", err)
+	}
+	if got.Type != "" {
+		t.Fatalf("type mutated before state fence: got %q, want empty", got.Type)
+	}
+	if got.Metadata["state"] != "active" {
+		t.Fatalf("state mutated on mismatch: %q", got.Metadata["state"])
+	}
+	if got.Status == "closed" {
+		t.Fatal("bead closed on fenced mismatch")
+	}
+}
+
+// TestReviewFencedQualifiedAliasMismatchDoesNotRepairType pins the read-only
+// contract of the qualified-alias resolution door: resolving a bare identifier
+// against a qualified alias must not persist the empty-type repair before the
+// --if-state fence is acquired, so a mismatch refuses with the bead still
+// byte-untyped.
+func TestReviewFencedQualifiedAliasMismatchDoesNotRepairType(t *testing.T) {
+	cityDir, _, sessionBead := seedUntypedFencedSession(t, `[workspace]
+name = "test-city"
+
+[beads]
+provider = "file"
+
+[[agent]]
+name = "worker"
+start_command = "true"
+max_active_sessions = 1
+`, map[string]string{
+		"session_name": "fenced-qualified",
+		"alias":        "test-city/worker",
+	})
+	var stdout, stderr bytes.Buffer
+	code := cmdSessionCloseWithOptions([]string{"worker"}, &stdout, &stderr, sessionMutationOptions{IfState: "creating"})
+	assertFencedMismatchLeftBeadUntyped(t, cityDir, sessionBead, &stdout, &stderr, code)
+}
+
+// TestReviewFencedConfiguredNameMismatchDoesNotRepairType pins the read-only
+// contract of the configured named-session resolution door: the canonical
+// lookup for a configured name must not persist the empty-type repair before
+// the --if-state fence is acquired.
+func TestReviewFencedConfiguredNameMismatchDoesNotRepairType(t *testing.T) {
+	cityDir, _, sessionBead := seedUntypedFencedSession(t, `[workspace]
+name = "test-city"
+
+[beads]
+provider = "file"
+
+[[agent]]
+name = "worker"
+start_command = "true"
+max_active_sessions = 1
+
+[[named_session]]
+template = "worker"
+mode = "on_demand"
+`, map[string]string{
+		"session_name":              "fenced-configured",
+		"configured_named_session":  "true",
+		"configured_named_identity": "worker",
+	})
+	var stdout, stderr bytes.Buffer
+	code := cmdSessionCloseWithOptions([]string{"worker"}, &stdout, &stderr, sessionMutationOptions{IfState: "creating"})
+	assertFencedMismatchLeftBeadUntyped(t, cityDir, sessionBead, &stdout, &stderr, code)
+}

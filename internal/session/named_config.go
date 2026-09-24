@@ -343,7 +343,7 @@ type ConfiguredNamedSessionLookup struct {
 // FindCanonicalConfiguredNamedSessionBead finds the live bead that owns a
 // configured named session using exact metadata-filtered store queries.
 func FindCanonicalConfiguredNamedSessionBead(store beads.Store, spec NamedSessionSpec) (beads.Bead, bool, error) {
-	lookup, err := lookupConfiguredNamedSession(store, spec, false)
+	lookup, err := lookupConfiguredNamedSession(store, spec, false, true)
 	if err != nil {
 		return beads.Bead{}, false, err
 	}
@@ -356,10 +356,20 @@ func FindCanonicalConfiguredNamedSessionBead(store beads.Store, spec NamedSessio
 // uniqueness and claim serialization remain the authority under concurrent
 // bead mutation.
 func LookupConfiguredNamedSession(store beads.Store, spec NamedSessionSpec) (ConfiguredNamedSessionLookup, error) {
-	return lookupConfiguredNamedSession(store, spec, true)
+	return lookupConfiguredNamedSession(store, spec, true, true)
 }
 
-func lookupConfiguredNamedSession(store beads.Store, spec NamedSessionSpec, includeConflict bool) (ConfiguredNamedSessionLookup, error) {
+// LookupConfiguredNamedSessionReadOnly is the zero-mutation variant of
+// LookupConfiguredNamedSession for fenced resolution: a repairable empty bead
+// type is normalized in memory only (normalizeEmptyType), so a caller that
+// later refuses the operation — e.g. an --if-state fence mismatch — leaves the
+// bead byte-identical. Persisting the repair stays with the explicitly
+// mutating paths (RepairEmptyType's contract in resolve.go).
+func LookupConfiguredNamedSessionReadOnly(store beads.Store, spec NamedSessionSpec) (ConfiguredNamedSessionLookup, error) {
+	return lookupConfiguredNamedSession(store, spec, true, false)
+}
+
+func lookupConfiguredNamedSession(store beads.Store, spec NamedSessionSpec, includeConflict, persistTypeRepair bool) (ConfiguredNamedSessionLookup, error) {
 	if store == nil {
 		return ConfiguredNamedSessionLookup{}, nil
 	}
@@ -375,7 +385,7 @@ func lookupConfiguredNamedSession(store beads.Store, spec NamedSessionSpec, incl
 	var aliasMatches []beads.Bead
 
 	if spec.Identity != "" {
-		matches, err := listConfiguredNamedSessionBeadsByMetadata(store, NamedSessionIdentityMetadata, spec.Identity)
+		matches, err := listConfiguredNamedSessionBeadsByMetadata(store, NamedSessionIdentityMetadata, spec.Identity, persistTypeRepair)
 		if err != nil {
 			return ConfiguredNamedSessionLookup{}, fmt.Errorf("listing canonical named session candidates: %w", err)
 		}
@@ -386,7 +396,7 @@ func lookupConfiguredNamedSession(store beads.Store, spec NamedSessionSpec, incl
 	}
 
 	if spec.SessionName != "" {
-		matches, err := listConfiguredNamedSessionBeadsByMetadata(store, "session_name", spec.SessionName)
+		matches, err := listConfiguredNamedSessionBeadsByMetadata(store, "session_name", spec.SessionName, persistTypeRepair)
 		if err != nil {
 			return ConfiguredNamedSessionLookup{}, fmt.Errorf("listing canonical named session candidates by session_name: %w", err)
 		}
@@ -398,7 +408,7 @@ func lookupConfiguredNamedSession(store beads.Store, spec NamedSessionSpec, incl
 	}
 
 	if spec.Identity != "" && spec.Identity != spec.SessionName {
-		matches, err := listConfiguredNamedSessionBeadsByMetadata(store, "session_name", spec.Identity)
+		matches, err := listConfiguredNamedSessionBeadsByMetadata(store, "session_name", spec.Identity, persistTypeRepair)
 		if err != nil {
 			return ConfiguredNamedSessionLookup{}, fmt.Errorf("listing canonical named session candidates by bare identity: %w", err)
 		}
@@ -409,7 +419,7 @@ func lookupConfiguredNamedSession(store beads.Store, spec NamedSessionSpec, incl
 	}
 
 	if spec.Identity != "" {
-		matches, err := listConfiguredNamedSessionBeadsByMetadata(store, "alias", spec.Identity)
+		matches, err := listConfiguredNamedSessionBeadsByMetadata(store, "alias", spec.Identity, persistTypeRepair)
 		if err != nil {
 			return ConfiguredNamedSessionLookup{}, fmt.Errorf("listing alias-matching named session candidates: %w", err)
 		}
@@ -432,7 +442,12 @@ func lookupConfiguredNamedSession(store beads.Store, spec NamedSessionSpec, incl
 	return ConfiguredNamedSessionLookup{}, nil
 }
 
-func listConfiguredNamedSessionBeadsByMetadata(store beads.Store, key, value string) ([]beads.Bead, error) {
+// listConfiguredNamedSessionBeadsByMetadata lists session beads matching an
+// exact metadata filter. persistTypeRepair selects between the durable
+// empty-type heal (RepairEmptyType — for explicitly mutating callers) and the
+// in-memory normalizeEmptyType used by read-only resolution, per RepairEmptyType's
+// contract in resolve.go.
+func listConfiguredNamedSessionBeadsByMetadata(store beads.Store, key, value string, persistTypeRepair bool) ([]beads.Bead, error) {
 	key = strings.TrimSpace(key)
 	value = strings.TrimSpace(value)
 	if key == "" || value == "" {
@@ -449,7 +464,11 @@ func listConfiguredNamedSessionBeadsByMetadata(store beads.Store, key, value str
 		if !IsSessionBeadOrRepairable(b) {
 			continue
 		}
-		RepairEmptyType(store, &b)
+		if persistTypeRepair {
+			RepairEmptyType(store, &b)
+		} else {
+			normalizeEmptyType(&b)
+		}
 		out = append(out, b)
 	}
 	return out, nil

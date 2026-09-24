@@ -24,10 +24,17 @@ func resolveSessionIDAllowClosed(store beads.Store, identifier string) (string, 
 	return session.ResolveSessionIDAllowClosed(store, identifier)
 }
 
+// namedSessionResolveOptions selects the resolution doors. readOnly keeps
+// every door strictly read-only: repairable empty session types are normalized
+// in memory and never persisted, so a caller that refuses after resolution
+// (e.g. an --if-state fence mismatch) performs zero durable mutation.
+// readOnly must not be combined with materialize (materialize reopens a
+// closed bead, a mutation by definition).
 type namedSessionResolveOptions struct {
 	allowClosed         bool
 	materialize         bool
 	materializeMetadata map[string]string
+	readOnly            bool
 }
 
 const templateTargetPrefix = "template:"
@@ -57,7 +64,12 @@ func resolveConfiguredNamedSessionID(
 	if !ok {
 		return "", false, fmt.Errorf("%w: %q", session.ErrSessionNotFound, identifier)
 	}
-	lookup, err := session.LookupConfiguredNamedSession(store, spec)
+	var lookup session.ConfiguredNamedSessionLookup
+	if opts.readOnly {
+		lookup, err = session.LookupConfiguredNamedSessionReadOnly(store, spec)
+	} else {
+		lookup, err = session.LookupConfiguredNamedSession(store, spec)
+	}
 	if err != nil {
 		return "", true, fmt.Errorf("looking up configured named session: %w", err)
 	}
@@ -157,7 +169,7 @@ func resolveSessionIDWithOptions(
 	} else if !errors.Is(err, session.ErrSessionNotFound) {
 		return "", err
 	}
-	if id, err := resolveOpenQualifiedAliasBasename(store, identifier); err == nil {
+	if id, err := resolveOpenQualifiedAliasBasename(store, identifier, !opts.readOnly); err == nil {
 		return id, nil
 	} else if !errors.Is(err, session.ErrSessionNotFound) {
 		return "", err
@@ -180,7 +192,12 @@ func resolveSessionIDWithOptions(
 	return "", fmt.Errorf("%w: %q", session.ErrSessionNotFound, identifier)
 }
 
-func resolveOpenQualifiedAliasBasename(store beads.Store, identifier string) (string, error) {
+// resolveOpenQualifiedAliasBasename resolves a bare identifier against the
+// basename of live qualified aliases. persistTypeRepair controls the durable
+// empty-type heal; read-only resolution (persistTypeRepair=false) skips it —
+// the fence that authorized the read-only resolve performs its own repair
+// inside the mutation boundary when the operation actually proceeds.
+func resolveOpenQualifiedAliasBasename(store beads.Store, identifier string, persistTypeRepair bool) (string, error) {
 	identifier = strings.TrimSpace(identifier)
 	if store == nil || identifier == "" || strings.Contains(identifier, "/") {
 		return "", fmt.Errorf("%w: %q", session.ErrSessionNotFound, identifier)
@@ -197,7 +214,7 @@ func resolveOpenQualifiedAliasBasename(store beads.Store, identifier string) (st
 		if info.Closed {
 			continue
 		}
-		if info.Type == "" {
+		if info.Type == "" && persistTypeRepair {
 			sessFront.RepairTypeBestEffort(info.ID)
 		}
 		alias := strings.TrimSpace(info.Alias)
