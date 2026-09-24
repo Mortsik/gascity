@@ -1677,10 +1677,27 @@ func buildResumeCommand(cityPath string, cfg *config.City, info session.Info, se
 type sessionMutationOptions struct {
 	JSON    bool
 	IfState string
+
+	// SuspendDeps injects the managed-reconciler discovery and controller-poke
+	// seams for tests of the managed suspend path. nil uses the production
+	// implementations; close ignores it (close has no managed path).
+	SuspendDeps *sessionSuspendDeps
 }
 
 func (o sessionMutationOptions) expectedState() session.State {
 	return session.State(strings.TrimSpace(o.IfState))
+}
+
+// validateSessionIfStateFlag rejects an explicitly passed but empty --if-state
+// as a usage error. The empty string is this file's "flag absent" marker, so
+// accepting `--if-state ""` would silently run the unfenced legacy path under
+// the user's explicit fence request.
+func validateSessionIfStateFlag(cmd *cobra.Command, stderr io.Writer, ifState string) error {
+	if cmd.Flags().Changed("if-state") && strings.TrimSpace(ifState) == "" {
+		printCommandUsageError(stderr, cmd, fmt.Errorf("--if-state must not be empty"))
+		return errExit
+	}
+	return nil
 }
 
 func writeSessionMutationError(stdout, stderr io.Writer, command string, asJSON bool, err error) int {
@@ -1723,7 +1740,10 @@ The session bead persists and can be resumed later.
 
 Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 		Args: cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateSessionIfStateFlag(cmd, stderr, ifState); err != nil {
+				return err
+			}
 			if cmdSessionSuspendWithOptions(args, stdout, stderr, sessionMutationOptions{JSON: jsonOutput, IfState: ifState}) != 0 {
 				return errExit
 			}
@@ -1745,9 +1765,32 @@ func cmdSessionSuspend(args []string, stdout, stderr io.Writer, jsonOutput ...bo
 	return cmdSessionSuspendWithOptions(args, stdout, stderr, sessionMutationOptions{JSON: sessionJSONRequested(jsonOutput)})
 }
 
+// sessionSuspendDeps injects the managed-reconciler discovery and controller
+// poke seams so tests can exercise the managed suspend path hermetically, the
+// same way doSessionWake's deps do. Production leaves
+// sessionMutationOptions.SuspendDeps nil and gets the real implementations.
+type sessionSuspendDeps struct {
+	cityUsesManagedReconciler func(cityPath string) bool
+	pokeController            func(cityPath string) error
+}
+
+// sessionSuspendProductionDeps wires the real controller discovery and poke
+// implementations used by the gc binary.
+func sessionSuspendProductionDeps() sessionSuspendDeps {
+	return sessionSuspendDeps{
+		cityUsesManagedReconciler: cityUsesManagedReconciler,
+		pokeController:            pokeController,
+	}
+}
+
 func cmdSessionSuspendWithOptions(args []string, stdout, stderr io.Writer, opts sessionMutationOptions) int {
 	asJSON := opts.JSON
 	expected := opts.expectedState()
+	deps := opts.SuspendDeps
+	if deps == nil {
+		production := sessionSuspendProductionDeps()
+		deps = &production
+	}
 	store, code := openCityStore(stderr, "gc session suspend")
 	if store == nil {
 		return code
@@ -1770,8 +1813,8 @@ func cmdSessionSuspendWithOptions(args []string, stdout, stderr io.Writer, opts 
 	// Try reconciler-first path: set held_until metadata, poke controller.
 	// Only use this path when the city is managed by a standalone controller
 	// or the machine-wide supervisor — not for unmanaged ad-hoc cities.
-	if cityErr == nil && cityUsesManagedReconciler(cityPath) {
-		if pokeErr := pokeController(cityPath); pokeErr == nil {
+	if cityErr == nil && deps.cityUsesManagedReconciler(cityPath) {
+		if pokeErr := deps.pokeController(cityPath); pokeErr == nil {
 			// Controller is running — metadata-only suspend.
 			// Set held_until far in the future so the reconciler drains/stops the session.
 			heldUntil := time.Now().Add(indefiniteHoldDuration).UTC().Format(time.RFC3339)
@@ -1792,7 +1835,7 @@ func cmdSessionSuspendWithOptions(args []string, stdout, stderr io.Writer, opts 
 				return writeSessionMutationError(stdout, stderr, "gc session suspend", asJSON, mutationErr)
 			}
 			// Poke again to trigger immediate reconciler tick.
-			_ = pokeController(cityPath)
+			_ = deps.pokeController(cityPath)
 			if asJSON {
 				if err := writeSessionActionJSON(stdout, sessionActionResult{
 					Action:    "suspend",
@@ -1873,7 +1916,10 @@ func newSessionCloseCmd(stdout, stderr io.Writer) *cobra.Command {
 
 Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 		Args: cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := validateSessionIfStateFlag(cmd, stderr, ifState); err != nil {
+				return err
+			}
 			if cmdSessionCloseWithOptions(args, stdout, stderr, sessionMutationOptions{JSON: jsonOutput, IfState: ifState}) != 0 {
 				return errExit
 			}

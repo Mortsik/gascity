@@ -5927,3 +5927,48 @@ func TestCloseDetailedIfStateGoneRefuses(t *testing.T) {
 		t.Fatalf("runtime calls on gone fence = %v, want none", sp.SnapshotCalls())
 	}
 }
+
+func TestSuspendIfStateMatchPreservesSuspendBehavior(t *testing.T) {
+	mgr, store, sp, info := newStateFenceFileStoreManager(t)
+
+	if err := mgr.SuspendIfState(info.ID, StateActive); err != nil {
+		t.Fatalf("SuspendIfState(match): %v", err)
+	}
+	if got := sp.CountCalls("Stop", info.SessionName); got != 1 {
+		t.Fatalf("runtime Stop calls = %d, want 1", got)
+	}
+	if sp.IsRunning(info.SessionName) {
+		t.Fatal("runtime still running after matching fenced suspend")
+	}
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got := State(b.Metadata["state"]); got != StateSuspended {
+		t.Fatalf("persisted state = %q, want %q", got, StateSuspended)
+	}
+	if b.Metadata["suspended_at"] == "" {
+		t.Fatal("suspended_at not stamped by fenced suspend")
+	}
+}
+
+func TestSuspendIfStateGoneRefuses(t *testing.T) {
+	store, err := beads.OpenFileStore(fsys.OSFS{}, filepath.Join(t.TempDir(), "beads.json"))
+	if err != nil {
+		t.Fatalf("OpenFileStore: %v", err)
+	}
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	err = mgr.SuspendIfState("gc-missing", StateActive)
+	var fenceErr *StateFenceError
+	if !errors.As(err, &fenceErr) {
+		t.Fatalf("SuspendIfState error = %v, want *StateFenceError", err)
+	}
+	if fenceErr.Code != StateFenceGone {
+		t.Fatalf("SuspendIfState code = %q, want %q", fenceErr.Code, StateFenceGone)
+	}
+	if len(sp.SnapshotCalls()) != 0 {
+		t.Fatalf("runtime calls on gone fence = %v, want none", sp.SnapshotCalls())
+	}
+}
