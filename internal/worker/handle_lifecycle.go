@@ -126,6 +126,20 @@ func (h *SessionHandle) Stop(ctx context.Context) (err error) {
 	return err
 }
 
+// StopIfState suspends the worker only while its persisted session state still
+// matches expected. A fence refusal performs no runtime or bead mutation.
+func (h *SessionHandle) StopIfState(ctx context.Context, expected sessionpkg.State) (err error) {
+	event := h.beginOperationEvent(ctx, workerOperationStop)
+	defer func() { event.finish(err) }()
+
+	id := h.currentSessionID()
+	if id == "" {
+		return &sessionpkg.StateFenceError{Code: sessionpkg.StateFenceGone, Expected: expected}
+	}
+	err = h.manager.SuspendIfState(id, expected)
+	return err
+}
+
 // Kill terminates the live runtime without mutating the persisted lifecycle.
 func (h *SessionHandle) Kill(ctx context.Context) (err error) {
 	event := h.beginOperationEvent(ctx, workerOperationKill)
@@ -155,6 +169,20 @@ func (h *SessionHandle) CloseDetailed(ctx context.Context) (result sessionpkg.Cl
 		return result, nil
 	}
 	result, err = h.manager.CloseDetailed(id)
+	return result, err
+}
+
+// CloseDetailedIfState closes the worker only while its persisted session state
+// still matches expected. A fence refusal performs no runtime or bead mutation.
+func (h *SessionHandle) CloseDetailedIfState(ctx context.Context, expected sessionpkg.State) (result sessionpkg.CloseResult, err error) {
+	event := h.beginOperationEvent(ctx, workerOperationClose)
+	defer func() { event.finish(err) }()
+
+	id := h.currentSessionID()
+	if id == "" {
+		return result, &sessionpkg.StateFenceError{Code: sessionpkg.StateFenceGone, Expected: expected}
+	}
+	result, err = h.manager.CloseDetailedIfState(id, expected)
 	return result, err
 }
 

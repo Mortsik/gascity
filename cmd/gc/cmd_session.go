@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -1673,9 +1674,47 @@ func buildResumeCommand(cityPath string, cfg *config.City, info session.Info, se
 	return cmd, runtime.Config{WorkDir: info.WorkDir}
 }
 
+type sessionMutationOptions struct {
+	JSON    bool
+	IfState string
+}
+
+func (o sessionMutationOptions) expectedState() session.State {
+	return session.State(strings.TrimSpace(o.IfState))
+}
+
+func writeSessionMutationError(stdout, stderr io.Writer, command string, asJSON bool, err error) int {
+	var fenceErr *session.StateFenceError
+	if errors.As(err, &fenceErr) {
+		message := fmt.Sprintf("%s: %v", command, fenceErr)
+		if asJSON {
+			return writeJSONError(stdout, stderr, string(fenceErr.Code), message, 1)
+		}
+		fmt.Fprintf(stderr, "%s\n", message) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	fmt.Fprintf(stderr, "%s: %v\n", command, err) //nolint:errcheck // best-effort stderr
+	return 1
+}
+
+func resolveSessionIDForMutation(cityPath string, cfg *config.City, store beads.Store, identifier string, expected session.State) (string, error) {
+	if expected == "" {
+		return resolveSessionIDWithConfig(cityPath, cfg, store, identifier)
+	}
+	id, err := resolveSessionIDAllowClosedWithConfig(cityPath, cfg, store, identifier)
+	if err == nil {
+		return id, nil
+	}
+	if errors.Is(err, session.ErrSessionNotFound) {
+		return "", &session.StateFenceError{Code: session.StateFenceGone, ID: identifier, Expected: expected}
+	}
+	return "", err
+}
+
 // newSessionSuspendCmd creates the "gc session suspend <id-or-alias>" command.
 func newSessionSuspendCmd(stdout, stderr io.Writer) *cobra.Command {
 	var jsonOutput bool
+	var ifState string
 	cmd := &cobra.Command{
 		Use:   "suspend <session-id-or-alias>",
 		Short: "Suspend a session (save state, free resources)",
@@ -1685,7 +1724,7 @@ The session bead persists and can be resumed later.
 Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			if cmdSessionSuspend(args, stdout, stderr, jsonOutput) != 0 {
+			if cmdSessionSuspendWithOptions(args, stdout, stderr, sessionMutationOptions{JSON: jsonOutput, IfState: ifState}) != 0 {
 				return errExit
 			}
 			return nil
@@ -1693,6 +1732,7 @@ Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 		ValidArgsFunction: completeSessionIDs,
 	}
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "emit JSONL")
+	cmd.Flags().StringVar(&ifState, "if-state", "", "suspend only if the session is still in this state")
 	return cmd
 }
 
@@ -1702,7 +1742,12 @@ Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 // controller. The reconciler handles the actual process stop. Falls back
 // to direct suspend via the session manager if the controller isn't running.
 func cmdSessionSuspend(args []string, stdout, stderr io.Writer, jsonOutput ...bool) int {
-	asJSON := sessionJSONRequested(jsonOutput)
+	return cmdSessionSuspendWithOptions(args, stdout, stderr, sessionMutationOptions{JSON: sessionJSONRequested(jsonOutput)})
+}
+
+func cmdSessionSuspendWithOptions(args []string, stdout, stderr io.Writer, opts sessionMutationOptions) int {
+	asJSON := opts.JSON
+	expected := opts.expectedState()
 	store, code := openCityStore(stderr, "gc session suspend")
 	if store == nil {
 		return code
@@ -1711,16 +1756,15 @@ func cmdSessionSuspend(args []string, stdout, stderr io.Writer, jsonOutput ...bo
 	cityPath, cityErr := resolveCity()
 	var cfg *config.City
 	if cityErr == nil {
-		cfg, _ = loadCityConfig(cityPath, configWarnWriter(sessionJSONRequested(jsonOutput), stderr))
+		cfg, _ = loadCityConfig(cityPath, configWarnWriter(asJSON, stderr))
 	}
 	// Every store consumer here is session-class (session-ID resolution, held_until
 	// suspend patch, session worker handle), so route the whole flow through the
 	// session coordination-class store for relocation-safety.
 	sessStore := cliSessionStore(store, cfg, cityPath)
-	sessionID, err := resolveSessionIDWithConfig(cityPath, cfg, sessStore, args[0])
+	sessionID, err := resolveSessionIDForMutation(cityPath, cfg, sessStore, args[0], expected)
 	if err != nil {
-		fmt.Fprintf(stderr, "gc session suspend: %v\n", err) //nolint:errcheck // best-effort stderr
-		return 1
+		return writeSessionMutationError(stdout, stderr, "gc session suspend", asJSON, err)
 	}
 
 	// Try reconciler-first path: set held_until metadata, poke controller.
@@ -1731,13 +1775,21 @@ func cmdSessionSuspend(args []string, stdout, stderr io.Writer, jsonOutput ...bo
 			// Controller is running — metadata-only suspend.
 			// Set held_until far in the future so the reconciler drains/stops the session.
 			heldUntil := time.Now().Add(indefiniteHoldDuration).UTC().Format(time.RFC3339)
-			if err := sessionFrontDoor(sessStore).ApplyPatch(sessionID, map[string]string{
-				"held_until":   heldUntil,
-				"sleep_intent": "user-hold",
-				"state":        "suspended",
-			}); err != nil {
-				fmt.Fprintf(stderr, "gc session suspend: %v\n", err) //nolint:errcheck // best-effort stderr
-				return 1
+			applySuspendPatch := func(target beads.Store) error {
+				return sessionFrontDoor(target).ApplyPatch(sessionID, map[string]string{
+					"held_until":   heldUntil,
+					"sleep_intent": "user-hold",
+					"state":        "suspended",
+				})
+			}
+			var mutationErr error
+			if expected != "" {
+				mutationErr = session.WithExpectedStateMutation(sessStore, sessionID, expected, applySuspendPatch)
+			} else {
+				mutationErr = applySuspendPatch(sessStore)
+			}
+			if mutationErr != nil {
+				return writeSessionMutationError(stdout, stderr, "gc session suspend", asJSON, mutationErr)
 			}
 			// Poke again to trigger immediate reconciler tick.
 			_ = pokeController(cityPath)
@@ -1764,13 +1816,32 @@ func cmdSessionSuspend(args []string, stdout, stderr io.Writer, jsonOutput ...bo
 		fmt.Fprintf(stderr, "gc session suspend: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	handle, err := workerHandleForSessionWithConfig(cityPath, sessStore, sp, cfg, sessionID)
+	var handle worker.Handle
+	if expected != "" {
+		// The fenced path must not use SessionByID: that legacy constructor may
+		// persist an empty-type repair before the state fence is acquired. Build
+		// from the already-resolved record instead, which normalizes only its
+		// in-memory projection and leaves all durable mutation to StopIfState.
+		handle, err = workerHandleForSessionTargetWithConfig(cityPath, sessStore, sp, cfg, sessionID)
+	} else {
+		handle, err = workerHandleForSessionWithConfig(cityPath, sessStore, sp, cfg, sessionID)
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session suspend: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 
-	if err := handle.Stop(context.Background()); err != nil {
+	if expected != "" {
+		conditional, ok := handle.(worker.ConditionalLifecycleHandle)
+		if !ok {
+			return writeSessionMutationError(stdout, stderr, "gc session suspend", asJSON, &session.StateFenceError{
+				Code: session.StateFenceUnsupported, ID: sessionID, Expected: expected,
+			})
+		}
+		if err := conditional.StopIfState(context.Background(), expected); err != nil {
+			return writeSessionMutationError(stdout, stderr, "gc session suspend", asJSON, err)
+		}
+	} else if err := handle.Stop(context.Background()); err != nil {
 		fmt.Fprintf(stderr, "gc session suspend: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -1794,6 +1865,7 @@ func cmdSessionSuspend(args []string, stdout, stderr io.Writer, jsonOutput ...bo
 // newSessionCloseCmd creates the "gc session close <id-or-alias>" command.
 func newSessionCloseCmd(stdout, stderr io.Writer) *cobra.Command {
 	var jsonOutput bool
+	var ifState string
 	cmd := &cobra.Command{
 		Use:   "close <session-id-or-alias>",
 		Short: "Close a session permanently",
@@ -1802,7 +1874,7 @@ func newSessionCloseCmd(stdout, stderr io.Writer) *cobra.Command {
 Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			if cmdSessionClose(args, stdout, stderr, jsonOutput) != 0 {
+			if cmdSessionCloseWithOptions(args, stdout, stderr, sessionMutationOptions{JSON: jsonOutput, IfState: ifState}) != 0 {
 				return errExit
 			}
 			return nil
@@ -1810,12 +1882,18 @@ Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 		ValidArgsFunction: completeSessionIDs,
 	}
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "emit JSONL")
+	cmd.Flags().StringVar(&ifState, "if-state", "", "close only if the session is still in this state")
 	return cmd
 }
 
 // cmdSessionClose is the CLI entry point for "gc session close".
 func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool) int {
-	asJSON := sessionJSONRequested(jsonOutput)
+	return cmdSessionCloseWithOptions(args, stdout, stderr, sessionMutationOptions{JSON: sessionJSONRequested(jsonOutput)})
+}
+
+func cmdSessionCloseWithOptions(args []string, stdout, stderr io.Writer, opts sessionMutationOptions) int {
+	asJSON := opts.JSON
+	expected := opts.expectedState()
 	store, code := openCityStore(stderr, "gc session close")
 	if store == nil {
 		return code
@@ -1824,7 +1902,7 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 	cityPath, cityErr := resolveCity()
 	var cfg *config.City
 	if cityErr == nil {
-		cfg, _ = loadCityConfig(cityPath, configWarnWriter(sessionJSONRequested(jsonOutput), stderr))
+		cfg, _ = loadCityConfig(cityPath, configWarnWriter(asJSON, stderr))
 	}
 	// SURGICAL route: the session-class consumers (session-ID resolution, session
 	// worker handle, session bead read) go through the session coordination-class
@@ -1832,10 +1910,9 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 	// (unclaimWorkAssignedToRetiredSessionBead) is WORK-class and stays on the
 	// generic store.
 	sessStore := cliSessionStore(store, cfg, cityPath)
-	sessionID, err := resolveSessionIDWithConfig(cityPath, cfg, sessStore, args[0])
+	sessionID, err := resolveSessionIDForMutation(cityPath, cfg, sessStore, args[0], expected)
 	if err != nil {
-		fmt.Fprintf(stderr, "gc session close: %v\n", err) //nolint:errcheck // best-effort stderr
-		return 1
+		return writeSessionMutationError(stdout, stderr, "gc session close", asJSON, err)
 	}
 
 	sp, err := newSessionProvider()
@@ -1843,7 +1920,15 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 		fmt.Fprintf(stderr, "gc session close: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	handle, err := workerHandleForSessionWithConfig(cityPath, sessStore, sp, cfg, sessionID)
+	var handle worker.Handle
+	if expected != "" {
+		// See the suspend path above: SessionByID can heal an empty session type
+		// before the conditional mutation runs. The exact-target constructor uses
+		// the read-only record projection, preserving mismatch = zero mutation.
+		handle, err = workerHandleForSessionTargetWithConfig(cityPath, sessStore, sp, cfg, sessionID)
+	} else {
+		handle, err = workerHandleForSessionWithConfig(cityPath, sessStore, sp, cfg, sessionID)
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session close: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -1857,10 +1942,20 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 		closedSessionBead = beads.Bead{ID: sessionID}
 	}
 
-	closeResult, err := handle.CloseDetailed(context.Background())
+	var closeResult session.CloseResult
+	if expected != "" {
+		conditional, ok := handle.(worker.ConditionalLifecycleHandle)
+		if !ok {
+			return writeSessionMutationError(stdout, stderr, "gc session close", asJSON, &session.StateFenceError{
+				Code: session.StateFenceUnsupported, ID: sessionID, Expected: expected,
+			})
+		}
+		closeResult, err = conditional.CloseDetailedIfState(context.Background(), expected)
+	} else {
+		closeResult, err = handle.CloseDetailed(context.Background())
+	}
 	if err != nil {
-		fmt.Fprintf(stderr, "gc session close: %v\n", err) //nolint:errcheck // best-effort stderr
-		return 1
+		return writeSessionMutationError(stdout, stderr, "gc session close", asJSON, err)
 	}
 	if cityErr == nil {
 		if err := withdrawQueuedWaitNudges(cityPath, closeResult.WaitNudgeIDs); err != nil {

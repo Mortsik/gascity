@@ -14,6 +14,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionauto "github.com/gastownhall/gascity/internal/runtime/auto"
 	"github.com/gastownhall/gascity/internal/sessionlog"
@@ -5690,5 +5691,239 @@ func TestTranscriptPathZCodeResolvesEachSeatByBeadID(t *testing.T) {
 		if got != want {
 			t.Fatalf("TranscriptPath(%s) = %q, want %q", infos[i].ID, got, want)
 		}
+	}
+}
+
+func newStateFenceFileStoreManager(t *testing.T) (*Manager, *beads.FileStore, *runtime.Fake, Info) {
+	t.Helper()
+	store, err := beads.OpenFileStore(fsys.OSFS{}, filepath.Join(t.TempDir(), "beads.json"))
+	if err != nil {
+		t.Fatalf("OpenFileStore: %v", err)
+	}
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{
+		Template:  "helper",
+		Title:     "fenced",
+		Command:   "claude",
+		WorkDir:   t.TempDir(),
+		Provider:  "claude",
+		Hints:     runtime.Config{},
+		ExtraMeta: map[string]string{"session_origin": "manual"},
+	})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	return mgr, store, sp, info
+}
+
+func TestSuspendIfStateStaleExpectedCannotStopAfterConcurrentWriterAdvances(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "beads.json")
+	owner, err := beads.OpenFileStore(fsys.OSFS{}, path)
+	if err != nil {
+		t.Fatalf("OpenFileStore(owner): %v", err)
+	}
+	other, err := beads.OpenFileStore(fsys.OSFS{}, path)
+	if err != nil {
+		t.Fatalf("OpenFileStore(other): %v", err)
+	}
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(owner, sp)
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{
+		Template: "helper", Title: "raced", Command: "claude", WorkDir: t.TempDir(), Provider: "claude",
+	})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := owner.SetMetadata(info.ID, "state", string(StateDraining)); err != nil {
+		t.Fatalf("seed draining state: %v", err)
+	}
+
+	writer, ok := beads.ExclusiveMutationFor(other)
+	if !ok {
+		t.Fatal("second FileStore does not expose ExclusiveMutationStore")
+	}
+	writerEntered := make(chan struct{})
+	releaseWriter := make(chan struct{})
+	writerDone := make(chan error, 1)
+	go func() {
+		writerDone <- writer.WithExclusiveMutation(func(locked beads.Store) error {
+			if err := locked.SetMetadata(info.ID, "state", string(StateActive)); err != nil {
+				return err
+			}
+			close(writerEntered)
+			<-releaseWriter
+			return nil
+		})
+	}()
+	<-writerEntered
+
+	suspendDone := make(chan error, 1)
+	go func() { suspendDone <- mgr.SuspendIfState(info.ID, StateDraining) }()
+	select {
+	case err := <-suspendDone:
+		t.Fatalf("fenced suspend escaped concurrent writer before its commit: %v", err)
+	case <-time.After(100 * time.Millisecond):
+		// Expected: SuspendIfState waits for the FileStore writer authority.
+	}
+	close(releaseWriter)
+	if err := <-writerDone; err != nil {
+		t.Fatalf("concurrent writer: %v", err)
+	}
+
+	err = <-suspendDone
+	var fenceErr *StateFenceError
+	if !errors.As(err, &fenceErr) || fenceErr.Code != StateFenceMismatch {
+		t.Fatalf("SuspendIfState after writer advanced state = %v, want state-mismatch", err)
+	}
+	if fenceErr.Actual != StateActive || fenceErr.Expected != StateDraining {
+		t.Fatalf("fence = %+v, want actual=%q expected=%q", fenceErr, StateActive, StateDraining)
+	}
+	if got := sp.CountCalls("Stop", info.SessionName); got != 0 {
+		t.Fatalf("runtime Stop calls = %d, want 0 after stale expected state", got)
+	}
+	if !sp.IsRunning(info.SessionName) {
+		t.Fatal("runtime stopped after stale expected state")
+	}
+	got, err := owner.Get(info.ID)
+	if err != nil {
+		t.Fatalf("owner.Get: %v", err)
+	}
+	if state := State(got.Metadata["state"]); state != StateActive {
+		t.Fatalf("persisted state = %q, want writer's %q", state, StateActive)
+	}
+}
+
+func TestSuspendIfStateUnsupportedStoreFailsClosed(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+	info, err := mgr.CreateSession(context.Background(), CreateOptions{
+		Template: "helper", Title: "unsupported", Command: "claude", WorkDir: t.TempDir(), Provider: "claude",
+	})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	err = mgr.SuspendIfState(info.ID, StateActive)
+	var fenceErr *StateFenceError
+	if !errors.As(err, &fenceErr) || fenceErr.Code != StateFenceUnsupported {
+		t.Fatalf("SuspendIfState on unsupported store = %v, want state-fence-unsupported", err)
+	}
+	if got := sp.CountCalls("Stop", info.SessionName); got != 0 {
+		t.Fatalf("runtime Stop calls = %d, want 0 on unsupported fence", got)
+	}
+	if !sp.IsRunning(info.SessionName) {
+		t.Fatal("runtime stopped on unsupported fence")
+	}
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got := State(b.Metadata["state"]); got != StateActive {
+		t.Fatalf("persisted state = %q, want %q", got, StateActive)
+	}
+}
+
+func TestSuspendIfStateMismatchHasZeroMutation(t *testing.T) {
+	mgr, store, sp, info := newStateFenceFileStoreManager(t)
+
+	err := mgr.SuspendIfState(info.ID, StateDraining)
+	var fenceErr *StateFenceError
+	if !errors.As(err, &fenceErr) {
+		t.Fatalf("SuspendIfState error = %v, want *StateFenceError", err)
+	}
+	if fenceErr.Code != StateFenceMismatch {
+		t.Fatalf("SuspendIfState code = %q, want %q", fenceErr.Code, StateFenceMismatch)
+	}
+	if fenceErr.Expected != StateDraining || fenceErr.Actual != StateActive {
+		t.Fatalf("SuspendIfState fence = %+v, want expected=%q actual=%q", fenceErr, StateDraining, StateActive)
+	}
+	if got := sp.CountCalls("Stop", info.SessionName); got != 0 {
+		t.Fatalf("runtime Stop calls = %d, want 0 on state mismatch", got)
+	}
+	if !sp.IsRunning(info.SessionName) {
+		t.Fatal("runtime stopped on state mismatch")
+	}
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got := State(b.Metadata["state"]); got != StateActive {
+		t.Fatalf("persisted state = %q, want %q", got, StateActive)
+	}
+}
+
+func TestCloseDetailedIfStateMismatchHasZeroMutation(t *testing.T) {
+	mgr, store, sp, info := newStateFenceFileStoreManager(t)
+
+	_, err := mgr.CloseDetailedIfState(info.ID, StateCreating)
+	var fenceErr *StateFenceError
+	if !errors.As(err, &fenceErr) {
+		t.Fatalf("CloseDetailedIfState error = %v, want *StateFenceError", err)
+	}
+	if fenceErr.Code != StateFenceMismatch {
+		t.Fatalf("CloseDetailedIfState code = %q, want %q", fenceErr.Code, StateFenceMismatch)
+	}
+	if got := sp.CountCalls("Stop", info.SessionName); got != 0 {
+		t.Fatalf("runtime Stop calls = %d, want 0 on state mismatch", got)
+	}
+	if !sp.IsRunning(info.SessionName) {
+		t.Fatal("runtime stopped on state mismatch")
+	}
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if b.Status == "closed" {
+		t.Fatal("bead closed on state mismatch")
+	}
+	if got := State(b.Metadata["state"]); got != StateActive {
+		t.Fatalf("persisted state = %q, want %q", got, StateActive)
+	}
+}
+
+func TestCloseDetailedIfStateMatchPreservesCloseBehavior(t *testing.T) {
+	mgr, store, sp, info := newStateFenceFileStoreManager(t)
+	if err := store.SetMetadata(info.ID, "state", string(StateCreating)); err != nil {
+		t.Fatalf("SetMetadata(state): %v", err)
+	}
+
+	if _, err := mgr.CloseDetailedIfState(info.ID, StateCreating); err != nil {
+		t.Fatalf("CloseDetailedIfState: %v", err)
+	}
+	if got := sp.CountCalls("Stop", info.SessionName); got != 1 {
+		t.Fatalf("runtime Stop calls = %d, want 1", got)
+	}
+	if sp.IsRunning(info.SessionName) {
+		t.Fatal("runtime still running after matching fenced close")
+	}
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if b.Status != "closed" {
+		t.Fatalf("bead status = %q, want closed", b.Status)
+	}
+}
+
+func TestCloseDetailedIfStateGoneRefuses(t *testing.T) {
+	store, err := beads.OpenFileStore(fsys.OSFS{}, filepath.Join(t.TempDir(), "beads.json"))
+	if err != nil {
+		t.Fatalf("OpenFileStore: %v", err)
+	}
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp)
+
+	_, err = mgr.CloseDetailedIfState("gc-missing", StateCreating)
+	var fenceErr *StateFenceError
+	if !errors.As(err, &fenceErr) {
+		t.Fatalf("CloseDetailedIfState error = %v, want *StateFenceError", err)
+	}
+	if fenceErr.Code != StateFenceGone {
+		t.Fatalf("CloseDetailedIfState code = %q, want %q", fenceErr.Code, StateFenceGone)
+	}
+	if len(sp.SnapshotCalls()) != 0 {
+		t.Fatalf("runtime calls on gone fence = %v, want none", sp.SnapshotCalls())
 	}
 }

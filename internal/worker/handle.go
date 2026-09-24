@@ -43,6 +43,14 @@ type LifecycleHandle interface {
 	StateHandle
 }
 
+// ConditionalLifecycleHandle is an optional capability for bead-backed workers
+// whose lifecycle mutation can be fenced by the authoritative persisted session
+// state. Runtime-only handles intentionally do not implement it.
+type ConditionalLifecycleHandle interface {
+	StopIfState(context.Context, sessionpkg.State) error
+	CloseDetailedIfState(context.Context, sessionpkg.State) (sessionpkg.CloseResult, error)
+}
+
 // MessagingHandle exposes live input delivery operations.
 type MessagingHandle interface {
 	Message(context.Context, MessageRequest) (MessageResult, error)

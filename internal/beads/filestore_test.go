@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/beadstest"
@@ -2049,5 +2050,76 @@ func TestFileStoreRevisionContinuityAcrossDowngradeRewrite(t *testing.T) {
 	}
 	if again.Revision != reloaded.Revision {
 		t.Fatalf("re-seed not deterministic: %d then %d", reloaded.Revision, again.Revision)
+	}
+}
+
+func TestFileStoreExclusiveMutationSerializesConcurrentWriters(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("flock not available on Windows")
+	}
+
+	path := filepath.Join(t.TempDir(), "beads.json")
+	owner, err := beads.OpenFileStore(fsys.OSFS{}, path)
+	if err != nil {
+		t.Fatalf("OpenFileStore(owner): %v", err)
+	}
+	other, err := beads.OpenFileStore(fsys.OSFS{}, path)
+	if err != nil {
+		t.Fatalf("OpenFileStore(other): %v", err)
+	}
+	created, err := owner.Create(beads.Bead{Title: "session", Type: "session", Metadata: beads.StringMap{"state": "creating"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	mutator, ok := beads.ExclusiveMutationFor(owner)
+	if !ok {
+		t.Fatal("FileStore does not expose ExclusiveMutationStore")
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	ownerDone := make(chan error, 1)
+	go func() {
+		ownerDone <- mutator.WithExclusiveMutation(func(locked beads.Store) error {
+			got, err := locked.Get(created.ID)
+			if err != nil {
+				return err
+			}
+			if got.Metadata["state"] != "creating" {
+				return fmt.Errorf("locked state = %q, want creating", got.Metadata["state"])
+			}
+			close(entered)
+			<-release
+			return locked.SetMetadata(created.ID, "state", "suspended")
+		})
+	}()
+	<-entered
+
+	otherDone := make(chan error, 1)
+	go func() {
+		otherDone <- other.SetMetadata(created.ID, "state", "active")
+	}()
+
+	select {
+	case err := <-otherDone:
+		t.Fatalf("concurrent writer escaped exclusive mutation before release: %v", err)
+	case <-time.After(100 * time.Millisecond):
+		// Expected: other writer is blocked on the shared FileStore flock.
+	}
+
+	close(release)
+	if err := <-ownerDone; err != nil {
+		t.Fatalf("WithExclusiveMutation: %v", err)
+	}
+	if err := <-otherDone; err != nil {
+		t.Fatalf("concurrent writer after release: %v", err)
+	}
+
+	got, err := owner.Get(created.ID)
+	if err != nil {
+		t.Fatalf("owner.Get(final): %v", err)
+	}
+	if got.Metadata["state"] != "active" {
+		t.Fatalf("final state = %q, want active from serialized second writer", got.Metadata["state"])
 	}
 }
