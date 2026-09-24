@@ -12464,6 +12464,82 @@ port = 3307
 	}
 }
 
+// When the two canonical files disagree, the lifecycle follows metadata:
+// a rig whose metadata pins embedded Dolt boots fine even when its config
+// still carries a stale flat dolt.mode: server line, because metadata is the
+// routing identity (agent-forge-teyh, fix-loop 2 objection 1).
+func TestStartBeadsLifecycleFollowsMetadataWhenModesDisagree(t *testing.T) {
+	cityPath := t.TempDir()
+	callLog := filepath.Join(cityPath, "op-calls.log")
+	script := writeManagedBdTestScript(t, "#!/bin/sh\necho \"$1\" >> "+callLog+"\nexit 2\n")
+	if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`[workspace]
+name = "test-city"
+
+[dolt]
+host = "mini2.hippo-tilapia.ts.net"
+port = 3307
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rigPath := filepath.Join(t.TempDir(), "agent-forge")
+	if err := os.MkdirAll(filepath.Join(rigPath, ".beads", "embeddeddolt", "agent_forge", ".dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Metadata pins embedded; the config disagrees with a stale flat server
+	// mode and carries no endpoint.
+	if err := os.WriteFile(filepath.Join(rigPath, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"agent_forge"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigPath, ".beads", "config.yaml"), []byte(`issue_prefix: agent-forge
+dolt.mode: server
+dolt.auto-start: false
+gc.endpoint_origin: explicit
+gc.endpoint_status: unverified
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GC_BEADS", "exec:"+script)
+	t.Setenv("GC_BEADS_SCOPE_ROOT", cityPath)
+	t.Cleanup(func() { cityDoltConfigs.Delete(cityPath) })
+
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Dolt:      config.DoltConfig{Host: "mini2.hippo-tilapia.ts.net", Port: 3307},
+		Rigs: []config.Rig{{
+			Name:     "agent-forge",
+			Path:     rigPath,
+			Prefix:   "agent-forge",
+			DoltHost: "127.0.0.1",
+			DoltPort: "45371",
+		}},
+	}
+	if err := startBeadsLifecycle(cityPath, "test-city", cfg, io.Discard); err != nil {
+		t.Fatalf("startBeadsLifecycle with metadata-embedded rig: %v", err)
+	}
+
+	meta, err := os.ReadFile(filepath.Join(rigPath, ".beads", "metadata.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(meta), `"dolt_mode": "embedded"`) && !strings.Contains(string(meta), `"dolt_mode":"embedded"`) {
+		t.Errorf("metadata dolt_mode must stay embedded, got: %s", meta)
+	}
+	configData, err := os.ReadFile(filepath.Join(rigPath, ".beads", "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(configData), "dolt.host:") || strings.Contains(string(configData), "dolt.port:") {
+		t.Errorf("metadata-embedded rig must not gain a server endpoint:\n%s", configData)
+	}
+}
+
 func TestNormalizeCanonicalBdScopeFilesPreservesEmbeddedRigContract(t *testing.T) {
 	cityPath := t.TempDir()
 	rigPath := filepath.Join(cityPath, "agent-forge")

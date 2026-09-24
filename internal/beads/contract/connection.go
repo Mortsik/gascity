@@ -159,7 +159,7 @@ func ResolveDoltConnectionTarget(fs fsys.FS, cityRoot, scopeRoot string) (DoltCo
 		target.Port = port
 		return target, nil
 	case EndpointOriginCityCanonical, EndpointOriginExplicit:
-		if cfg.EndpointOrigin == EndpointOriginExplicit && !sameScope(scopeRoot, cityRoot) && scopeTracksNoExternalEndpoint(cfg) && ScopeDoltContractIsEmbedded(fs, scopeRoot) {
+		if cfg.EndpointOrigin == EndpointOriginExplicit && !sameScope(scopeRoot, cityRoot) && scopeTracksNoExternalEndpoint(cfg) && ScopeUsesEmbeddedDoltContract(fs, scopeRoot) {
 			// An embedded-contract rig owns its bead database under its own
 			// .beads directory; bd opens it in-process, so there is no server
 			// endpoint to populate and no server that must be reachable.
@@ -196,7 +196,7 @@ func ValidateCanonicalConfigState(fs fsys.FS, cityRoot, scopeRoot string, cfg Co
 	case "":
 		return nil
 	case EndpointOriginExplicit:
-		if scopeTracksNoExternalEndpoint(cfg) && ScopeDoltContractIsEmbedded(fs, scopeRoot) {
+		if scopeTracksNoExternalEndpoint(cfg) && ScopeUsesEmbeddedDoltContract(fs, scopeRoot) {
 			// An embedded-contract rig owns its bead storage under its own
 			// .beads directory; there is no server endpoint to require.
 			return nil
@@ -446,7 +446,7 @@ func ValidateConnectionConfigState(fs fsys.FS, cityRoot, scopeRoot string, cfg C
 	case EndpointOriginManagedCity, EndpointOriginCityCanonical:
 		return fmt.Errorf("%s endpoint origin is invalid for rig scope", cfg.EndpointOrigin)
 	case EndpointOriginExplicit:
-		if scopeTracksNoExternalEndpoint(cfg) && ScopeDoltContractIsEmbedded(fs, scopeRoot) {
+		if scopeTracksNoExternalEndpoint(cfg) && ScopeUsesEmbeddedDoltContract(fs, scopeRoot) {
 			// An embedded-contract rig owns its bead storage under its own
 			// .beads directory; there is no server endpoint to require.
 			return nil
@@ -675,11 +675,41 @@ func scopeTracksNoExternalEndpoint(cfg ConfigState) bool {
 	return strings.TrimSpace(cfg.DoltHost) == "" && strings.TrimSpace(cfg.DoltPort) == ""
 }
 
-// ScopeDoltContractIsEmbedded reports whether a scope's config.yaml pins its
-// storage contract to embedded Dolt (dolt.mode: embedded, flat or nested
-// form). Such a scope owns its bead database under its own .beads directory;
-// no server endpoint exists for it.
-func ScopeDoltContractIsEmbedded(fs fsys.FS, scopeRoot string) bool {
+// ScopeUsesEmbeddedDoltContract reports whether a scope's tracked storage
+// contract is embedded Dolt — the single embedded predicate for validation,
+// connection resolution, drift checking, lifecycle, and diagnostics.
+//
+// metadata.json's dolt_mode is the routing identity — it is what bd and the
+// native store branch on — so a recorded mode always answers, in BOTH
+// directions: an embedded metadata mode stays an embedded contract even when
+// config.yaml says server, and a recorded non-embedded mode is not embedded
+// even when config.yaml says embedded. A recorded embedded mode counts only
+// for a scope whose metadata names the dolt backend — the pre-registry
+// "legacy" marker is adoption debris, not a tracked contract. config.yaml's
+// dolt.mode corroborates only when metadata records no mode, and only when
+// the metadata is absent or itself dolt-backed.
+//
+// Such a scope owns its bead database under its own .beads directory; no
+// server endpoint exists for it.
+func ScopeUsesEmbeddedDoltContract(fs fsys.FS, scopeRoot string) bool {
+	metaPath := filepath.Join(scopeRoot, ".beads", "metadata.json")
+	if mode, ok, err := ReadDoltMode(fs, metaPath); err == nil && ok {
+		if !strings.EqualFold(strings.TrimSpace(mode), "embedded") {
+			return false
+		}
+		state, _, loadErr := LoadMetadataState(fs, metaPath)
+		return loadErr == nil && state.Backend == "dolt"
+	}
+	state, ok, loadErr := LoadMetadataState(fs, metaPath)
+	if loadErr != nil {
+		// Unreadable or unregistered metadata (e.g. the pre-registry
+		// "legacy" backend) is canonicalization's job, not a tracked
+		// embedded contract.
+		return false
+	}
+	if ok && state.Backend != "" && state.Backend != "dolt" {
+		return false
+	}
 	mode, ok, err := ReadScopeDoltMode(fs, filepath.Join(scopeRoot, ".beads", "config.yaml"))
 	return err == nil && ok && mode == "embedded"
 }

@@ -652,32 +652,15 @@ func scopeHasOwnConfigYAML(dir string) bool {
 }
 
 // scopeUsesEmbeddedDoltContract reports whether a scope's tracked storage
-// contract is embedded Dolt. metadata.json's dolt_mode is the routing
-// identity — it is what bd and the native store branch on — so a recorded
-// non-embedded mode always answers, and config.yaml's dolt.mode corroborates
-// only when metadata records no mode at all. A recorded embedded mode counts
-// only for a scope the dolt backend registry actually serves: the
-// pre-registry "legacy" marker is adoption debris that canonicalization
-// owns, not a tracked embedded contract. Such a scope owns its bead database
-// under its own .beads directory: gc must neither rewrite it to a server
-// mode nor wire it to the managed Dolt lifecycle.
+// contract is embedded Dolt, by the single shared predicate
+// (contract.ScopeUsesEmbeddedDoltContract): metadata.json's dolt_mode is the
+// routing identity and answers alone, config.yaml's dolt.mode corroborates
+// only when metadata records no mode, and the pre-registry "legacy" backend
+// marker is adoption debris rather than a tracked contract. Such a scope
+// owns its bead database under its own .beads directory: gc must neither
+// rewrite it to a server mode nor wire it to the managed Dolt lifecycle.
 func scopeUsesEmbeddedDoltContract(dir string) bool {
-	fs := fsys.OSFS{}
-	path := scopeMetadataJSONPath(dir)
-	if mode, ok, err := contract.ReadDoltMode(fs, path); err == nil && ok {
-		if !strings.EqualFold(strings.TrimSpace(mode), "embedded") {
-			return false
-		}
-		state, _, loadErr := contract.LoadMetadataState(fs, path)
-		return loadErr == nil && state.Backend == "dolt"
-	}
-	if state, ok, loadErr := contract.LoadMetadataState(fs, path); loadErr != nil || (ok && state.Backend != "" && state.Backend != "dolt") {
-		// Unreadable or non-dolt metadata is canonicalization's job, not a
-		// tracked embedded contract.
-		return false
-	}
-	mode, ok, err := contract.ReadScopeDoltMode(fs, filepath.Join(dir, ".beads", "config.yaml"))
-	return err == nil && ok && strings.EqualFold(mode, "embedded")
+	return contract.ScopeUsesEmbeddedDoltContract(fsys.OSFS{}, dir)
 }
 
 // scopeHasCompleteStorageBinding recognizes the opaque workspace binding
@@ -1731,7 +1714,7 @@ func ensureCanonicalScopeMetadata(fs fsys.FS, scopeRoot, doltDatabase string, pr
 	if err := ensureBeadsDir(fs, filepath.Dir(path)); err != nil {
 		return err
 	}
-	doltMode := canonicalScopeMetadataDoltMode(fs, scopeRoot, path)
+	doltMode := canonicalScopeMetadataDoltMode(fs, scopeRoot)
 	announceStorageModeChange(fs, path, doltMode, doltDatabase)
 	_, err = contract.EnsureCanonicalMetadata(fs, path, contract.MetadataState{
 		Database:     "dolt",
@@ -1743,24 +1726,14 @@ func ensureCanonicalScopeMetadata(fs fsys.FS, scopeRoot, doltDatabase string, pr
 }
 
 // canonicalScopeMetadataDoltMode returns the dolt_mode canonicalization must
-// write for a scope. A scope whose tracked contract is already embedded Dolt
-// keeps it: flipping an embedded scope onto a server endpoint moves the
-// ledger bd reads without moving a single row, and strands the scope on a
-// server that may not exist. A recorded metadata mode answers alone (it is
-// the routing identity), and an embedded answer requires the dolt backend
-// registry to actually serve the scope — the pre-registry "legacy" marker is
-// adoption debris and canonicalizes to server mode as before. config.yaml's
-// dolt.mode corroborates only when metadata records no mode.
-func canonicalScopeMetadataDoltMode(fs fsys.FS, scopeRoot, metadataPath string) string {
-	if mode, ok, err := contract.ReadDoltMode(fs, metadataPath); err == nil && ok {
-		if strings.EqualFold(strings.TrimSpace(mode), "embedded") {
-			if state, _, loadErr := contract.LoadMetadataState(fs, metadataPath); loadErr == nil && state.Backend == "dolt" {
-				return "embedded"
-			}
-		}
-		return "server"
-	}
-	if mode, ok, err := contract.ReadScopeDoltMode(fs, filepath.Join(scopeRoot, ".beads", "config.yaml")); err == nil && ok && strings.EqualFold(mode, "embedded") {
+// write for a scope. A scope whose tracked contract is embedded Dolt
+// (contract.ScopeUsesEmbeddedDoltContract) keeps it: flipping an embedded
+// scope onto a server endpoint moves the ledger bd reads without moving a
+// single row, and strands the scope on a server that may not exist.
+// Everything else — including the pre-registry "legacy" adoption shape —
+// canonicalizes to gc's managed server mode, as before.
+func canonicalScopeMetadataDoltMode(fs fsys.FS, scopeRoot string) string {
+	if contract.ScopeUsesEmbeddedDoltContract(fs, scopeRoot) {
 		return "embedded"
 	}
 	return "server"
@@ -2179,7 +2152,7 @@ func validateCanonicalCompatDoltDrift(cityPath string, cfg *config.City) error {
 		}
 		if rigState.EndpointOrigin == contract.EndpointOriginExplicit &&
 			strings.TrimSpace(rigState.DoltHost) == "" && strings.TrimSpace(rigState.DoltPort) == "" &&
-			contract.ScopeDoltContractIsEmbedded(fsys.OSFS{}, rig.Path) {
+			contract.ScopeUsesEmbeddedDoltContract(fsys.OSFS{}, rig.Path) {
 			// The rig's repository contract is embedded Dolt: it owns its bead
 			// storage under its own .beads directory, so city.toml
 			// dolt_host/dolt_port entries cannot drift from a canonical

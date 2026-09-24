@@ -279,14 +279,81 @@ func TestCanonicalizeScopeMetadataIfPresentSkipsOnlyAbsentMetadata(t *testing.T)
 		if err := canonicalizeScopeMetadataIfPresent(fsys.OSFS{}, scopeDir); err != nil {
 			t.Fatalf("canonicalizeScopeMetadataIfPresent: %v", err)
 		}
-		// The scope's tracked contract is embedded Dolt: canonicalization
-		// rewrites the canonical fields but preserves the mode it pinned
-		// (agent-forge-teyh) — same treatment as the init path and the
-		// named-scope door.
-		if mode := readScopeDoltMode(t, scopeDir); mode != "embedded" {
-			t.Fatalf("dolt_mode = %q, want the embedded contract preserved", mode)
+		// An endpoint command is an explicit operator choice of a server
+		// topology, so it deliberately transitions the scope's metadata to
+		// server mode — the init door is the one that preserves embedded
+		// contracts (agent-forge-teyh, fix-loop 2 objection 2).
+		if mode := readScopeDoltMode(t, scopeDir); mode != "server" {
+			t.Fatalf("dolt_mode = %q, want server", mode)
 		}
 	})
+}
+
+// A successful `gc rig set-endpoint` from an embedded-contract scope must
+// leave ONE coherent topology: metadata.json server, config.yaml explicit
+// server endpoint, and connection resolution external — all three describing
+// the same store. The command is the operator's deliberate migration off the
+// embedded contract, and the transition is announced (agent-forge-teyh,
+// fix-loop 2 objection 2).
+func TestDoRigSetEndpointFromEmbeddedScopeLeavesOneCoherentTopology(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(t.TempDir(), "frontend")
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads", "embeddeddolt", "fe", ".dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeRigEndpointCityConfig(t, cityDir, rigDir)
+	writeRigEndpointMetadata(t, cityDir, "hq")
+	if err := os.WriteFile(filepath.Join(rigDir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"fe"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigDir, ".beads", "config.yaml"), []byte(`issue_prefix: fe
+issue-prefix: fe
+dolt:
+  mode: embedded
+dolt.auto-start: false
+gc.endpoint_origin: explicit
+gc.endpoint_status: unverified
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	notices := captureStorageModeChanges(t)
+	var stdout, stderr bytes.Buffer
+	code := doRigSetEndpoint(fsys.OSFS{}, cityDir, "frontend", rigEndpointOptions{
+		External:        true,
+		Host:            "db.example.com",
+		Port:            "3307",
+		AdoptUnverified: true,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doRigSetEndpoint() = %d, stderr = %s", code, stderr.String())
+	}
+
+	// All three descriptions of the scope's storage agree on the server
+	// topology afterwards.
+	if mode := readScopeDoltMode(t, rigDir); mode != "server" {
+		t.Fatalf("metadata dolt_mode = %q, want server", mode)
+	}
+	state := readRigEndpointConfigState(t, rigDir)
+	if state.EndpointOrigin != contract.EndpointOriginExplicit {
+		t.Fatalf("config endpoint origin = %q, want explicit", state.EndpointOrigin)
+	}
+	if state.DoltHost != "db.example.com" || state.DoltPort != "3307" {
+		t.Fatalf("config endpoint = %q:%q, want db.example.com:3307", state.DoltHost, state.DoltPort)
+	}
+	target, err := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, cityDir, rigDir)
+	if err != nil {
+		t.Fatalf("ResolveDoltConnectionTarget() error = %v", err)
+	}
+	if target.Embedded || !target.External || target.Host != "db.example.com" || target.Port != "3307" {
+		t.Fatalf("target = %+v, want external db.example.com:3307", target)
+	}
+	left := filepath.Join(rigDir, ".beads", "embeddeddolt", "fe")
+	if !strings.Contains(notices.String(), left) {
+		t.Errorf("the transition off the embedded contract did not name %q; notices=%q", left, notices.String())
+	}
 }
 
 func TestDoRigSetEndpointInheritMirrorsExternalCity(t *testing.T) {

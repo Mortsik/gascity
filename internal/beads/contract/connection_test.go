@@ -1143,7 +1143,149 @@ func TestResolveDoltConnectionTargetExplicitServerRigUnchanged(t *testing.T) {
 	}
 }
 
+// writeScopeFiles writes a scope's .beads/config.yaml and metadata.json
+// verbatim, for disagreement fixtures.
+//
 //nolint:unparam // helper keeps FS explicit in tests
+func writeScopeFiles(t *testing.T, fs fsys.FS, scope, config, metadata string) {
+	t.Helper()
+	if err := fs.MkdirAll(filepath.Join(scope, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if config != "" {
+		if err := fs.WriteFile(filepath.Join(scope, ".beads", "config.yaml"), []byte(config), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if metadata != "" {
+		if err := fs.WriteFile(filepath.Join(scope, ".beads", "metadata.json"), []byte(metadata), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// The single embedded predicate is metadata-first: metadata.json's dolt_mode
+// answers alone, in BOTH disagreement directions, and the legacy-backend
+// adoption guard holds (agent-forge-teyh fix-loop 2, objection 1).
+func TestScopeUsesEmbeddedDoltContractMetadataWinsOverConfig(t *testing.T) {
+	fs := fsys.OSFS{}
+	for _, tc := range []struct {
+		name     string
+		metadata string
+		config   string
+		want     bool
+	}{
+		{
+			name:     "metadata embedded wins over config server",
+			metadata: `{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"af"}`,
+			config:   "issue_prefix: af\ndolt.mode: server\n",
+			want:     true,
+		},
+		{
+			name:     "metadata server wins over config embedded",
+			metadata: `{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"af"}`,
+			config:   "issue_prefix: af\ndolt:\n  mode: embedded\n",
+			want:     false,
+		},
+		{
+			name:     "legacy backend with embedded mode is adoption debris",
+			metadata: `{"database":"legacy","backend":"legacy","dolt_mode":"embedded","dolt_database":"af"}`,
+			config:   "issue_prefix: af\ndolt.mode: embedded\n",
+			want:     false,
+		},
+		{
+			name:     "config corroborates when metadata records no mode",
+			metadata: `{"database":"dolt","backend":"dolt","dolt_database":"af"}`,
+			config:   "issue_prefix: af\ndolt.mode: embedded\n",
+			want:     true,
+		},
+		{
+			name:     "no embedded contract anywhere",
+			metadata: `{"database":"dolt","backend":"dolt","dolt_database":"af"}`,
+			config:   "issue_prefix: af\n",
+			want:     false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scope := filepath.Join(t.TempDir(), "rig")
+			writeScopeFiles(t, fs, scope, tc.config, tc.metadata)
+			if got := ScopeUsesEmbeddedDoltContract(fs, scope); got != tc.want {
+				t.Fatalf("ScopeUsesEmbeddedDoltContract = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Disagreement between the two canonical files reaches validation and
+// connection resolution, and metadata wins there too: an embedded metadata
+// contract makes an endpoint-less explicit config valid even when config.yaml
+// still says server, while a recorded server mode keeps demanding the port no
+// matter what config.yaml claims.
+func TestEmbeddedContractDisagreementMetadataWinsAtValidation(t *testing.T) {
+	fs := fsys.OSFS{}
+	city := t.TempDir()
+
+	t.Run("metadata embedded, config server: valid without port, resolves embedded", func(t *testing.T) {
+		rig := filepath.Join(t.TempDir(), "rig")
+		writeScopeFiles(t, fs, rig,
+			"issue_prefix: af\ndolt.mode: server\ndolt.auto-start: false\ngc.endpoint_origin: explicit\ngc.endpoint_status: unverified\n",
+			`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"af"}`)
+		cfg, ok, err := ReadConfigState(fs, filepath.Join(rig, ".beads", "config.yaml"))
+		if err != nil || !ok {
+			t.Fatalf("ReadConfigState() ok=%v err=%v", ok, err)
+		}
+		if err := ValidateCanonicalConfigState(fs, city, rig, cfg); err != nil {
+			t.Fatalf("ValidateCanonicalConfigState() error = %v", err)
+		}
+		target, err := ResolveDoltConnectionTarget(fs, city, rig)
+		if err != nil {
+			t.Fatalf("ResolveDoltConnectionTarget() error = %v", err)
+		}
+		if !target.Embedded || target.External || target.Host != "" || target.Port != "" {
+			t.Fatalf("target = %+v, want embedded with no server endpoint", target)
+		}
+	})
+
+	t.Run("metadata server, config embedded: port still required", func(t *testing.T) {
+		rig := filepath.Join(t.TempDir(), "rig")
+		writeScopeFiles(t, fs, rig,
+			"issue_prefix: af\ndolt:\n  mode: embedded\ndolt.auto-start: false\ngc.endpoint_origin: explicit\ngc.endpoint_status: unverified\n",
+			`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"af"}`)
+		_, err := ResolveScopeConfigState(fs, city, rig, "af")
+		if err == nil || !strings.Contains(err.Error(), "explicit rig config requires dolt.port") {
+			t.Fatalf("ResolveScopeConfigState() error = %v, want explicit rig config requires dolt.port", err)
+		}
+	})
+
+	t.Run("genuinely server scopes require the port in both file shapes", func(t *testing.T) {
+		for name, tc := range map[string]struct {
+			metadata string
+			config   string
+		}{
+			"metadata server, config records no mode": {
+				metadata: `{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"af"}`,
+				config:   "issue_prefix: af\ndolt.auto-start: false\ngc.endpoint_origin: explicit\ngc.endpoint_status: unverified\n",
+			},
+			"metadata records no mode, config server": {
+				metadata: `{"database":"dolt","backend":"dolt","dolt_database":"af"}`,
+				config:   "issue_prefix: af\ndolt.mode: server\ndolt.auto-start: false\ngc.endpoint_origin: explicit\ngc.endpoint_status: unverified\n",
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				rig := filepath.Join(t.TempDir(), "rig")
+				writeScopeFiles(t, fs, rig, tc.config, tc.metadata)
+				cfg, ok, err := ReadConfigState(fs, filepath.Join(rig, ".beads", "config.yaml"))
+				if err != nil || !ok {
+					t.Fatalf("ReadConfigState() ok=%v err=%v", ok, err)
+				}
+				if err := ValidateConnectionConfigState(fs, city, rig, cfg); err == nil || !strings.Contains(err.Error(), "explicit rig config requires dolt.port") {
+					t.Fatalf("ValidateConnectionConfigState() error = %v, want explicit rig config requires dolt.port", err)
+				}
+			})
+		}
+	})
+}
+
 func writeCanonicalConfig(t *testing.T, fs fsys.FS, dir string, state ConfigState) {
 	t.Helper()
 	if err := fs.MkdirAll(filepath.Join(dir, ".beads"), 0o700); err != nil {

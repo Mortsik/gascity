@@ -374,9 +374,8 @@ func requireCanonicalScopeMetadata(fs fsys.FS, scopeRoot string) error {
 // store the operator never initialized.
 //
 // It announces the mode change for the same reason ensureCanonicalScopeMetadata
-// does: this is the identical rewrite through a different door, and a warning
-// that depends on which command performed the flip is a warning an operator
-// cannot rely on.
+// does for the flips IT performs: a warning that depends on which command
+// performed the flip is a warning an operator cannot rely on.
 func requireCanonicalizedScopeMetadata(fs fsys.FS, scopeRoot string) error {
 	if err := requireCanonicalScopeMetadata(fs, scopeRoot); err != nil {
 		return err
@@ -387,12 +386,21 @@ func requireCanonicalizedScopeMetadata(fs fsys.FS, scopeRoot string) error {
 		return err
 	}
 	doltDatabase = strings.TrimSpace(doltDatabase)
-	doltMode := canonicalScopeMetadataDoltMode(fs, scopeRoot, path)
-	announceStorageModeChange(fs, path, doltMode, doltDatabase)
+	// An endpoint command is an explicit operator choice of a SERVER
+	// topology (--external, --self, or --inherit all name server endpoints),
+	// so it deliberately transitions the scope's metadata to server mode:
+	// requestedRigEndpointState writes the matching server endpoint into
+	// config.yaml, and metadata.json is the routing identity — leaving it
+	// embedded would make the two canonical files describe different
+	// stores. This is the one door that may flip an embedded contract, and
+	// announceStorageModeChange makes that flip loud. The automatic
+	// lifecycle door (ensureCanonicalScopeMetadata) preserves embedded
+	// contracts; only this operator-driven one rewrites them.
+	announceStorageModeChange(fs, path, "server", doltDatabase)
 	_, err = contract.EnsureCanonicalMetadata(fs, path, contract.MetadataState{
 		Database:     "dolt",
 		Backend:      "dolt",
-		DoltMode:     doltMode,
+		DoltMode:     "server",
 		DoltDatabase: doltDatabase,
 	})
 	return err

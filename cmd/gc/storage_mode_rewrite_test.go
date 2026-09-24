@@ -213,23 +213,42 @@ func TestTheAdoptionAnnouncementNamesARecoveryThatSURVIVESTheNextBoot(t *testing
 	}
 }
 
-// TestEveryDoorThatFlipsTheStorageModeAnnouncesIt closes the gap a
-// per-command warning always has — and, since agent-forge-teyh, pins that
-// none of the doors rewrites an embedded contract.
+// TestEveryDoorLeavesOneCoherentStorageMode closes the gap a per-command
+// warning always has, and pins the split agent-forge-teyh draws between the
+// two kinds of doors.
 //
-// `gc rig set-endpoint` and `gc beads city use-managed`/`use-external` reach
-// their own canonicalizers (requireCanonicalizedScopeMetadata for the scope the
-// command names, canonicalizeScopeMetadataIfPresent for the inherited rigs a
-// city endpoint change sweeps along, both in cmd_rig_endpoint.go) rather than
-// the init one. All three doors must preserve an embedded-contract scope
-// silently: a warning that depends on which command the operator happened to
-// run — or on which of the three doors the scope arrived through — is a
-// warning nobody can rely on.
-func TestEveryDoorTreatsAnEmbeddedContractTheSame(t *testing.T) {
+// The INIT door is the automatic one — every `gc start`, `gc rig add` and
+// `gc supervisor run` runs it — and it preserves an embedded-contract scope
+// silently: nobody asked to move the scope, so nobody may.
+//
+// The ENDPOINT doors are operator commands: `gc rig set-endpoint` and
+// `gc beads city use-managed`/`use-external` reach their own canonicalizers
+// (requireCanonicalizedScopeMetadata for the scope the command names,
+// canonicalizeScopeMetadataIfPresent for the inherited rigs a city endpoint
+// change sweeps along, both in cmd_rig_endpoint.go), and every endpoint
+// choice names a SERVER topology. An explicit endpoint change deliberately
+// transitions the scope to server mode and announces the flip — metadata is
+// the routing identity, so leaving it embedded while the canonical config
+// names a server endpoint would make the two files describe different stores
+// (fix-loop 2, objection 2). A warning that depends on which door the scope
+// arrived through is still a warning nobody can rely on: all endpoint doors
+// behave identically.
+func TestEveryDoorLeavesOneCoherentStorageMode(t *testing.T) {
+	t.Run("init door preserves the embedded contract silently", func(t *testing.T) {
+		scope := embeddedScopeWithBeads(t, "jc")
+		notices := captureStorageModeChanges(t)
+		if err := ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, scope, "jc"); err != nil {
+			t.Fatalf("ensureCanonicalScopeMetadataForInit: %v", err)
+		}
+		if mode := readScopeDoltMode(t, scope); mode != "embedded" {
+			t.Fatalf("dolt_mode = %q, want the embedded contract preserved", mode)
+		}
+		if notices.Len() != 0 {
+			t.Fatalf("preserving an embedded contract announced a change: %q", notices.String())
+		}
+	})
+
 	for name, canonicalize := range map[string]func(scope string) error{
-		"init path": func(scope string) error {
-			return ensureCanonicalScopeMetadataForInit(fsys.OSFS{}, scope, "jc")
-		},
 		"endpoint path, named scope": func(scope string) error {
 			return requireCanonicalizedScopeMetadata(fsys.OSFS{}, scope)
 		},
@@ -243,11 +262,12 @@ func TestEveryDoorTreatsAnEmbeddedContractTheSame(t *testing.T) {
 			if err := canonicalize(scope); err != nil {
 				t.Fatalf("canonicalize: %v", err)
 			}
-			if mode := readScopeDoltMode(t, scope); mode != "embedded" {
-				t.Fatalf("dolt_mode = %q, want the embedded contract preserved", mode)
+			if mode := readScopeDoltMode(t, scope); mode != "server" {
+				t.Fatalf("dolt_mode = %q, want the deliberate server transition", mode)
 			}
-			if notices.Len() != 0 {
-				t.Fatalf("preserving an embedded contract announced a change: %q", notices.String())
+			left := filepath.Join(scope, ".beads", "embeddeddolt", "jc")
+			if !strings.Contains(notices.String(), left) {
+				t.Fatalf("the transition did not name %q; notices=%q", left, notices.String())
 			}
 		})
 	}

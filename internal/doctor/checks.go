@@ -1125,16 +1125,12 @@ func scopeUsesBDDoltliteStore(cityPath, scopePath string) bool {
 }
 
 // scopeUsesEmbeddedDoltStore reports whether a scope's tracked storage
-// contract is embedded Dolt. metadata.json's dolt_mode is the routing
-// identity; config.yaml's dolt.mode corroborates only when metadata records
-// no mode. Such a scope owns its bead database under its own .beads
-// directory — no server endpoint exists to probe.
+// contract is embedded Dolt, by the single shared predicate
+// (contract.ScopeUsesEmbeddedDoltContract). Such a scope owns its bead
+// database under its own .beads directory — no server endpoint exists to
+// probe.
 func scopeUsesEmbeddedDoltStore(scopeRoot string) bool {
-	if mode, ok, err := contract.ReadDoltMode(fsys.OSFS{}, filepath.Join(scopeRoot, ".beads", "metadata.json")); err == nil && ok {
-		return strings.EqualFold(strings.TrimSpace(mode), "embedded")
-	}
-	mode, ok, err := contract.ReadScopeDoltMode(fsys.OSFS{}, filepath.Join(scopeRoot, ".beads", "config.yaml"))
-	return err == nil && ok && strings.EqualFold(mode, "embedded")
+	return contract.ScopeUsesEmbeddedDoltContract(fsys.OSFS{}, scopeRoot)
 }
 
 func doctorExecProviderBase(provider string) string {
