@@ -3,13 +3,17 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 )
 
@@ -415,6 +419,155 @@ func TestCmdSessionSuspendIfStateManagedPathGoneRefusesZeroPokes(t *testing.T) {
 	}
 	if got.Metadata["held_until"] != "" {
 		t.Fatalf("held_until after managed gone = %q, want empty (no suspend patch)", got.Metadata["held_until"])
+	}
+}
+
+// swapSessionProviderForTest replaces the session-provider construction seam
+// with a spy [runtime.Fake] the test keeps a handle on, so provider-level
+// effects of a command (e.g. the runtime Stop issued by the direct suspend
+// fallback) are observable from outside the command. Restored via t.Cleanup.
+func swapSessionProviderForTest(t *testing.T) *runtime.Fake {
+	t.Helper()
+	fake := runtime.NewFake()
+	oldBuild := buildSessionProviderByName
+	buildSessionProviderByName = func(*config.City, string, config.SessionConfig, string, string) (runtime.Provider, error) {
+		return fake, nil
+	}
+	t.Cleanup(func() { buildSessionProviderByName = oldBuild })
+	return fake
+}
+
+// stopCalls returns the Stop calls the provider recorded, in order.
+func stopCalls(fake *runtime.Fake) []runtime.Call {
+	var stops []runtime.Call
+	for _, c := range fake.Calls {
+		if c.Method == "Stop" {
+			stops = append(stops, c)
+		}
+	}
+	return stops
+}
+
+// TestCmdSessionSuspendIfStateManagedControllerDownIsMetadataOnly pins the
+// fenced managed suspend on a managed city whose controller is DOWN: the
+// single post-success poke fails and the failure is ignored, so the command
+// still succeeds — but as a metadata-only suspend. The runtime is NOT
+// stopped (no provider Stop, no worker-handle fallback; mode stays
+// "managed"), and held_until lands durably far in the future so the
+// self-healing reconciler finishes the stop once the controller is back.
+func TestCmdSessionSuspendIfStateManagedControllerDownIsMetadataOnly(t *testing.T) {
+	cityDir, _, sessionBead := setupSessionIfStateCity(t, "active")
+	fake := swapSessionProviderForTest(t)
+
+	pokes := 0
+	deps := sessionSuspendDeps{
+		cityUsesManagedReconciler: func(string) bool { return true },
+		pokeController: func(string) error {
+			pokes++
+			return errors.New("controller down")
+		},
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdSessionSuspendWithOptions([]string{sessionBead.ID}, &stdout, &stderr, sessionMutationOptions{JSON: true, IfState: "active", SuspendDeps: &deps})
+	if code != 0 {
+		t.Fatalf("fenced managed suspend with controller down exit = %d; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	var result sessionActionResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON result: %v; stdout=%q", err, stdout.String())
+	}
+	if result.Mode != "managed" || result.State != "suspended" {
+		t.Fatalf("result = %+v, want mode=managed state=suspended (metadata-only success, not the direct fallback)", result)
+	}
+	// Exactly one poke — the post-success reconciler tick. Its failure is
+	// swallowed; there is no pre-fence availability poke to fail louder.
+	if pokes != 1 {
+		t.Fatalf("poke count = %d, want 1 (post-success tick only; no pre-fence poke)", pokes)
+	}
+	// The runtime must still be running: this command never reached the
+	// worker-handle fallback, so it issued no provider Stop.
+	if stops := stopCalls(fake); len(stops) != 0 {
+		t.Fatalf("provider Stop calls = %d (%v), want 0 (controller down ⇒ runtime keeps running)", len(stops), stops)
+	}
+	reopened, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("reopen city store: %v", err)
+	}
+	after, err := reopened.Get(sessionBead.ID)
+	if err != nil {
+		t.Fatalf("Get(after controller-down suspend): %v", err)
+	}
+	if state := after.Metadata["state"]; state != "suspended" {
+		t.Fatalf("state after controller-down suspend = %q, want suspended", state)
+	}
+	if intent := after.Metadata["sleep_intent"]; intent != "user-hold" {
+		t.Fatalf("sleep_intent after controller-down suspend = %q, want user-hold", intent)
+	}
+	held, err := time.Parse(time.RFC3339, after.Metadata["held_until"])
+	if err != nil {
+		t.Fatalf("held_until %q is not RFC3339, want the durable user-hold patch: %v", after.Metadata["held_until"], err)
+	}
+	// The patch is the indefinite-hold sentinel (~100 years out) — durable
+	// enough for self-healing to act on whenever the controller returns.
+	if !held.After(time.Now().Add(99 * 365 * 24 * time.Hour)) {
+		t.Fatalf("held_until = %v, want the far-future indefinite hold", held)
+	}
+}
+
+// TestCmdSessionSuspendManagedPokeFailureFallsThroughToDirectStop pins the
+// contrast: on the SAME managed city with the controller down, an UNFENCED
+// suspend uses its pre-poke as the liveness probe — the failed poke falls
+// through to the direct worker-handle suspend, which stops the runtime
+// (provider Stop) and records state=suspended without the managed
+// held_until/sleep_intent patch.
+func TestCmdSessionSuspendManagedPokeFailureFallsThroughToDirectStop(t *testing.T) {
+	cityDir, _, sessionBead := setupSessionIfStateCity(t, "active")
+	fake := swapSessionProviderForTest(t)
+
+	pokes := 0
+	deps := sessionSuspendDeps{
+		cityUsesManagedReconciler: func(string) bool { return true },
+		pokeController: func(string) error {
+			pokes++
+			return errors.New("controller down")
+		},
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdSessionSuspendWithOptions([]string{sessionBead.ID}, &stdout, &stderr, sessionMutationOptions{JSON: true, SuspendDeps: &deps})
+	if code != 0 {
+		t.Fatalf("unfenced managed suspend with controller down exit = %d; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	var result sessionActionResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON result: %v; stdout=%q", err, stdout.String())
+	}
+	if result.Mode != "direct" {
+		t.Fatalf("result mode = %q, want direct (failed pre-poke falls through to the worker-handle suspend)", result.Mode)
+	}
+	// The direct fallback stops the runtime: exactly one provider Stop for
+	// the session's runtime name.
+	stops := stopCalls(fake)
+	if len(stops) != 1 || stops[0].Name != "worker-fenced" {
+		t.Fatalf("provider Stop calls = %v, want exactly one Stop for worker-fenced (runtime stopped by the direct suspend)", stops)
+	}
+	if pokes != 1 {
+		t.Fatalf("poke count = %d, want 1 (the failed liveness pre-poke)", pokes)
+	}
+	reopened, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("reopen city store: %v", err)
+	}
+	after, err := reopened.Get(sessionBead.ID)
+	if err != nil {
+		t.Fatalf("Get(after direct suspend): %v", err)
+	}
+	if state := after.Metadata["state"]; state != "suspended" {
+		t.Fatalf("state after direct suspend = %q, want suspended", state)
+	}
+	if held := after.Metadata["held_until"]; held != "" {
+		t.Fatalf("held_until after direct suspend = %q, want empty (the managed patch never ran)", held)
 	}
 }
 
