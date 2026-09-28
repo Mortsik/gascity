@@ -1878,12 +1878,21 @@ func cmdSessionSuspendWithOptions(args []string, stdout, stderr io.Writer, opts 
 			return 0
 		}
 		if expected != "" {
-			// Fenced managed suspend: the availability check above is
-			// side-effect-free (it pings, never pokes), and the reconciler
-			// trigger is deferred until AFTER the fenced patch succeeds — a
-			// mismatch/gone refusal must not cause any controller tick, since
-			// the tick itself can mutate runtime or durable state before the
-			// command reports the refusal.
+			// Fenced managed suspend: nothing gates this branch on controller
+			// availability — the managed-routing check that selected this path
+			// may ping the controller socket, but it decides routing only.
+			// There is deliberately no pre-fence poke: a poke fires a
+			// reconciler tick that can mutate runtime or durable state before
+			// the fence decides, so a mismatch/gone refusal would not be
+			// zero-mutation. The reconciler trigger fires only AFTER the
+			// fenced patch succeeds. When the controller is down, that
+			// post-success poke fails and the failure is ignored: the command
+			// still reports success for a metadata-only suspend — the runtime
+			// keeps running, and the durable held_until patch is what the
+			// self-healing reconciler acts on to stop it once the controller
+			// is back. (The unfenced path below probes liveness with its
+			// pre-poke and falls through to the direct worker-handle
+			// suspend, which stops the runtime immediately.)
 			if mutationErr := session.WithExpectedStateMutation(sessStore, sessionID, expected, applySuspendPatch); mutationErr != nil {
 				return writeSessionMutationError(stdout, stderr, "gc session suspend", asJSON, mutationErr)
 			}
