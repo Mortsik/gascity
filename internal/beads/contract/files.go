@@ -1362,7 +1362,10 @@ func ensureFallbackNestedDoltDisableEventFlush(lines []string, value bool) ([]st
 	sectionBody := lines[sectionIndex+1 : sectionEnd]
 	if strings.TrimSpace(lines[sectionIndex]) != "dolt:" {
 		if expanded, ok := expandFlowMapSectionHeader(lines[sectionIndex]); ok {
-			out = append(out, expanded...)
+			// Only the opener goes out here; the expanded entries are appended
+			// by the walk below — emitting them twice would leave duplicated,
+			// potentially contradicting entries in one block.
+			out = append(out, expanded[0])
 			sectionBody = expanded[1:]
 			changed = true
 		} else {

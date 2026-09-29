@@ -2273,7 +2273,9 @@ func TestReadDoltConfigReadsFlowMapDoltSectionOnMalformedYAML(t *testing.T) {
 
 // The malformed-YAML fallback must not silently drop a flow-map `dolt:` section
 // on a preserving write: the nested mode bd itself writes survives (and keeps
-// ReadScopeDoltMode's answer), as do unmanaged sibling entries.
+// ReadScopeDoltMode's answer), as do unmanaged sibling entries. The exact
+// output shape is pinned — a duplicated (or contradictory) dolt block from the
+// expansion is a failure, not a Contains match.
 func TestEnsureCanonicalConfigFallbackPreservesFlowMapDoltSectionOnPreserve(t *testing.T) {
 	fs := fsys.OSFS{}
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -2291,15 +2293,20 @@ func TestEnsureCanonicalConfigFallbackPreservesFlowMapDoltSectionOnPreserve(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := string(data)
-	if !strings.Contains(text, "mode: embedded") {
-		t.Errorf("flow-map mode must survive a preserving fallback write:\n%s", text)
-	}
-	if !strings.Contains(text, "user: bob") {
-		t.Errorf("unmanaged flow-map sibling must survive a preserving fallback write:\n%s", text)
-	}
-	if !strings.Contains(text, "disable-event-flush: true") {
-		t.Errorf("flow-map disable-event-flush must survive a preserving fallback write:\n%s", text)
+	want := strings.Join([]string{
+		`sync.remote: "git+x"`,
+		"types.custom: a,b",
+		"dolt:",
+		"  mode: embedded",
+		"  disable-event-flush: true",
+		"  user: bob",
+		"dolt.auto-start: false",
+		"export.auto: false",
+		"backup.enabled: false",
+		"",
+	}, "\n")
+	if string(data) != want {
+		t.Errorf("preserving fallback write must produce exactly one coherent dolt block:\ngot:\n%s\nwant:\n%s", data, want)
 	}
 	if mode, ok, err := ReadScopeDoltMode(fs, path); err != nil || !ok || mode != "embedded" {
 		t.Errorf("ReadScopeDoltMode() = (%q, %v, %v), want embedded", mode, ok, err)
@@ -2308,7 +2315,8 @@ func TestEnsureCanonicalConfigFallbackPreservesFlowMapDoltSectionOnPreserve(t *t
 
 // An owned-mode fallback write removes ONLY the nested mode from a flow-map
 // `dolt:` section: siblings survive and the flow-carried disable-event-flush
-// is honored rather than defaulted.
+// is honored rather than defaulted. The exact output shape is pinned — a
+// duplicated (or contradictory) dolt block from the expansion is a failure.
 func TestEnsureCanonicalConfigFallbackOwnedModeRemovesOnlyNestedModeFromFlowMap(t *testing.T) {
 	fs := fsys.OSFS{}
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -2326,18 +2334,20 @@ func TestEnsureCanonicalConfigFallbackOwnedModeRemovesOnlyNestedModeFromFlowMap(
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := string(data)
-	if !strings.Contains(text, "dolt.mode: server") {
-		t.Errorf("owned mode must be written flat:\n%s", text)
-	}
-	if strings.Contains(text, "mode: embedded") {
-		t.Errorf("nested flow-map mode must not survive an owned-mode fallback write:\n%s", text)
-	}
-	if !strings.Contains(text, "user: bob") {
-		t.Errorf("unmanaged flow-map sibling must survive an owned-mode fallback write:\n%s", text)
-	}
-	if !strings.Contains(text, "disable-event-flush: false") {
-		t.Errorf("flow-carried disable-event-flush must be honored, not defaulted:\n%s", text)
+	want := strings.Join([]string{
+		`sync.remote: "git+x"`,
+		"types.custom: a,b",
+		"dolt:",
+		"  disable-event-flush: false",
+		"  user: bob",
+		"dolt.auto-start: false",
+		"export.auto: false",
+		"backup.enabled: false",
+		"dolt.mode: server",
+		"",
+	}, "\n")
+	if string(data) != want {
+		t.Errorf("owned-mode fallback write must produce exactly one coherent dolt block:\ngot:\n%s\nwant:\n%s", data, want)
 	}
 	if mode, ok, err := ReadScopeDoltMode(fs, path); err != nil || !ok || mode != "server" {
 		t.Errorf("ReadScopeDoltMode() = (%q, %v, %v), want server", mode, ok, err)
