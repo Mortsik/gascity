@@ -2217,3 +2217,129 @@ func TestEnsureCanonicalConfigFallbackPreserveAlignsContradictingFlatMode(t *tes
 		t.Errorf("ReadScopeDoltMode() = (%q, %v, %v), want embedded", mode, ok, err)
 	}
 }
+
+// The line-based nested scan must see entries inside a flow-map section
+// header (`dolt: {mode: embedded}`) — bd's native shape — not only block
+// sections. A scalar section value still opens nothing.
+func TestScanNestedConfigLineValueFromDataReadsFlowMapSection(t *testing.T) {
+	flow := "issue_prefix: af\ndolt: {mode: embedded, disable-event-flush: false}\n"
+	if value, ok := scanNestedConfigLineValueFromData([]byte(flow), "dolt", "mode"); !ok || value != "embedded" {
+		t.Errorf("flow-map mode scan = (%q, %v), want embedded", value, ok)
+	}
+	if value, ok := scanNestedConfigLineValueFromData([]byte(flow), "dolt", "disable-event-flush"); !ok || value != "false" {
+		t.Errorf("flow-map disable-event-flush scan = (%q, %v), want false", value, ok)
+	}
+	if _, ok := scanNestedConfigLineValueFromData([]byte(flow), "dolt", "absent"); ok {
+		t.Error("flow-map scan found a key the mapping does not carry")
+	}
+	scalar := "issue_prefix: af\ndolt: server\n"
+	if _, ok := scanNestedConfigLineValueFromData([]byte(scalar), "dolt", "mode"); ok {
+		t.Error("scalar section value must not open a nested section")
+	}
+	block := "issue_prefix: af\ndolt:\n  mode: embedded\n"
+	if value, ok := scanNestedConfigLineValueFromData([]byte(block), "dolt", "mode"); !ok || value != "embedded" {
+		t.Errorf("block-section scan = (%q, %v), want embedded", value, ok)
+	}
+}
+
+// A flow-map `dolt:` section on malformed YAML must still be read: the scan
+// fallback honors an explicit disable-event-flush carried in flow form
+// instead of defaulting it to true.
+func TestReadDoltConfigReadsFlowMapDoltSectionOnMalformedYAML(t *testing.T) {
+	fs := fsys.OSFS{}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	input := strings.Join([]string{
+		"issue_prefix: zz",
+		"dolt: {mode: embedded, disable-event-flush: false}",
+		": not yaml",
+		"",
+	}, "\n")
+	if err := fs.WriteFile(path, []byte(input), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok, err := ReadDoltConfig(fs, path)
+	if err != nil {
+		t.Fatalf("ReadDoltConfig() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("ReadDoltConfig() ok = false, want true")
+	}
+	if got.DisableEventFlush == nil || *got.DisableEventFlush {
+		t.Fatalf("ReadDoltConfig().DisableEventFlush = %v, want explicit false", got.DisableEventFlush)
+	}
+}
+
+// The malformed-YAML fallback must not silently drop a flow-map `dolt:` section
+// on a preserving write: the nested mode bd itself writes survives (and keeps
+// ReadScopeDoltMode's answer), as do unmanaged sibling entries.
+func TestEnsureCanonicalConfigFallbackPreservesFlowMapDoltSectionOnPreserve(t *testing.T) {
+	fs := fsys.OSFS{}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	// The glued line routes this config through ensureCanonicalConfigFallback.
+	config := "sync.remote: \"git+x\"types.custom: a,b\ndolt: {mode: embedded, disable-event-flush: true, user: bob}\n"
+	if err := fs.WriteFile(path, []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := EnsureCanonicalConfig(fs, path, ConfigState{}); err != nil {
+		t.Fatalf("EnsureCanonicalConfig() error = %v", err)
+	}
+
+	data, err := fs.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "mode: embedded") {
+		t.Errorf("flow-map mode must survive a preserving fallback write:\n%s", text)
+	}
+	if !strings.Contains(text, "user: bob") {
+		t.Errorf("unmanaged flow-map sibling must survive a preserving fallback write:\n%s", text)
+	}
+	if !strings.Contains(text, "disable-event-flush: true") {
+		t.Errorf("flow-map disable-event-flush must survive a preserving fallback write:\n%s", text)
+	}
+	if mode, ok, err := ReadScopeDoltMode(fs, path); err != nil || !ok || mode != "embedded" {
+		t.Errorf("ReadScopeDoltMode() = (%q, %v, %v), want embedded", mode, ok, err)
+	}
+}
+
+// An owned-mode fallback write removes ONLY the nested mode from a flow-map
+// `dolt:` section: siblings survive and the flow-carried disable-event-flush
+// is honored rather than defaulted.
+func TestEnsureCanonicalConfigFallbackOwnedModeRemovesOnlyNestedModeFromFlowMap(t *testing.T) {
+	fs := fsys.OSFS{}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	// The glued line routes this config through ensureCanonicalConfigFallback.
+	config := "sync.remote: \"git+x\"types.custom: a,b\ndolt: {mode: embedded, disable-event-flush: false, user: bob}\n"
+	if err := fs.WriteFile(path, []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := EnsureCanonicalConfig(fs, path, ConfigState{DoltMode: "server"}); err != nil {
+		t.Fatalf("EnsureCanonicalConfig() error = %v", err)
+	}
+
+	data, err := fs.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "dolt.mode: server") {
+		t.Errorf("owned mode must be written flat:\n%s", text)
+	}
+	if strings.Contains(text, "mode: embedded") {
+		t.Errorf("nested flow-map mode must not survive an owned-mode fallback write:\n%s", text)
+	}
+	if !strings.Contains(text, "user: bob") {
+		t.Errorf("unmanaged flow-map sibling must survive an owned-mode fallback write:\n%s", text)
+	}
+	if !strings.Contains(text, "disable-event-flush: false") {
+		t.Errorf("flow-carried disable-event-flush must be honored, not defaulted:\n%s", text)
+	}
+	if mode, ok, err := ReadScopeDoltMode(fs, path); err != nil || !ok || mode != "server" {
+		t.Errorf("ReadScopeDoltMode() = (%q, %v, %v), want server", mode, ok, err)
+	}
+}

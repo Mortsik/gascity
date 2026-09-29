@@ -1010,6 +1010,15 @@ func scanNestedConfigLineValueFromData(data []byte, section string, keys ...stri
 		if strings.TrimLeft(line, " \t") == line {
 			key, value, ok := topLevelConfigLine(line)
 			inSection = ok && key == section && value == ""
+			if ok && key == section && value != "" {
+				// A flow-map section header (`dolt: {mode: embedded}`) carries
+				// its entries on the header line; the block walk below can
+				// never see them, so look there directly. The main yaml.Node
+				// path reads the same entries as a MappingNode.
+				if found, ok := scanFlowMappingValue(value, keys...); ok {
+					return found, true
+				}
+			}
 			continue
 		}
 		if !inSection {
@@ -1031,6 +1040,196 @@ func scanNestedConfigLineValueFromData(data []byte, section string, keys ...stri
 		}
 	}
 	return "", false
+}
+
+// scanFlowMappingValue returns the value of the first requested key found in a
+// flow-mapping value ("{mode: embedded, user: bob}"), in document order.
+// ok=false when the value is not a flow mapping or no requested key appears
+// in it; empty entry values never match, mirroring the block-section walk.
+func scanFlowMappingValue(value string, keys ...string) (string, bool) {
+	entries, ok := flowMappingEntries(value)
+	if !ok {
+		return "", false
+	}
+	for _, entry := range entries {
+		for _, want := range keys {
+			if entry[0] == want && entry[1] != "" {
+				return entry[1], true
+			}
+		}
+	}
+	return "", false
+}
+
+// expandFlowMapSectionHeader converts a flow-map section header
+// (`dolt: {mode: embedded, user: bob}`) into its block equivalent (`dolt:`
+// plus indented entries) so the line-based fallback can reconcile entries in
+// place instead of dropping the whole mapping. ok=false when the header value
+// is empty or not a flow mapping — those callers keep their previous shape.
+func expandFlowMapSectionHeader(line string) ([]string, bool) {
+	key, value, ok := topLevelConfigLine(line)
+	if !ok || value == "" {
+		return nil, false
+	}
+	entries, ok := flowMappingEntries(value)
+	if !ok {
+		return nil, false
+	}
+	out := make([]string, 0, len(entries)+1)
+	out = append(out, key+":")
+	for _, entry := range entries {
+		if entry[1] == "" {
+			out = append(out, "  "+entry[0]+":")
+			continue
+		}
+		out = append(out, "  "+entry[0]+": "+entry[1])
+	}
+	return out, true
+}
+
+// flowMappingEntries parses a YAML flow mapping value into its ordered
+// key/value pairs, tolerating quoted values that contain commas or colons and
+// nested mappings. Keys are unquoted; values are kept verbatim. ok=false for
+// anything that is not a complete flow mapping — a scalar section value
+// parses nothing and callers fall back to their non-mapping handling.
+func flowMappingEntries(value string) ([][2]string, bool) {
+	trimmed := strings.TrimSpace(value)
+	if len(trimmed) < 2 || trimmed[0] != '{' {
+		return nil, false
+	}
+	end := flowMappingClose(trimmed)
+	if end < 0 {
+		return nil, false
+	}
+	if rest := strings.TrimSpace(trimmed[end+1:]); rest != "" && !strings.HasPrefix(rest, "#") {
+		return nil, false
+	}
+	parts := splitFlowMappingParts(trimmed[1:end])
+	entries := make([][2]string, 0, len(parts))
+	for _, part := range parts {
+		trimmedPart := strings.TrimSpace(part)
+		if trimmedPart == "" {
+			continue
+		}
+		key, entryValue, ok := cutFlowMappingEntry(trimmedPart)
+		if !ok {
+			return nil, false
+		}
+		entries = append(entries, [2]string{key, entryValue})
+	}
+	return entries, true
+}
+
+// flowMappingClose returns the index of the '}' matching trimmed[0], or -1
+// when the braces do not balance. Quoted spans and nested braces are skipped.
+func flowMappingClose(trimmed string) int {
+	depth := 0
+	var quote rune
+	escaped := false
+	for i, r := range trimmed {
+		if !skipFlowChar(&quote, &escaped, r) {
+			continue
+		}
+		switch r {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// skipFlowChar advances the shared flow-scanner state across quoted spans and
+// returns false for characters inside them (and for the quote delimiters
+// themselves), true for structural characters.
+func skipFlowChar(quote *rune, escaped *bool, r rune) bool {
+	if *quote != 0 {
+		if *escaped {
+			*escaped = false
+			return false
+		}
+		if r == '\\' {
+			*escaped = true
+			return false
+		}
+		if r == *quote {
+			*quote = 0
+		}
+		return false
+	}
+	switch r {
+	case '\'', '"':
+		*quote = r
+		return false
+	}
+	return true
+}
+
+// splitFlowMappingParts splits a flow-mapping body at top-level commas,
+// ignoring commas inside quotes or nested braces/brackets.
+func splitFlowMappingParts(body string) []string {
+	var parts []string
+	depth := 0
+	var quote rune
+	escaped := false
+	start := 0
+	for i, r := range body {
+		if !skipFlowChar(&quote, &escaped, r) {
+			continue
+		}
+		switch r {
+		case '{', '[':
+			depth++
+		case '}', ']':
+			depth--
+		case ',':
+			if depth == 0 {
+				parts = append(parts, body[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(parts, body[start:])
+}
+
+// cutFlowMappingEntry splits one flow-mapping entry at its first top-level
+// colon. Keys are unquoted and trimmed; values are trimmed and kept verbatim.
+// ok=false when the entry carries no top-level colon or its quotes do not
+// balance.
+func cutFlowMappingEntry(entry string) (string, string, bool) {
+	depth := 0
+	var quote rune
+	escaped := false
+	for i, r := range entry {
+		if !skipFlowChar(&quote, &escaped, r) {
+			continue
+		}
+		switch r {
+		case '{', '[':
+			depth++
+		case '}', ']':
+			depth--
+		case ':':
+			if depth == 0 {
+				key := strings.TrimSpace(entry[:i])
+				return unquoteYAMLKey(key), strings.TrimSpace(entry[i+1:]), key != ""
+			}
+		}
+	}
+	return "", "", false
+}
+
+func unquoteYAMLKey(key string) string {
+	if len(key) >= 2 {
+		if (key[0] == '"' && key[len(key)-1] == '"') || (key[0] == '\'' && key[len(key)-1] == '\'') {
+			return key[1 : len(key)-1]
+		}
+	}
+	return key
 }
 
 func readConfigStateFromData(data []byte) ConfigState {
@@ -1128,6 +1327,14 @@ func topLevelConfigLine(line string) (key, value string, ok bool) {
 	return strings.TrimSpace(key), strings.TrimSpace(value), true
 }
 
+// ensureFallbackNestedDoltDisableEventFlush reconciles the nested
+// `dolt:` section's disable-event-flush entry on the line-based fallback path.
+// A flow-map section header (`dolt: {mode: embedded, ...}`) is expanded into
+// its block equivalent first — replacing it with a bare `dolt:` would
+// silently drop the whole mapping (mode and sibling entries). Only a
+// non-mapping header value falls back to the bare opener: there is nothing
+// there to preserve. Mirrors removeFallbackNestedDoltMode's
+// last-`dolt:`-section-wins semantics.
 func ensureFallbackNestedDoltDisableEventFlush(lines []string, value bool) ([]string, bool) {
 	want := "  disable-event-flush: " + boolString(value)
 	sectionIndex := -1
@@ -1152,15 +1359,22 @@ func ensureFallbackNestedDoltDisableEventFlush(lines []string, value bool) ([]st
 	out := make([]string, 0, len(lines)+1)
 	out = append(out, lines[:sectionIndex]...)
 	changed := false
+	sectionBody := lines[sectionIndex+1 : sectionEnd]
 	if strings.TrimSpace(lines[sectionIndex]) != "dolt:" {
-		out = append(out, "dolt:")
-		changed = true
+		if expanded, ok := expandFlowMapSectionHeader(lines[sectionIndex]); ok {
+			out = append(out, expanded...)
+			sectionBody = expanded[1:]
+			changed = true
+		} else {
+			out = append(out, "dolt:")
+			changed = true
+		}
 	} else {
 		out = append(out, lines[sectionIndex])
 	}
 
 	seen := false
-	for _, line := range lines[sectionIndex+1 : sectionEnd] {
+	for _, line := range sectionBody {
 		key, ok := nestedConfigLineKey(line)
 		if ok && (key == "disable-event-flush" || key == "disable_event_flush") {
 			if seen {
