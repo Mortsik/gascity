@@ -1948,3 +1948,106 @@ func findAttemptByRef(t *testing.T, store beads.Store, _, stepRef string) beads.
 	}
 	return beads.Bead{}
 }
+
+// TestSpawnNextAttemptFailsLoudlyOnUnstampedControllerOwnedSpec pins
+// agent-forge-362ut option B: a retry rebuilt from a PRE-stamping frozen spec
+// (gc.original_kind=cleanup, no gc.run_target, control without
+// gc.execution_routed_to) must fail closed at the spawn boundary instead of
+// attaching an attempt no controller claim loop can ever pick up — the
+// umb8j/qa7mj unrouted births that sat ready until zombie-sweep closed them.
+// A stamped controller-owned spec still spawns, and a plain task spec without
+// a lane keeps the silent skip (incubated task attempts are legitimate).
+func TestSpawnNextAttemptFailsLoudlyOnUnstampedControllerOwnedSpec(t *testing.T) {
+	newControl := func(t *testing.T, store beads.Store, spec *formula.Step) (root, control beads.Bead) {
+		t.Helper()
+		specJSON, err := json.Marshal(spec)
+		if err != nil {
+			t.Fatalf("marshal frozen step spec: %v", err)
+		}
+		root = mustCreate(t, store, beads.Bead{
+			Title:    "workflow",
+			Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindWorkflow},
+		})
+		control = mustCreate(t, store, beads.Bead{
+			Title: "cleanup control",
+			Metadata: map[string]string{
+				beadmeta.KindMetadataKey:           beadmeta.KindRetry,
+				beadmeta.RootBeadIDMetadataKey:     root.ID,
+				beadmeta.StepRefMetadataKey:        "mol-stale.cleanup",
+				beadmeta.StepIDMetadataKey:         spec.ID,
+				beadmeta.SourceStepSpecMetadataKey: string(specJSON),
+				beadmeta.ControlEpochMetadataKey:   "1",
+			},
+		})
+		return root, control
+	}
+
+	t.Run("unstamped controller-owned spec fails closed", func(t *testing.T) {
+		store := beads.NewMemStore()
+		spec := &formula.Step{
+			ID:          "cleanup",
+			Title:       "Teardown",
+			Description: "teardown lane",
+			Type:        "task",
+			Metadata: map[string]string{
+				beadmeta.OriginalKindMetadataKey: beadmeta.KindCleanup,
+			},
+		}
+		root, control := newControl(t, store, spec)
+
+		err := spawnNextAttempt(t.Context(), store, control, 2, ProcessOptions{})
+		if err == nil {
+			t.Fatal("spawnNextAttempt: want terminal error for controller-owned step with an empty routing chain, got nil")
+		}
+		for _, want := range []string{"gc.original_kind", "cleanup", control.ID, "NOT spawned"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not mention %q", err.Error(), want)
+			}
+		}
+		if got := findAttemptByRef(t, store, root.ID, "mol-stale.cleanup.attempt.2"); got.ID != "" {
+			t.Fatalf("unstamped controller-owned attempt must not be attached, got bead %s", got.ID)
+		}
+	})
+
+	t.Run("stamped controller-owned spec still spawns", func(t *testing.T) {
+		store := beads.NewMemStore()
+		spec := &formula.Step{
+			ID:          "cleanup",
+			Title:       "Teardown",
+			Description: "teardown lane",
+			Type:        "task",
+			Metadata: map[string]string{
+				beadmeta.OriginalKindMetadataKey: beadmeta.KindCleanup,
+				beadmeta.RunTargetMetadataKey:   "core.control-dispatcher",
+			},
+		}
+		root, control := newControl(t, store, spec)
+
+		if err := spawnNextAttempt(t.Context(), store, control, 2, ProcessOptions{}); err != nil {
+			t.Fatalf("spawnNextAttempt stamped spec: %v", err)
+		}
+		got := findAttemptByRef(t, store, root.ID, "mol-stale.cleanup.attempt.2")
+		if got.ID == "" {
+			t.Fatal("stamped controller-owned attempt not attached")
+		}
+		if got.Metadata[beadmeta.RunTargetMetadataKey] != "core.control-dispatcher" {
+			t.Fatalf("gc.run_target = %q, want preserved from the stamped spec", got.Metadata[beadmeta.RunTargetMetadataKey])
+		}
+	})
+
+	t.Run("plain task spec without a lane still skips silently", func(t *testing.T) {
+		store := beads.NewMemStore()
+		spec := &formula.Step{
+			ID:          "work",
+			Title:       "Work",
+			Description: "worker lane",
+			Type:        "task",
+			Metadata:    map[string]string{},
+		}
+		_, control := newControl(t, store, spec)
+
+		if err := spawnNextAttempt(t.Context(), store, control, 2, ProcessOptions{}); err != nil {
+			t.Fatalf("spawnNextAttempt plain unlanned task: want silent skip, got %v", err)
+		}
+	})
+}

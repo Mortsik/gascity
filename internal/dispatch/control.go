@@ -714,6 +714,24 @@ func spawnNextAttempt(ctx context.Context, store beads.Store, control beads.Bead
 			continue
 		}
 		if target == "" {
+			// A controller-owned landing step (the frozen spec carries its
+			// origin as gc.original_kind cleanup / workflow-finalize — the
+			// merge+cleanup family the integration controller owns;
+			// buildAttemptRecipe re-kinds the attempt root as a task, so
+			// KindMetadataKey alone cannot see it) with an EMPTY routing chain
+			// is a defect in the molecule's frozen snapshot, not a transient
+			// blip: pre-stamping lane specs birthed unrouted attempts that sat
+			// ready until zombie-sweep closed them (agent-forge-362ut,
+			// umb8j/qa7mj). Fail closed at the spawn boundary instead of
+			// attaching an attempt no controller claim loop can ever pick up.
+			// Plain work steps keep the silent skip: incubated task attempts
+			// without a lane are legitimate.
+			if originalKind := strings.TrimSpace(recipe.Steps[i].Metadata[beadmeta.OriginalKindMetadataKey]); originalKind == beadmeta.KindCleanup || originalKind == beadmeta.KindWorkflowFinalize {
+				return fmt.Errorf(
+					"spawn attempt %s (control %s): controller-owned step (gc.original_kind=%q) resolves to an empty routing target (run_target → routed_to → assignee → execution_routed_to all empty) — the frozen spec snapshot is unstamped; attempt NOT spawned",
+					recipe.Steps[i].ID, control.ID, originalKind,
+				)
+			}
 			continue
 		}
 		applyAttemptStepRoute(&recipe.Steps[i], target, routeCfg, store)
