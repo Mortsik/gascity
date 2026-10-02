@@ -659,6 +659,19 @@ func spawnNextAttempt(ctx context.Context, store beads.Store, control beads.Bead
 
 	recipe := buildAttemptRecipe(&step, control, attemptNum)
 
+	// The controller-owned landing signal for the empty-target guard below.
+	// The authoritative source is the CONTROL's gc.original_kind (formula's
+	// retry expansion stamps it when the control is minted from a kinded
+	// step — internal/formula/retry.go); the frozen spec's own gc.kind is the
+	// complementary source, read from the deserialized step because the spec
+	// bead never carries gc.original_kind and buildAttemptRecipe above has
+	// already re-kinded the attempt root as a task. Pre-tsx8 kindless specs
+	// carry neither signal and cannot be discriminated from plain work.
+	landingKind := strings.TrimSpace(control.Metadata[beadmeta.OriginalKindMetadataKey])
+	if !controllerLandingKind(landingKind) {
+		landingKind = strings.TrimSpace(step.Metadata[beadmeta.KindMetadataKey])
+	}
+
 	// Attach bypasses graph compile routing, so spawned attempts need their
 	// execution lane restored manually. Prefer each step's explicit target when
 	// available, and only inherit the parent execution lane as a fallback.
@@ -714,22 +727,19 @@ func spawnNextAttempt(ctx context.Context, store beads.Store, control beads.Bead
 			continue
 		}
 		if target == "" {
-			// A controller-owned landing step (the frozen spec carries its
-			// origin as gc.original_kind cleanup / workflow-finalize — the
-			// merge+cleanup family the integration controller owns;
-			// buildAttemptRecipe re-kinds the attempt root as a task, so
-			// KindMetadataKey alone cannot see it) with an EMPTY routing chain
-			// is a defect in the molecule's frozen snapshot, not a transient
-			// blip: pre-stamping lane specs birthed unrouted attempts that sat
-			// ready until zombie-sweep closed them (agent-forge-362ut,
+			// A controller-owned landing step with an EMPTY routing chain is
+			// a defect in the molecule's frozen snapshot, not a transient
+			// blip: pre-stamping lane specs birthed unrouted attempts that
+			// sat ready until zombie-sweep closed them (agent-forge-362ut,
 			// umb8j/qa7mj). Fail closed at the spawn boundary instead of
 			// attaching an attempt no controller claim loop can ever pick up.
-			// Plain work steps keep the silent skip: incubated task attempts
+			// Pre-tsx8 kindless specs carry no landing signal and keep the
+			// silent skip, as do plain work steps: incubated task attempts
 			// without a lane are legitimate.
-			if originalKind := strings.TrimSpace(recipe.Steps[i].Metadata[beadmeta.OriginalKindMetadataKey]); originalKind == beadmeta.KindCleanup || originalKind == beadmeta.KindWorkflowFinalize {
+			if controllerLandingKind(landingKind) {
 				return fmt.Errorf(
-					"spawn attempt %s (control %s): controller-owned step (gc.original_kind=%q) resolves to an empty routing target (run_target → routed_to → assignee → execution_routed_to all empty) — the frozen spec snapshot is unstamped; attempt NOT spawned",
-					recipe.Steps[i].ID, control.ID, originalKind,
+					"spawn attempt %s (control %s): controller-owned landing step (gc.original_kind/gc.kind=%q) resolves to an empty routing target (run_target → routed_to → assignee → execution_routed_to all empty) — the frozen spec snapshot is unstamped; attempt NOT spawned",
+					recipe.Steps[i].ID, control.ID, landingKind,
 				)
 			}
 			continue
@@ -1427,6 +1437,16 @@ func controlDispatcherTargetForExecutionTarget(executionTarget, rigContext strin
 // Pinned to the authoritative set by TestIsAttemptControlKindMatchesControlKinds.
 func isAttemptControlKind(kind string) bool {
 	return beadmeta.IsControlKind(kind)
+}
+
+// controllerLandingKind reports whether kind names a controller-owned landing
+// step of the integration-controller family. It is deliberately an explicit
+// pair, not beadmeta.IsControlKind: ControlKinds is the ProcessControl switch
+// set and excludes cleanup, while "merge" does not exist as a gc.kind value at
+// all (merge steps compile to workflow-finalize, which ControlKinds does
+// cover — the pair keeps both halves readable at the guard site).
+func controllerLandingKind(kind string) bool {
+	return kind == beadmeta.KindCleanup || kind == beadmeta.KindWorkflowFinalize
 }
 
 // latestAttemptCandidateIsControlInfrastructure reports whether a bead kind

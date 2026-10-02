@@ -1951,14 +1951,18 @@ func findAttemptByRef(t *testing.T, store beads.Store, _, stepRef string) beads.
 
 // TestSpawnNextAttemptFailsLoudlyOnUnstampedControllerOwnedSpec pins
 // agent-forge-362ut option B: a retry rebuilt from a PRE-stamping frozen spec
-// (gc.original_kind=cleanup, no gc.run_target, control without
-// gc.execution_routed_to) must fail closed at the spawn boundary instead of
-// attaching an attempt no controller claim loop can ever pick up — the
-// umb8j/qa7mj unrouted births that sat ready until zombie-sweep closed them.
-// A stamped controller-owned spec still spawns, and a plain task spec without
-// a lane keeps the silent skip (incubated task attempts are legitimate).
+// must fail closed at the spawn boundary instead of attaching an attempt no
+// controller claim loop can ever pick up — the umb8j/qa7mj unrouted births
+// that sat ready until zombie-sweep closed them.
+//
+// The shapes here are the REAL persisted ones: the frozen spec sidecar is
+// json.Marshal of the source step, so it carries gc.kind but never
+// gc.original_kind; the control bead is where formula's retry expansion
+// stamps gc.original_kind (internal/formula/retry.go). A stamped
+// controller-owned spec still spawns, and kindless specs (pre-tsx8, and plain
+// work) keep the silent skip — the guard has no signal to discriminate them.
 func TestSpawnNextAttemptFailsLoudlyOnUnstampedControllerOwnedSpec(t *testing.T) {
-	newControl := func(t *testing.T, store beads.Store, spec *formula.Step) (root, control beads.Bead) {
+	newControl := func(t *testing.T, store beads.Store, spec *formula.Step, controlOriginalKind string) (root, control beads.Bead) {
 		t.Helper()
 		specJSON, err := json.Marshal(spec)
 		if err != nil {
@@ -1968,32 +1972,38 @@ func TestSpawnNextAttemptFailsLoudlyOnUnstampedControllerOwnedSpec(t *testing.T)
 			Title:    "workflow",
 			Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindWorkflow},
 		})
+		controlMeta := map[string]string{
+			beadmeta.KindMetadataKey:           beadmeta.KindRetry,
+			beadmeta.RootBeadIDMetadataKey:     root.ID,
+			beadmeta.StepRefMetadataKey:        "mol-stale." + spec.ID,
+			beadmeta.StepIDMetadataKey:         spec.ID,
+			beadmeta.SourceStepSpecMetadataKey: string(specJSON),
+			beadmeta.ControlEpochMetadataKey:   "1",
+		}
+		if controlOriginalKind != "" {
+			controlMeta[beadmeta.OriginalKindMetadataKey] = controlOriginalKind
+		}
 		control = mustCreate(t, store, beads.Bead{
-			Title: "cleanup control",
-			Metadata: map[string]string{
-				beadmeta.KindMetadataKey:           beadmeta.KindRetry,
-				beadmeta.RootBeadIDMetadataKey:     root.ID,
-				beadmeta.StepRefMetadataKey:        "mol-stale.cleanup",
-				beadmeta.StepIDMetadataKey:         spec.ID,
-				beadmeta.SourceStepSpecMetadataKey: string(specJSON),
-				beadmeta.ControlEpochMetadataKey:   "1",
-			},
+			Title:    spec.ID + " control",
+			Metadata: controlMeta,
 		})
 		return root, control
 	}
 
-	t.Run("unstamped controller-owned spec fails closed", func(t *testing.T) {
+	t.Run("post-tsx8 cleanup control fails closed", func(t *testing.T) {
 		store := beads.NewMemStore()
+		// Real post-tsx8 shape: kinded cleanup step frozen unstamped (no
+		// gc.run_target), control carrying gc.original_kind=cleanup.
 		spec := &formula.Step{
 			ID:          "cleanup",
 			Title:       "Teardown",
 			Description: "teardown lane",
 			Type:        "task",
 			Metadata: map[string]string{
-				beadmeta.OriginalKindMetadataKey: beadmeta.KindCleanup,
+				beadmeta.KindMetadataKey: beadmeta.KindCleanup,
 			},
 		}
-		root, control := newControl(t, store, spec)
+		root, control := newControl(t, store, spec, beadmeta.KindCleanup)
 
 		err := spawnNextAttempt(t.Context(), store, control, 2, ProcessOptions{})
 		if err == nil {
@@ -2009,6 +2019,33 @@ func TestSpawnNextAttemptFailsLoudlyOnUnstampedControllerOwnedSpec(t *testing.T)
 		}
 	})
 
+	t.Run("spec gc.kind alone fails closed", func(t *testing.T) {
+		store := beads.NewMemStore()
+		// Complementary signal source: control without gc.original_kind
+		// (e.g. minted before the retry-expansion stamp), spec still kinded.
+		spec := &formula.Step{
+			ID:          "finalize",
+			Title:       "Finalize",
+			Description: "finalize lane",
+			Type:        "task",
+			Metadata: map[string]string{
+				beadmeta.KindMetadataKey: beadmeta.KindWorkflowFinalize,
+			},
+		}
+		root, control := newControl(t, store, spec, "")
+
+		err := spawnNextAttempt(t.Context(), store, control, 2, ProcessOptions{})
+		if err == nil {
+			t.Fatal("spawnNextAttempt: want terminal error for kinded spec with an empty routing chain, got nil")
+		}
+		if !strings.Contains(err.Error(), beadmeta.KindWorkflowFinalize) {
+			t.Errorf("error %q does not mention the landing kind %q", err.Error(), beadmeta.KindWorkflowFinalize)
+		}
+		if got := findAttemptByRef(t, store, root.ID, "mol-stale.finalize.attempt.2"); got.ID != "" {
+			t.Fatalf("unstamped controller-owned attempt must not be attached, got bead %s", got.ID)
+		}
+	})
+
 	t.Run("stamped controller-owned spec still spawns", func(t *testing.T) {
 		store := beads.NewMemStore()
 		spec := &formula.Step{
@@ -2017,11 +2054,11 @@ func TestSpawnNextAttemptFailsLoudlyOnUnstampedControllerOwnedSpec(t *testing.T)
 			Description: "teardown lane",
 			Type:        "task",
 			Metadata: map[string]string{
-				beadmeta.OriginalKindMetadataKey: beadmeta.KindCleanup,
-				beadmeta.RunTargetMetadataKey:   "core.control-dispatcher",
+				beadmeta.KindMetadataKey:     beadmeta.KindCleanup,
+				beadmeta.RunTargetMetadataKey: "core.control-dispatcher",
 			},
 		}
-		root, control := newControl(t, store, spec)
+		root, control := newControl(t, store, spec, beadmeta.KindCleanup)
 
 		if err := spawnNextAttempt(t.Context(), store, control, 2, ProcessOptions{}); err != nil {
 			t.Fatalf("spawnNextAttempt stamped spec: %v", err)
@@ -2035,8 +2072,12 @@ func TestSpawnNextAttemptFailsLoudlyOnUnstampedControllerOwnedSpec(t *testing.T)
 		}
 	})
 
-	t.Run("plain task spec without a lane still skips silently", func(t *testing.T) {
+	t.Run("pre-tsx8 kindless spec stays a silent skip", func(t *testing.T) {
 		store := beads.NewMemStore()
+		// Documented limitation: a pre-tsx8 snapshot (e.g. 3gsf) carries no
+		// gc.kind on the spec and no gc.original_kind on the control, so the
+		// guard has no signal to tell it from legitimate laneless work. The
+		// silent skip is retained deliberately; heuristics were rejected.
 		spec := &formula.Step{
 			ID:          "work",
 			Title:       "Work",
@@ -2044,10 +2085,10 @@ func TestSpawnNextAttemptFailsLoudlyOnUnstampedControllerOwnedSpec(t *testing.T)
 			Type:        "task",
 			Metadata:    map[string]string{},
 		}
-		_, control := newControl(t, store, spec)
+		_, control := newControl(t, store, spec, "")
 
 		if err := spawnNextAttempt(t.Context(), store, control, 2, ProcessOptions{}); err != nil {
-			t.Fatalf("spawnNextAttempt plain unlanned task: want silent skip, got %v", err)
+			t.Fatalf("spawnNextAttempt kindless spec: want silent skip, got %v", err)
 		}
 	})
 }
