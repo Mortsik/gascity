@@ -1440,11 +1440,15 @@ func isAttemptControlKind(kind string) bool {
 }
 
 // controllerLandingKind reports whether kind names a controller-owned landing
-// step of the integration-controller family. It is deliberately an explicit
-// pair, not beadmeta.IsControlKind: ControlKinds is the ProcessControl switch
-// set and excludes cleanup, while "merge" does not exist as a gc.kind value at
-// all (merge steps compile to workflow-finalize, which ControlKinds does
-// cover — the pair keeps both halves readable at the guard site).
+// step of the integration-controller family: exactly cleanup and
+// workflow-finalize. It is deliberately an explicit pair, not
+// beadmeta.IsControlKind: ControlKinds is the ProcessControl switch set and
+// excludes cleanup (a structural graph-node kind, compiled into graphs but
+// never dispatched as a control bead), while workflow-finalize is the separate
+// graph-compile finalizer that fans in the graph's sink steps
+// (internal/formula/graph.go). Lane merge steps are plain tasks stamped with
+// gc.run_target and carry no gc.kind of their own, so a merge control carries
+// no landing signal and keeps the silent skip.
 func controllerLandingKind(kind string) bool {
 	return kind == beadmeta.KindCleanup || kind == beadmeta.KindWorkflowFinalize
 }

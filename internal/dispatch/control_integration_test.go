@@ -2046,6 +2046,35 @@ func TestSpawnNextAttemptFailsLoudlyOnUnstampedControllerOwnedSpec(t *testing.T)
 		}
 	})
 
+	t.Run("control gc.original_kind alone, kindless spec, fails closed", func(t *testing.T) {
+		store := beads.NewMemStore()
+		// Primary signal source standing alone: the control carries
+		// gc.original_kind=cleanup while the frozen spec carries no gc.kind at
+		// all. The guard must fire from the control metadata alone — no
+		// correlation with the spec-kind fallback.
+		spec := &formula.Step{
+			ID:          "cleanup",
+			Title:       "Teardown",
+			Description: "teardown lane",
+			Type:        "task",
+			Metadata:    map[string]string{},
+		}
+		root, control := newControl(t, store, spec, beadmeta.KindCleanup)
+
+		err := spawnNextAttempt(t.Context(), store, control, 2, ProcessOptions{})
+		if err == nil {
+			t.Fatal("spawnNextAttempt: want terminal error for controller-owned step with an empty routing chain, got nil")
+		}
+		for _, want := range []string{"gc.original_kind", beadmeta.KindCleanup, control.ID, "NOT spawned"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not mention %q", err.Error(), want)
+			}
+		}
+		if got := findAttemptByRef(t, store, root.ID, "mol-stale.cleanup.attempt.2"); got.ID != "" {
+			t.Fatalf("unstamped controller-owned attempt must not be attached, got bead %s", got.ID)
+		}
+	})
+
 	t.Run("stamped controller-owned spec still spawns", func(t *testing.T) {
 		store := beads.NewMemStore()
 		spec := &formula.Step{
@@ -2054,7 +2083,7 @@ func TestSpawnNextAttemptFailsLoudlyOnUnstampedControllerOwnedSpec(t *testing.T)
 			Description: "teardown lane",
 			Type:        "task",
 			Metadata: map[string]string{
-				beadmeta.KindMetadataKey:     beadmeta.KindCleanup,
+				beadmeta.KindMetadataKey:      beadmeta.KindCleanup,
 				beadmeta.RunTargetMetadataKey: "core.control-dispatcher",
 			},
 		}
