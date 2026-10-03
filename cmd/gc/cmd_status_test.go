@@ -16,7 +16,9 @@ import (
 	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/suspensionstate"
 	"github.com/gastownhall/gascity/internal/worker"
 )
 
@@ -155,6 +157,93 @@ func TestDoRigStatusSuspendedRig(t *testing.T) {
 	out := stdout.String()
 	if !strings.Contains(out, "Suspended:  yes") {
 		t.Errorf("stdout missing 'Suspended:  yes', got:\n%s", out)
+	}
+}
+
+// runDoRigStatusJSONAtCity runs the JSON rig-status path against an
+// explicit cityPath so tests can seed
+// <cityPath>/.gc/runtime/suspension-state.json with runtime overrides.
+func runDoRigStatusJSONAtCity(
+	sp runtime.Provider,
+	dops drainOps,
+	rig config.Rig,
+	agents []config.Agent,
+	cityPath string,
+	stdout, stderr io.Writer,
+) int {
+	return doRigStatusWithStoreAndSnapshot(sp, dops, rig, agents, cityPath, "city", "", nil, nil, newSessionBeadSnapshot(nil), true, stdout, stderr)
+}
+
+// TestDoRigStatusJSONSuspensionMatchesCanonicalState is the GC-REG-22
+// regression: renderRigStatusJSON used to copy rig.Suspended straight
+// from config, so --json disagreed with the text path whenever the rig
+// was suspended/resumed through the runtime
+// (.gc/runtime/suspension-state.json). JSON must render suspension from
+// the same canonical runtime state the text path loads.
+func TestDoRigStatusJSONSuspensionMatchesCanonicalState(t *testing.T) {
+	sp := runtime.NewFake()
+	dops := newFakeDrainOps()
+	agents := []config.Agent{
+		{Name: "worker", Dir: "frontend", MaxActiveSessions: intPtr(1)},
+	}
+	cityPath := filepath.Join(t.TempDir(), "city")
+	parseRigSuspended := func(t *testing.T, stdout *bytes.Buffer) bool {
+		t.Helper()
+		var result RigStatusJSON
+		if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+			t.Fatalf("invalid JSON: %v\nraw: %s", err, stdout.String())
+		}
+		return result.Rig.Suspended
+	}
+
+	// Explicit runtime suspend beats a not-suspended config.
+	suspend := true
+	if err := suspensionstate.SetRigSuspended(fsys.OSFS{}, cityPath, "frontend", &suspend); err != nil {
+		t.Fatalf("SetRigSuspended(suspend): %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	rig := config.Rig{Name: "frontend", Path: "/tmp/frontend"}
+	if code := runDoRigStatusJSONAtCity(sp, dops, rig, agents, cityPath, &stdout, &stderr); code != 0 {
+		t.Fatalf("json code = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !parseRigSuspended(t, &stdout) {
+		t.Error("JSON rig.suspended = false, want true: explicit runtime suspend must beat config not-suspended")
+	}
+
+	// An explicit runtime resume beats suspended_on_start=true.
+	resume := false
+	if err := suspensionstate.SetRigSuspended(fsys.OSFS{}, cityPath, "frontend", &resume); err != nil {
+		t.Fatalf("SetRigSuspended(resume): %v", err)
+	}
+	stdout.Reset()
+	rig = config.Rig{Name: "frontend", Path: "/tmp/frontend", SuspendedOnStart: true}
+	if code := runDoRigStatusJSONAtCity(sp, dops, rig, agents, cityPath, &stdout, &stderr); code != 0 {
+		t.Fatalf("json code = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if parseRigSuspended(t, &stdout) {
+		t.Error("JSON rig.suspended = true, want false: explicit runtime resume must beat suspended_on_start=true")
+	}
+
+	// Missing runtime state defers to suspended_on_start — the same
+	// EffectiveRigSuspended merge the text path performs, no third state.
+	if err := os.Remove(filepath.Join(cityPath, ".gc", "runtime", "suspension-state.json")); err != nil {
+		t.Fatalf("remove suspension-state.json: %v", err)
+	}
+	stdout.Reset()
+	if code := runDoRigStatusJSONAtCity(sp, dops, rig, agents, cityPath, &stdout, &stderr); code != 0 {
+		t.Fatalf("json code = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !parseRigSuspended(t, &stdout) {
+		t.Error("JSON rig.suspended = false, want true: missing runtime state must defer to suspended_on_start=true")
+	}
+
+	// The text path must agree with JSON in the same conditions.
+	var textStdout, textStderr bytes.Buffer
+	if code := doRigStatusWithStoreAndSnapshot(sp, dops, rig, agents, cityPath, "city", "", nil, nil, newSessionBeadSnapshot(nil), false, &textStdout, &textStderr); code != 0 {
+		t.Fatalf("text code = %d, want 0; stderr: %s", code, textStderr.String())
+	}
+	if !strings.Contains(textStdout.String(), "Suspended:  yes") {
+		t.Errorf("text path disagrees with JSON after runtime-state removal, got:\n%s", textStdout.String())
 	}
 }
 
