@@ -335,6 +335,11 @@ func renderRigStatusJSON(
 	statusSnapshot *sessionBeadSnapshot,
 	stdout, stderr io.Writer,
 ) int {
+	// Render suspension from the canonical runtime state — the same
+	// loadSuspensionState + EffectiveRigSuspended merge the text path
+	// uses — so --json and text never disagree after a runtime
+	// suspend/resume recorded in .gc/runtime/suspension-state.json.
+	suspState, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
 	result := RigStatusJSON{
 		SchemaVersion: "1",
 		CityPath:      cityPath,
@@ -344,7 +349,7 @@ func renderRigStatusJSON(
 			Path:          rig.Path,
 			Prefix:        rig.EffectivePrefix(),
 			DefaultBranch: rig.EffectiveDefaultBranch(),
-			Suspended:     rig.Suspended,
+			Suspended:     suspensionstate.EffectiveRigSuspended(suspState, rig.Name, rig.EffectiveSuspendedOnStart()),
 			Beads:         rigBeadsStatus(fsys.OSFS{}, rig.Path),
 		},
 	}
