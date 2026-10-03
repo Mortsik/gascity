@@ -351,6 +351,29 @@ func scanScopeDoltModeFromData(data []byte) (string, bool) {
 	return "", false
 }
 
+// ReadCustomTypesConfig reads the flat `types.custom` CSV key from a scope's
+// config.yaml — the same key bd itself falls back to when its DB config table
+// has no value for it (see ConfigState.CustomTypes). ok=false when the file or
+// the key is absent, or the value is empty. A config that fails to parse as
+// YAML is still answered by a line-wise scan, mirroring the tolerant read
+// shape EnsureCanonicalConfig uses for the same key.
+func ReadCustomTypesConfig(fs fsys.FS, path string) ([]string, bool, error) {
+	doc, err := readConfigDoc(fs, path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		data, readErr := fs.ReadFile(path)
+		if readErr != nil {
+			return nil, false, err
+		}
+		raw, ok := scanConfigLineValueFromData(data, "types.custom:")
+		return parseCustomTypesValue(raw), ok, nil
+	}
+	raw, ok := configStringValue(mappingRoot(doc), "types.custom")
+	return parseCustomTypesValue(raw), ok, nil
+}
+
 // removeNestedDoltMode deletes the nested `dolt: {mode:}` entry so the owned
 // flat dolt.mode cannot be contradicted — ReadScopeDoltMode prioritizes the
 // nested form. Other entries of the `dolt:` section (e.g.

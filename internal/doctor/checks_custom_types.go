@@ -12,6 +12,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/contract"
+	"github.com/gastownhall/gascity/internal/fsys"
 )
 
 // RequiredCustomTypes lists the bead types that Gas City requires
@@ -80,7 +81,7 @@ func (c *CustomTypesCheck) Run(_ *CheckContext) *CheckResult {
 	}
 
 	// Get current custom types from the CSV config.
-	current, err := getCustomTypes(c.Dir)
+	current, csvSource, err := readCustomTypes(c.Dir)
 	if err != nil {
 		r.Status = StatusWarning
 		r.Message = fmt.Sprintf("could not read types.custom: %v", err)
@@ -107,12 +108,23 @@ func (c *CustomTypesCheck) Run(_ *CheckContext) *CheckResult {
 	if len(c.missing) == 0 && len(c.tableMissing) == 0 {
 		r.Status = StatusOK
 		r.Message = fmt.Sprintf("all %d required types registered", len(RequiredCustomTypes))
+		if csvSource != "" {
+			r.Message += " (types.custom via config.yaml fallback; bd config key unset)"
+			r.Details = append(r.Details,
+				"types.custom source: config.yaml fallback ("+csvSource+") — bd config get reads only the",
+				"DB config table, which carries no types.custom key for this embedded-mode scope,",
+				"so the check fell back to the config.yaml key bd itself reads when the table is unset")
+		}
 		return r
 	}
 
 	var parts []string
 	if len(c.missing) != 0 {
-		parts = append(parts, fmt.Sprintf("missing %d custom type(s): %s", len(c.missing), strings.Join(c.missing, ", ")))
+		part := fmt.Sprintf("missing %d custom type(s): %s", len(c.missing), strings.Join(c.missing, ", "))
+		if csvSource != "" {
+			part += " (types.custom via config.yaml fallback: " + csvSource + ")"
+		}
+		parts = append(parts, part)
 	}
 	if len(c.tableMissing) != 0 {
 		parts = append(parts, fmt.Sprintf("%d type(s) not registered in custom_types table (validator will reject): %s", len(c.tableMissing), strings.Join(c.tableMissing, ", ")))
@@ -163,12 +175,63 @@ func (c *CustomTypesCheck) Fix(_ *CheckContext) error {
 	// Read the current list so we can preserve user-added types.
 	// If we cannot read it, return the error rather than overwriting —
 	// silently dropping user types is worse than failing loud.
-	current, err := getCustomTypes(c.Dir)
+	current, _, err := readCustomTypes(c.Dir)
 	if err != nil {
 		return fmt.Errorf("reading current custom types: %w", err)
 	}
 	merged := contract.MergeCustomTypes(current, RequiredCustomTypes)
 	return setCustomTypes(c.Dir, strings.Join(merged, ","))
+}
+
+// readCustomTypes reads the effective types.custom CSV for a bd store:
+// the per-call `bd config get` answer first, and — for embedded-mode
+// scopes whose DB config table carries no key — the config.yaml value bd
+// itself falls back to (GC-REG-23: `bd config get` answers only from the DB
+// config table, so an embedded scope with a complete config.yaml CSV and a
+// complete custom_types table used to render as "missing 13 custom types").
+//
+// The returned source is "" for the primary bd-config answer and a
+// human-readable description of the fallback basis when config.yaml was
+// consulted, so callers can surface which path produced the answer.
+func readCustomTypes(dir string) ([]string, string, error) {
+	current, err := getCustomTypes(dir)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(current) > 0 {
+		return current, "", nil
+	}
+	embedded, via := scopeEmbeddedDoltStore(dir)
+	if !embedded {
+		return current, "", nil
+	}
+	fromYAML, ok, readErr := contract.ReadCustomTypesConfig(fsys.OSFS{}, filepath.Join(dir, ".beads", "config.yaml"))
+	if readErr != nil || !ok {
+		// bd answered (empty); a missing or unreadable config.yaml key is
+		// simply an unset CSV — report the empty answer as-is.
+		return current, "", nil
+	}
+	return fromYAML, via, nil
+}
+
+// scopeEmbeddedDoltStore reports whether a scope's store resolves to the
+// embedded Dolt backend, and through which signal. Either signal suffices:
+// metadata.json's dolt_mode (what activeBDStoreFromMetadata and the
+// events/convoy native-store gate read) or the config.yaml dolt.mode the
+// scope pins for itself. The two disagree exactly on split stores — a rig
+// migrated off embedded keeps `dolt.mode: embedded` in config.yaml while its
+// metadata says server — and both populations need the per-call fallback, so
+// the classification is a union, deliberately wider than either reader alone.
+func scopeEmbeddedDoltStore(dir string) (bool, string) {
+	beadsDir := filepath.Join(dir, ".beads")
+	if _, store := activeBDStoreFromMetadata(filepath.Join(beadsDir, "metadata.json")); store == "embeddeddolt" {
+		return true, "metadata.json dolt_mode"
+	}
+	mode, ok, err := contract.ReadScopeDoltMode(fsys.OSFS{}, filepath.Join(beadsDir, "config.yaml"))
+	if err == nil && ok && (mode == "embedded" || mode == "local") {
+		return true, "config.yaml dolt.mode=" + mode
+	}
+	return false, ""
 }
 
 // getCustomTypes reads the current types.custom config from a bd store.

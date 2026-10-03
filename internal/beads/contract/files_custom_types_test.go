@@ -271,3 +271,70 @@ func TestMergeCustomTypes(t *testing.T) {
 		})
 	}
 }
+
+// TestReadCustomTypesConfig pins the reader the gc doctor custom-types check
+// uses as its embedded-mode fallback (GC-REG-23): `bd config get` answers only
+// from the DB config table, so a scope whose types.custom lives solely in
+// config.yaml — the key bd itself falls back to — must be readable straight
+// from the file.
+func TestReadCustomTypesConfig(t *testing.T) {
+	fs := fsys.OSFS{}
+	dir := t.TempDir()
+
+	t.Run("reads flat key and splits CSV", func(t *testing.T) {
+		path := filepath.Join(dir, "a.yaml")
+		if err := fs.WriteFile(path, []byte("issue_prefix: gc\ntypes.custom: alpha,beta, gamma\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		got, ok, err := ReadCustomTypesConfig(fs, path)
+		if err != nil || !ok {
+			t.Fatalf("ReadCustomTypesConfig() ok=%v err=%v, want ok=true err=nil", ok, err)
+		}
+		if strings.Join(got, ",") != "alpha,beta,gamma" {
+			t.Fatalf("types = %v, want [alpha beta gamma]", got)
+		}
+	})
+
+	t.Run("missing file reports absent without error", func(t *testing.T) {
+		got, ok, err := ReadCustomTypesConfig(fs, filepath.Join(dir, "absent.yaml"))
+		if err != nil || ok || got != nil {
+			t.Fatalf("ReadCustomTypesConfig(absent) = %v, %v, %v; want nil, false, nil", got, ok, err)
+		}
+	})
+
+	t.Run("missing or empty key reports absent", func(t *testing.T) {
+		path := filepath.Join(dir, "b.yaml")
+		if err := fs.WriteFile(path, []byte("issue_prefix: gc\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok, err := ReadCustomTypesConfig(fs, path); err != nil || ok {
+			t.Fatalf("key-less config: ok=%v err=%v, want ok=false err=nil", ok, err)
+		}
+
+		empty := filepath.Join(dir, "c.yaml")
+		if err := fs.WriteFile(empty, []byte("types.custom:\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok, err := ReadCustomTypesConfig(fs, empty); err != nil || ok {
+			t.Fatalf("empty value: ok=%v err=%v, want ok=false err=nil", ok, err)
+		}
+	})
+
+	t.Run("unparseable YAML still answers via line scan", func(t *testing.T) {
+		// bd init has emitted glued `key: value` lines that fail YAML parsing
+		// (see EnsureCanonicalConfig's fallback path); the reader must still
+		// answer from the raw line, not error out.
+		path := filepath.Join(dir, "d.yaml")
+		broken := "issue_prefix: gc\ntypes.custom: [unclosed\n"
+		if err := fs.WriteFile(path, []byte(broken), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		got, ok, err := ReadCustomTypesConfig(fs, path)
+		if err != nil {
+			t.Fatalf("ReadCustomTypesConfig(broken) err = %v, want nil", err)
+		}
+		if !ok || len(got) == 0 {
+			t.Fatalf("ReadCustomTypesConfig(broken) ok=%v got=%v, want the scanned value", ok, got)
+		}
+	})
+}

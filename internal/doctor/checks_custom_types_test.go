@@ -1,6 +1,8 @@
 package doctor
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -461,5 +463,251 @@ func TestCustomTypesCheck_RequiredTypesComplete(t *testing.T) {
 	}
 	for typ := range expected {
 		t.Errorf("missing required type: %q", typ)
+	}
+}
+
+// TestScopeEmbeddedDoltStoreClassification pins the GC-REG-23 scope
+// classification: either signal — metadata.json's dolt_mode (what the
+// events/convoy native-store gate reads) or the config.yaml dolt.mode the
+// scope pins for itself — makes a scope embedded for the custom-types
+// fallback, because the failing population (observed live 2026-10-03) is
+// split stores: rigs migrated off embedded keep `dolt.mode: embedded` in
+// config.yaml while their metadata already says server.
+func TestScopeEmbeddedDoltStoreClassification(t *testing.T) {
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeMetadata := func(mode string) {
+		t.Helper()
+		meta := fmt.Sprintf(`{"backend":"dolt","database":"dolt","dolt_mode":%q,"dolt_database":"db"}`, mode)
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(meta), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeConfig := func(body string) {
+		t.Helper()
+		if body == "" {
+			os.Remove(filepath.Join(beadsDir, "config.yaml"))
+			return
+		}
+		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cases := []struct {
+		name      string
+		metadata  string
+		config    string
+		wantEmbed bool
+	}{
+		{name: "metadata embedded", metadata: "embedded", config: "", wantEmbed: true},
+		{name: "metadata local", metadata: "local", config: "", wantEmbed: true},
+		{
+			// The live GC-REG-23 shape: metadata already migrated to server,
+			// config.yaml still pins dolt.mode: embedded.
+			name:      "split store config embedded metadata server",
+			metadata:  "server",
+			config:    "dolt.mode: embedded\n",
+			wantEmbed: true,
+		},
+		{
+			name:      "nested config embedded",
+			metadata:  "server",
+			config:    "dolt:\n  mode: embedded\n",
+			wantEmbed: true,
+		},
+		{name: "metadata server no config", metadata: "server", config: "", wantEmbed: false},
+		{name: "both server", metadata: "server", config: "dolt.mode: server\n", wantEmbed: false},
+		{name: "no signals", metadata: "", config: "", wantEmbed: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			writeMetadata(tc.metadata)
+			writeConfig(tc.config)
+			got, via := scopeEmbeddedDoltStore(dir)
+			if got != tc.wantEmbed {
+				t.Fatalf("scopeEmbeddedDoltStore(%s) = %v (via %q), want %v", tc.name, got, via, tc.wantEmbed)
+			}
+			if got && via == "" {
+				t.Fatal("embedded classification must name the signal it came from")
+			}
+			if !got && via != "" {
+				t.Fatalf("non-embedded scope must have empty via, got %q", via)
+			}
+		})
+	}
+}
+
+// fakeBDScope builds a scope directory whose .beads/ carries the given
+// metadata mode and config.yaml body, plus a fake `bd` first on PATH that
+// answers `config get --json types.custom` with an empty DB-config value and
+// `types --json` with the full required set — the exact answers real bd gives
+// for the GC-REG-23 stores (DB config table without the key, complete
+// custom_types table). It returns the scope dir.
+func fakeBDScope(t *testing.T, metadataMode, configBody string, tableTypes []string) string {
+	t.Helper()
+
+	dir := guardedTempDir(t)
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	meta := fmt.Sprintf(`{"backend":"dolt","database":"dolt","dolt_mode":%q,"dolt_database":"db"}`, metadataMode)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(meta), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if configBody != "" {
+		if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(configBody), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tableJSON, err := json.Marshal(tableTypes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"case \"$1 $2\" in\n" +
+		"  'config get') printf '{\"key\":\"types.custom\",\"schema_version\":1,\"value\":\"\"}\\n'; exit 0 ;;\n" +
+		"  'types --json') printf '{\"core_types\":[],\"custom_types\":" + string(tableJSON) + ",\"schema_version\":1}\\n'; exit 0 ;;\n" +
+		"esac\n" +
+		"echo \"fake bd: unexpected args: $*\" >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+	return dir
+}
+
+// TestCustomTypesCheck_EmbeddedConfigYAMLFallback proves the GC-REG-23 fix on
+// the live failure shape: a scope whose DB config table carries no
+// types.custom key (bd config get answers empty) but whose config.yaml pins
+// dolt.mode: embedded and a complete types.custom CSV must report OK via the
+// config.yaml fallback — never "missing 13 custom types" — while the
+// custom_types table stays the independently checked source of truth.
+func TestCustomTypesCheck_EmbeddedConfigYAMLFallback(t *testing.T) {
+	csv := strings.Join(RequiredCustomTypes, ",")
+	dir := fakeBDScope(t, "server", "dolt.mode: embedded\ntypes.custom: "+csv+"\n", RequiredCustomTypes)
+
+	c := NewCustomTypesCheck(dir, "rig")
+	r := c.Run(&CheckContext{CityPath: dir})
+	if r.Status != StatusOK {
+		t.Fatalf("Run status = %v, want OK; message=%q details=%v", r.Status, r.Message, r.Details)
+	}
+	if !strings.Contains(r.Message, "config.yaml fallback") {
+		t.Fatalf("message = %q, want it to name the config.yaml fallback", r.Message)
+	}
+	if len(c.missing) != 0 {
+		t.Fatalf("c.missing = %v, want empty", c.missing)
+	}
+}
+
+// TestCustomTypesCheck_EmbeddedFallbackReportsTrueGaps keeps the fallback
+// honest: an embedded-mode scope whose config.yaml CSV itself lacks a type is
+// reported with exactly that gap (missing 1: step), not with the full
+// 13-type absence the empty bd-config answer alone would imply.
+func TestCustomTypesCheck_EmbeddedFallbackReportsTrueGaps(t *testing.T) {
+	short := make([]string, 0, len(RequiredCustomTypes)-1)
+	for _, typ := range RequiredCustomTypes {
+		if typ != "step" {
+			short = append(short, typ)
+		}
+	}
+	// The custom_types table knows every required type, so only the CSV gap
+	// should surface.
+	dir := fakeBDScope(t, "embedded", "types.custom: "+strings.Join(short, ",")+"\n", RequiredCustomTypes)
+
+	c := NewCustomTypesCheck(dir, "rig")
+	r := c.Run(&CheckContext{CityPath: dir})
+	if r.Status != StatusError {
+		t.Fatalf("Run status = %v, want Error; message=%q", r.Status, r.Message)
+	}
+	if len(c.missing) != 1 || c.missing[0] != "step" {
+		t.Fatalf("c.missing = %v, want [step]", c.missing)
+	}
+	if strings.Contains(r.Message, fmt.Sprintf("missing %d custom", len(RequiredCustomTypes))) {
+		t.Fatalf("message reports the full %d-type absence, want the single true gap: %q", len(RequiredCustomTypes), r.Message)
+	}
+	if !strings.Contains(r.Message, "config.yaml fallback") {
+		t.Fatalf("message = %q, want it to name the config.yaml fallback", r.Message)
+	}
+}
+
+// TestCustomTypesCheck_ServerModeUnchanged pins the other half of the
+// GC-REG-23 contract: a server-mode scope (no embedded signal on either
+// metadata or config.yaml) with an unset DB-config key keeps the pre-fix
+// behavior — the empty answer is reported as missing types, because for
+// server scopes the DB config table IS where gc's lifecycle writes the key,
+// and the drift it signals is real and fixable.
+func TestCustomTypesCheck_ServerModeUnchanged(t *testing.T) {
+	// config.yaml without any dolt.mode, types.custom absent from the file.
+	dir := fakeBDScope(t, "server", "issue_prefix: rig\n", RequiredCustomTypes)
+
+	c := NewCustomTypesCheck(dir, "rig")
+	r := c.Run(&CheckContext{CityPath: dir})
+	if r.Status != StatusError {
+		t.Fatalf("Run status = %v, want Error; message=%q", r.Status, r.Message)
+	}
+	if len(c.missing) != len(RequiredCustomTypes) {
+		t.Fatalf("c.missing = %v, want all %d required types (server-mode drift is real)", c.missing, len(RequiredCustomTypes))
+	}
+	if strings.Contains(r.Message, "config.yaml fallback") {
+		t.Fatalf("message = %q, server-mode scopes must not use the fallback", r.Message)
+	}
+}
+
+// TestCustomTypesCheck_EmbeddedRealBDConfigYAMLOnly runs the check against a
+// real bd-initialized embedded store whose types.custom exists ONLY in
+// config.yaml (never `bd config set`): the store's custom_types table is
+// complete (bd materializes it from the yaml key), so the check must pass
+// through the fallback path. Skipped unless bd and dolt are on PATH, like
+// TestCustomTypesCheck_TableDrift.
+func TestCustomTypesCheck_EmbeddedRealBDConfigYAMLOnly(t *testing.T) {
+	if _, err := exec.LookPath("bd"); err != nil {
+		t.Skip("bd binary not on PATH")
+	}
+	if _, err := exec.LookPath("dolt"); err != nil {
+		t.Skip("dolt binary not on PATH")
+	}
+	for _, key := range []string{
+		"BEADS_DIR", "BEADS_ACTOR", "GC_BEADS_SCOPE_ROOT",
+		"GC_BEADS", "BEADS_DOLT_SERVER_PORT", "GC_DOLT_HOST", "GC_DOLT_PORT",
+		"BEADS_DOLT_SERVER_HOST", "BEADS_DOLT_SHARED_SERVER",
+		"BEADS_DOLT_SERVER_MODE", "BEADS_SHARED_SERVER_DIR",
+	} {
+		t.Setenv(key, "")
+	}
+	testOwnedHome(t)
+
+	dir := guardedTempDir(t)
+	initCmd := exec.Command("bd", "init", "--non-interactive", "-p", "tst3", "--skip-hooks", "--skip-agents")
+	initCmd.Dir = dir
+	if out, err := initCmd.CombinedOutput(); err != nil {
+		t.Fatalf("bd init: %v\n%s", err, out)
+	}
+
+	// types.custom ONLY in config.yaml — the embedded store shape GC-REG-23
+	// describes; no `bd config set` ever ran.
+	cfgPath := filepath.Join(dir, ".beads", "config.yaml")
+	f, err := os.OpenFile(cfgPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("types.custom: " + strings.Join(RequiredCustomTypes, ",") + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	c := NewCustomTypesCheck(dir, "rig")
+	r := c.Run(&CheckContext{CityPath: dir})
+	if r.Status != StatusOK {
+		t.Fatalf("Run status = %v, want OK; message=%q details=%v", r.Status, r.Message, r.Details)
+	}
+	if !strings.Contains(r.Message, "config.yaml fallback") {
+		t.Fatalf("message = %q, want it to name the config.yaml fallback", r.Message)
 	}
 }
