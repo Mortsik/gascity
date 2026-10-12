@@ -857,6 +857,17 @@ func normalizeWaitIdleNudgeSource(source string) string {
 	return source
 }
 
+// isClaudeProviderFamily matches the claude builtin family including its
+// per-provider derivatives (claude-glm, claude-haiku, …) — ProviderFamily's
+// default arm returns those verbatim, so a bare != "claude" comparison
+// silently withheld live wait-idle delivery from every derivative fleet.
+// 2026-10-12 city stall: claude-glm pool sessions never received the
+// post-turn claim nudge (finding k), text landing in the composer without a
+// submit while the queue drained into paste-only injections.
+func isClaudeProviderFamily(kind string) bool {
+	return kind == "claude" || strings.HasPrefix(kind, "claude-")
+}
+
 func (m *Manager) tryWaitIdleNudgeLocked(ctx context.Context, id string, b beads.Bead, source, sessName, message, resumeCommand string, hints runtime.Config) (bool, error) {
 	if transportFromMetadata(b) == "acp" {
 		if err := m.ensureRunning(ctx, id, b, sessName, resumeCommand, hints); err != nil {
@@ -870,7 +881,7 @@ func (m *Manager) tryWaitIdleNudgeLocked(ctx context.Context, id string, b beads
 	if err := m.ensureRunning(ctx, id, b, sessName, resumeCommand, hints); err != nil {
 		return false, err
 	}
-	if providerKind(b) != "claude" {
+	if !isClaudeProviderFamily(providerKind(b)) {
 		return false, nil
 	}
 	waiter, ok := m.sp.(runtime.IdleWaitProvider)
@@ -896,7 +907,7 @@ func (m *Manager) tryWaitIdleNudgeLiveOnlyLocked(ctx context.Context, b beads.Be
 		}
 		return true, nil
 	}
-	if providerKind(b) != "claude" {
+	if !isClaudeProviderFamily(providerKind(b)) {
 		return false, nil
 	}
 	waiter, ok := m.sp.(runtime.IdleWaitProvider)
