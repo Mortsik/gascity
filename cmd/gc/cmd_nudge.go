@@ -1567,6 +1567,17 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 	if !pollerSessionIdleEnough(target, sp, quiescence, obs) {
 		return false, nil
 	}
+	return deliverClaimedQueueNudges(target, store, sessStore, sp, worker.NudgeWakeLiveOnly)
+}
+
+// deliverClaimedQueueNudges is the claim-and-inject core shared by the live
+// poller path (wake=LiveOnly: never resume, only inject into a running
+// session) and the resume path below (wake="": manager.Send resumes a
+// non-running slot via ensureRunning before injecting). Everything from the
+// atomic queue claim through fence dead-lettering, delivery, failure
+// accounting and acking lives here exactly as it did inline in
+// tryDeliverQueuedNudgesByPoller.
+func deliverClaimedQueueNudges(target nudgeTarget, store, sessStore beads.Store, sp runtime.Provider, wake worker.NudgeWakePolicy) (bool, error) {
 	items, err := claimDueQueuedNudgesForTarget(target.cityPath, target, time.Now())
 	if err != nil || len(items) == 0 {
 		return false, err
@@ -1639,7 +1650,7 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 		Text:     msg,
 		Delivery: worker.NudgeDeliveryDefault,
 		Source:   "queue",
-		Wake:     worker.NudgeWakeLiveOnly,
+		Wake:     wake,
 	})
 	if err != nil {
 		telemetry.RecordNudge(context.Background(), target.agentKey(), err)
@@ -1674,6 +1685,29 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 	telemetry.RecordNudge(context.Background(), target.agentKey(), nil)
 	stampLastNudgeDeliveredAt(deliverySessFront, target.sessionID, time.Now())
 	return true, errors.Join(bookkeepErr, ackQueuedNudges(target.cityPath, queuedNudgeIDs(items)))
+}
+
+// deliverQueuedNudgesWithResume delivers a queued nudge to a target that was
+// observed NOT running. Pool slots are routinely drift-drained (killed while
+// idle) between a producer enqueueing work and a dispatch tick reaching it;
+// before this path the dispatcher skipped every such target ("not-running"),
+// stranding the queue item until its 24h TTL — the exact 2026-10-12 city
+// stall measured as 18 pending nudges with zero delivery attempts against
+// live session beads. manager.Send's ensureRunning resumes the slot (bounded
+// by the session's startup budget, admitting through the provider health
+// gate) with the worker's transcript context intact, which is strictly
+// better than waiting for the wave to reclaim and redispatch a cold spawn.
+// No quiescence gate applies: nothing is running, so there is no turn to
+// interrupt; the epoch fence still applies post-claim
+// (splitQueuedNudgesForTarget) and a resume that cannot start (admission
+// hold, dead session bead) releases its claim for a later tick rather than
+// dead-lettering; a target whose session bead has vanished counts its
+// bounded attempts and dead-letters with an explicit error instead.
+func deliverQueuedNudgesWithResume(target nudgeTarget, store, sessStore beads.Store, sp runtime.Provider) (bool, error) {
+	if !session.LoadProviderHealthSnapshot(target.cityPath, time.Now()).Check(target.providerName()).Allowed {
+		return false, nil
+	}
+	return deliverClaimedQueueNudges(target, store, sessStore, sp, "")
 }
 
 func stampLastNudgeDeliveredAt(sessFront *session.Store, sessionID string, t time.Time) {

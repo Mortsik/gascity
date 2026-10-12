@@ -609,3 +609,79 @@ func TestEnqueuePingsWakeSocket(t *testing.T) {
 		t.Fatal("wakeCh not signaled after enqueue")
 	}
 }
+
+// TestDispatchAllQueuedNudgesResumesNotRunningTarget pins the 2026-10-12 fix:
+// a matched queue item whose session bead is open but whose runtime process is
+// gone (drift-drained pool slot) used to be skipped "not-running" every tick
+// with zero delivery attempts until its 24h TTL — measured live as 18 pending
+// nudges (oldest 20h) against session beads whose processes were all dead.
+// The dispatcher now attempts the resume path: manager.Send's ensureRunning
+// brings the slot back before the inject lands.
+func TestDispatchAllQueuedNudgesResumesNotRunningTarget(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	clearInheritedCityRoutingEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+
+	store := openNudgeBeadStore(dir)
+	fake := runtime.NewFake()
+	mgr := newSessionManagerWithConfig(dir, store.Store, fake, nil)
+	info, err := mgr.CreateSession(context.Background(), session.CreateOptions{Template: "resume-tgt", Title: "Worker", Command: "codex", WorkDir: dir, Provider: "codex", Env: nil, Resume: session.ProviderResume{}, Hints: runtime.Config{WorkDir: dir}, ExtraMeta: map[string]string{"session_origin": "manual"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Start(context.Background(), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Kill the runtime process: the session BEAD stays open (the pool-slot
+	// shape after drift-drain), the runtime no longer reports running.
+	if err := fake.Stop(info.SessionName); err != nil {
+		t.Fatalf("fake.Stop: %v", err)
+	}
+	if fake.IsRunning(info.SessionName) {
+		t.Fatal("precondition: session should not be running after Stop")
+	}
+
+	if err := enqueueQueuedNudge(dir, newQueuedNudge("resume-tgt", "claim the next step", time.Now().Add(-time.Minute))); err != nil {
+		t.Fatalf("enqueueQueuedNudge: %v", err)
+	}
+
+	snapshot, err := loadSessionBeadSnapshot(store.Store)
+	if err != nil {
+		t.Fatalf("loadSessionBeadSnapshot: %v", err)
+	}
+
+	delivered, err := dispatchAllQueuedNudges(dir, supervisorCfg(), store.Store, store.Store, fake, snapshot, nil)
+	if err != nil {
+		t.Fatalf("dispatchAllQueuedNudges: %v", err)
+	}
+	if delivered != 1 {
+		t.Fatalf("delivered = %d, want 1 (resume path must deliver to a not-running target)", delivered)
+	}
+
+	var nudgeMessages []string
+	resumed := false
+	for _, call := range fake.Calls {
+		if call.Method == "Nudge" {
+			nudgeMessages = append(nudgeMessages, call.Message)
+		}
+		if call.Method == "Start" && call.Name == info.SessionName {
+			resumed = true
+		}
+	}
+	if len(nudgeMessages) != 1 || !strings.Contains(nudgeMessages[0], "claim the next step") {
+		t.Fatalf("nudge calls = %q, want one carrying the queued reminder", nudgeMessages)
+	}
+	if !resumed {
+		t.Fatal("expected ensureRunning to restart the stopped session (no Start call observed)")
+	}
+
+	pending, inFlight, dead, err := listQueuedNudges(dir, "resume-tgt", time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	if len(pending) != 0 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("queue not drained: pending=%d inFlight=%d dead=%d", len(pending), len(inFlight), len(dead))
+	}
+}
