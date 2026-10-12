@@ -1701,7 +1701,8 @@ func deliverClaimedQueueNudges(target nudgeTarget, store, sessStore beads.Store,
 // interrupt; the epoch fence still applies post-claim
 // (splitQueuedNudgesForTarget) and a resume that cannot start (admission
 // hold, dead session bead) releases its claim for a later tick rather than
-// dead-lettering — transient by construction.
+// dead-lettering; a target whose session bead has vanished counts its
+// bounded attempts and dead-letters with an explicit error instead.
 func deliverQueuedNudgesWithResume(target nudgeTarget, store, sessStore beads.Store, sp runtime.Provider) (bool, error) {
 	if !session.LoadProviderHealthSnapshot(target.cityPath, time.Now()).Check(target.providerName()).Allowed {
 		return false, nil

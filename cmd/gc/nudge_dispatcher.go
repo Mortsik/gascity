@@ -235,11 +235,12 @@ func dispatchAllQueuedNudges(cityPath string, cfg *config.City, store, sessStore
 			// manager.Send's ensureRunning brings the slot back before the
 			// inject lands. ACP is exempt by design — a stopped ACP agent has
 			// nothing on the other side to observe the delivered prompt
-			// (pinned by TestDispatchAllQueuedNudgesSkipsACPSessionWhenNotRunning),
-			// and a resume that cannot start (admission hold, session gone
-			// from the bead store) releases its claim and falls back to the
-			// skip — retried next tick, never dead-lettered as a permanent
-			// failure.
+			// (pinned by TestDispatchAllQueuedNudgesSkipsACPSessionWhenNotRunning).
+			// A resume blocked by admission (ErrProviderUnavailable) releases
+			// its claim and falls back to the skip, retried next tick; a target
+			// whose session bead is gone fails through the attempt-counting
+			// dead-letter path (bounded retries, explicit last error) — the
+			// right end for work whose owning session no longer exists.
 			if target.sessionTransport() != "acp" {
 				ok, err := deliverQueuedNudgesWithResume(target, store, sessStore, sp)
 				if err != nil && firstErr == nil {
