@@ -224,6 +224,32 @@ func dispatchAllQueuedNudges(cityPath string, cfg *config.City, store, sessStore
 			continue
 		}
 		if !obs.Running {
+			// A matched queue item whose target session bead is open but whose
+			// runtime process is gone. Drift-drained pool slots are the common
+			// case — killed while idle between an enqueue and this tick — and
+			// the pre-2026-10-12 behavior skipped them forever ("not-running"
+			// every tick, zero delivery attempts, item parked until its 24h
+			// TTL) while the work sat claimed by a dead slot. For providers
+			// whose stopped process can be RESUMED with its transcript context
+			// (claude PTY slots), attempt the resume path instead:
+			// manager.Send's ensureRunning brings the slot back before the
+			// inject lands. ACP is exempt by design — a stopped ACP agent has
+			// nothing on the other side to observe the delivered prompt
+			// (pinned by TestDispatchAllQueuedNudgesSkipsACPSessionWhenNotRunning),
+			// and a resume that cannot start (admission hold, session gone
+			// from the bead store) releases its claim and falls back to the
+			// skip — retried next tick, never dead-lettered as a permanent
+			// failure.
+			if target.sessionTransport() != "acp" {
+				ok, err := deliverQueuedNudgesWithResume(target, store, sessStore, sp)
+				if err != nil && firstErr == nil {
+					firstErr = err
+				}
+				if ok {
+					delivered++
+					continue
+				}
+			}
 			skipCounts["not-running"]++
 			logNudgeDispatchSkip(debugOut, "not-running", target.agentKey(), target.sessionName, "")
 			continue
