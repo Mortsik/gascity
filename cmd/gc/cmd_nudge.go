@@ -1647,8 +1647,11 @@ func deliverClaimedQueueNudges(target nudgeTarget, store, sessStore beads.Store,
 		return false, errors.Join(bookkeepErr, err, relErr)
 	}
 	result, err := handle.Nudge(context.Background(), worker.NudgeRequest{
-		Text:     msg,
-		Delivery: worker.NudgeDeliveryDefault,
+		Text: msg,
+		// Immediate (NudgeNow) injects with a submit; the default path
+		// pasted the text into the composer without an Enter for claude-*
+		// sessions, leaving "queued messages" nobody sends (2026-10-13).
+		Delivery: worker.NudgeDeliveryImmediate,
 		Source:   "queue",
 		Wake:     wake,
 	})

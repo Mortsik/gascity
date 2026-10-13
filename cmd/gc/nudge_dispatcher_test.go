@@ -258,7 +258,7 @@ func TestDispatchAllQueuedNudgesDeliversAndAcks(t *testing.T) {
 
 	var nudgeMessages []string
 	for _, call := range fake.Calls {
-		if call.Method == "Nudge" {
+		if call.Method == "Nudge" || call.Method == "NudgeNow" {
 			nudgeMessages = append(nudgeMessages, call.Message)
 		}
 	}
@@ -341,7 +341,7 @@ func TestDispatchAllQueuedNudgesDeliversToIdleACPSession(t *testing.T) {
 
 	var nudgeMessages []string
 	for _, call := range fake.Calls {
-		if call.Method == "Nudge" {
+		if call.Method == "Nudge" || call.Method == "NudgeNow" {
 			nudgeMessages = append(nudgeMessages, call.Message)
 		}
 	}
@@ -663,7 +663,7 @@ func TestDispatchAllQueuedNudgesResumesNotRunningTarget(t *testing.T) {
 	var nudgeMessages []string
 	resumed := false
 	for _, call := range fake.Calls {
-		if call.Method == "Nudge" {
+		if call.Method == "Nudge" || call.Method == "NudgeNow" {
 			nudgeMessages = append(nudgeMessages, call.Message)
 		}
 		if call.Method == "Start" && call.Name == info.SessionName {

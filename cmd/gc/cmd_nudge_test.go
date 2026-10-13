@@ -486,7 +486,7 @@ func TestDeliverSessionNudgeWithProviderWaitIdleQueuesForCodex(t *testing.T) {
 		t.Fatalf("stdout = %q, want queued confirmation", stdout.String())
 	}
 	for _, call := range fake.Calls {
-		if call.Method == "Nudge" {
+		if call.Method == "Nudge" || call.Method == "NudgeNow" {
 			t.Fatalf("unexpected direct nudge call: %+v", call)
 		}
 	}
@@ -1444,7 +1444,7 @@ func TestDeliverSessionNudgeWithProviderWaitIdleLeavesACPDeliveryUnwrapped(t *te
 
 	var delivered string
 	for _, call := range fake.Calls {
-		if call.Method == "Nudge" {
+		if call.Method == "Nudge" || call.Method == "NudgeNow" {
 			delivered = call.Message
 		}
 		if call.Method == "WaitForIdle" {
@@ -2657,7 +2657,7 @@ func TestTryDeliverQueuedNudgesByPollerDeliversAndAcks(t *testing.T) {
 
 	var nudgeCalls []runtime.Call
 	for _, call := range fake.Calls {
-		if call.Method == "Nudge" {
+		if call.Method == "Nudge" || call.Method == "NudgeNow" {
 			nudgeCalls = append(nudgeCalls, call)
 		}
 	}
@@ -2734,7 +2734,7 @@ func TestTryDeliverQueuedNudgesByPollerAcksDeliveredUnobservedInsteadOfRetrying(
 
 	var nudgeCalls []runtime.Call
 	for _, call := range fake.Calls {
-		if call.Method == "Nudge" {
+		if call.Method == "Nudge" || call.Method == "NudgeNow" {
 			nudgeCalls = append(nudgeCalls, call)
 		}
 	}
@@ -2799,7 +2799,7 @@ func TestTryDeliverQueuedNudgesByPollerDeliversActivitylessTimedOnlySession(t *t
 
 	var nudgeCalls []runtime.Call
 	for _, call := range fake.Calls {
-		if call.Method == "Nudge" {
+		if call.Method == "Nudge" || call.Method == "NudgeNow" {
 			nudgeCalls = append(nudgeCalls, call)
 		}
 	}
@@ -2947,7 +2947,7 @@ func TestTryDeliverQueuedNudgesByPollerLeavesACPDeliveryUnwrapped(t *testing.T) 
 
 	var nudgeCalls []runtime.Call
 	for _, call := range fake.Calls {
-		if call.Method == "Nudge" {
+		if call.Method == "Nudge" || call.Method == "NudgeNow" {
 			nudgeCalls = append(nudgeCalls, call)
 		}
 	}
@@ -2998,7 +2998,7 @@ func TestTryDeliverQueuedNudgesByPollerKeepsACPProviderMissRecoverable(t *testin
 
 	var nudgeCalls int
 	for _, call := range fake.Calls {
-		if call.Method == "Nudge" {
+		if call.Method == "Nudge" || call.Method == "NudgeNow" {
 			nudgeCalls++
 		}
 	}
@@ -3153,7 +3153,7 @@ func TestTryDeliverQueuedNudgesByPollerDeliversDespiteStaleFenceBeadMarkFailure(
 
 	var nudgeCalls []runtime.Call
 	for _, call := range fake.Calls {
-		if call.Method == "Nudge" {
+		if call.Method == "Nudge" || call.Method == "NudgeNow" {
 			nudgeCalls = append(nudgeCalls, call)
 		}
 	}
