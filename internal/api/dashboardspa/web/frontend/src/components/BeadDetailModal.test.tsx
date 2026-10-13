@@ -16,6 +16,10 @@ vi.mock('../hooks/useEntityLinks', () => ({
   })),
 }));
 
+vi.mock('../hooks/useBeadExecutorMail', () => ({
+  useBeadExecutorMail: vi.fn(() => ({ messages: [], loading: false, error: null })),
+}));
+
 const mockUseBeadDetail = useBeadDetail as unknown as Mock;
 const mockUseEntityLinks = useEntityLinks as unknown as Mock;
 

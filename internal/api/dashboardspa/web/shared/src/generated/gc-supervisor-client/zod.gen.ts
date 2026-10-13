@@ -8412,6 +8412,21 @@ export const zSendMailPath = z.object({
  */
 export const zSendMailResponse = zMessage;
 
+export const zGetV0CityByCityNameMailByBeadByBeadIdPath = z.object({
+    cityName: z.string().min(1).regex(/\S/),
+    beadID: z.string()
+});
+
+export const zGetV0CityByCityNameMailByBeadByBeadIdQuery = z.object({
+    limit: z.coerce.bigint().gte(BigInt(1)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }).optional(),
+    kind: z.enum(['executor', 'any']).optional()
+});
+
+/**
+ * OK
+ */
+export const zGetV0CityByCityNameMailByBeadByBeadIdResponse = zMailListBody;
+
 export const zGetV0CityByCityNameMailCountPath = z.object({
     cityName: z.string().min(1).regex(/\S/)
 });

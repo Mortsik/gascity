@@ -2,10 +2,12 @@ import { useState, type ReactNode } from 'react';
 import { resolveSessionForTarget } from 'gas-city-dashboard-shared';
 import type { BeadNode } from '../lib/beadGraph';
 import { useBeadDetail } from '../hooks/useBeadDetail';
+import { useBeadExecutorMail } from '../hooks/useBeadExecutorMail';
 import { useEntityLinks } from '../hooks/useEntityLinks';
 import type { SupervisorBead } from '../supervisor/beadReads';
 import type { SupervisorSession } from '../supervisor/sessionReads';
 import { BeadBody } from './BeadBody';
+import { BeadExecutorMailSection } from './BeadExecutorMailSection';
 import { BeadDependencies } from './beads/BeadDependencies';
 import { BeadLiveRunModal } from './beads/BeadLiveRunModal';
 import { Button } from './Button';
@@ -52,6 +54,7 @@ export function BeadDetailModal({
   renderActions,
 }: BeadDetailModalProps) {
   const { bead, loading, error, notFound, now } = useBeadDetail(open, beadId, initialBead);
+  const executorMail = useBeadExecutorMail(open, beadId);
   const links = useEntityLinks(open ? beadId : null);
   const [runOpen, setRunOpen] = useState(false);
 
@@ -127,6 +130,7 @@ export function BeadDetailModal({
               now={now}
               {...(onOpenBead !== undefined ? { onOpenBead } : {})}
             />
+            <BeadExecutorMailSection state={executorMail} />
           </div>
         )}
       </Modal>

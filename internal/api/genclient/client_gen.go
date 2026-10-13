@@ -846,6 +846,24 @@ func (e GetV0CityByCityNameExtmsgTranscriptParamsOrder) Valid() bool {
 	}
 }
 
+// Defines values for GetV0CityByCityNameMailByBeadByBeadIdParamsKind.
+const (
+	Any      GetV0CityByCityNameMailByBeadByBeadIdParamsKind = "any"
+	Executor GetV0CityByCityNameMailByBeadByBeadIdParamsKind = "executor"
+)
+
+// Valid indicates whether the value is a known member of the GetV0CityByCityNameMailByBeadByBeadIdParamsKind enum.
+func (e GetV0CityByCityNameMailByBeadByBeadIdParamsKind) Valid() bool {
+	switch e {
+	case Any:
+		return true
+	case Executor:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for PostV0CityByCityNameRigByNameByActionParamsAction.
 const (
 	Restart PostV0CityByCityNameRigByNameByActionParamsAction = "restart"
@@ -9484,6 +9502,18 @@ type SendMailParams struct {
 	// IdempotencyKey Idempotency key for safe retries.
 	IdempotencyKey *string `json:"Idempotency-Key,omitempty"`
 }
+
+// GetV0CityByCityNameMailByBeadByBeadIdParams defines parameters for GetV0CityByCityNameMailByBeadByBeadId.
+type GetV0CityByCityNameMailByBeadByBeadIdParams struct {
+	// Limit Max messages to return (default 5, max 25).
+	Limit *int64 `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Kind Sender filter: executor (implementing agents only) or any (default).
+	Kind *GetV0CityByCityNameMailByBeadByBeadIdParamsKind `form:"kind,omitempty" json:"kind,omitempty"`
+}
+
+// GetV0CityByCityNameMailByBeadByBeadIdParamsKind defines parameters for GetV0CityByCityNameMailByBeadByBeadId.
+type GetV0CityByCityNameMailByBeadByBeadIdParamsKind string
 
 // GetV0CityByCityNameMailCountParams defines parameters for GetV0CityByCityNameMailCount.
 type GetV0CityByCityNameMailCountParams struct {
@@ -19545,6 +19575,9 @@ type ClientInterface interface {
 
 	SendMail(ctx context.Context, cityName string, params *SendMailParams, body SendMailJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// GetV0CityByCityNameMailByBeadByBeadId request
+	GetV0CityByCityNameMailByBeadByBeadId(ctx context.Context, cityName string, beadID string, params *GetV0CityByCityNameMailByBeadByBeadIdParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// GetV0CityByCityNameMailCount request
 	GetV0CityByCityNameMailCount(ctx context.Context, cityName string, params *GetV0CityByCityNameMailCountParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -21030,6 +21063,18 @@ func (c *Client) SendMailWithBody(ctx context.Context, cityName string, params *
 
 func (c *Client) SendMail(ctx context.Context, cityName string, params *SendMailParams, body SendMailJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewSendMailRequest(c.Server, cityName, params, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) GetV0CityByCityNameMailByBeadByBeadId(ctx context.Context, cityName string, beadID string, params *GetV0CityByCityNameMailByBeadByBeadIdParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetV0CityByCityNameMailByBeadByBeadIdRequest(c.Server, cityName, beadID, params)
 	if err != nil {
 		return nil, err
 	}
@@ -27283,6 +27328,85 @@ func NewSendMailRequestWithBody(server string, cityName string, params *SendMail
 	return req, nil
 }
 
+// NewGetV0CityByCityNameMailByBeadByBeadIdRequest generates requests for GetV0CityByCityNameMailByBeadByBeadId
+func NewGetV0CityByCityNameMailByBeadByBeadIdRequest(server string, cityName string, beadID string, params *GetV0CityByCityNameMailByBeadByBeadIdParams) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cityName", cityName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "beadID", beadID, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v0/city/%s/mail/by-bead/%s", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		queryValues := queryURL.Query()
+
+		if params.Limit != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "limit", *params.Limit, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "int64"}); err != nil {
+				return nil, err
+			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+				return nil, err
+			} else {
+				for k, v := range parsed {
+					for _, v2 := range v {
+						queryValues.Add(k, v2)
+					}
+				}
+			}
+
+		}
+
+		if params.Kind != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "kind", *params.Kind, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+				return nil, err
+			} else {
+				for k, v := range parsed {
+					for _, v2 := range v {
+						queryValues.Add(k, v2)
+					}
+				}
+			}
+
+		}
+
+		queryURL.RawQuery = queryValues.Encode()
+	}
+
+	req, err := http.NewRequest("GET", queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
 // NewGetV0CityByCityNameMailCountRequest generates requests for GetV0CityByCityNameMailCount
 func NewGetV0CityByCityNameMailCountRequest(server string, cityName string, params *GetV0CityByCityNameMailCountParams) (*http.Request, error) {
 	var err error
@@ -33095,6 +33219,9 @@ type ClientWithResponsesInterface interface {
 
 	SendMailWithResponse(ctx context.Context, cityName string, params *SendMailParams, body SendMailJSONRequestBody, reqEditors ...RequestEditorFn) (*SendMailResponse, error)
 
+	// GetV0CityByCityNameMailByBeadByBeadIdWithResponse request
+	GetV0CityByCityNameMailByBeadByBeadIdWithResponse(ctx context.Context, cityName string, beadID string, params *GetV0CityByCityNameMailByBeadByBeadIdParams, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameMailByBeadByBeadIdResponse, error)
+
 	// GetV0CityByCityNameMailCountWithResponse request
 	GetV0CityByCityNameMailCountWithResponse(ctx context.Context, cityName string, params *GetV0CityByCityNameMailCountParams, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameMailCountResponse, error)
 
@@ -35407,6 +35534,33 @@ func (r SendMailResponse) Status() string {
 
 // StatusCode returns HTTPResponse.StatusCode
 func (r SendMailResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+type GetV0CityByCityNameMailByBeadByBeadIdResponse struct {
+	Body                      []byte
+	HTTPResponse              *http.Response
+	JSON200                   *MailListBody
+	ApplicationproblemJSON400 *ErrorModel
+	ApplicationproblemJSON404 *ErrorModel
+	ApplicationproblemJSON422 *ErrorModel
+	ApplicationproblemJSON500 *ErrorModel
+	ApplicationproblemJSON503 *ErrorModel
+}
+
+// Status returns HTTPResponse.Status
+func (r GetV0CityByCityNameMailByBeadByBeadIdResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetV0CityByCityNameMailByBeadByBeadIdResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -38702,6 +38856,15 @@ func (c *ClientWithResponses) SendMailWithResponse(ctx context.Context, cityName
 		return nil, err
 	}
 	return ParseSendMailResponse(rsp)
+}
+
+// GetV0CityByCityNameMailByBeadByBeadIdWithResponse request returning *GetV0CityByCityNameMailByBeadByBeadIdResponse
+func (c *ClientWithResponses) GetV0CityByCityNameMailByBeadByBeadIdWithResponse(ctx context.Context, cityName string, beadID string, params *GetV0CityByCityNameMailByBeadByBeadIdParams, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameMailByBeadByBeadIdResponse, error) {
+	rsp, err := c.GetV0CityByCityNameMailByBeadByBeadId(ctx, cityName, beadID, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetV0CityByCityNameMailByBeadByBeadIdResponse(rsp)
 }
 
 // GetV0CityByCityNameMailCountWithResponse request returning *GetV0CityByCityNameMailCountResponse
@@ -44257,6 +44420,67 @@ func ParseSendMailResponse(rsp *http.Response) (*SendMailResponse, error) {
 			return nil, err
 		}
 		response.ApplicationproblemJSON500 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetV0CityByCityNameMailByBeadByBeadIdResponse parses an HTTP response from a GetV0CityByCityNameMailByBeadByBeadIdWithResponse call
+func ParseGetV0CityByCityNameMailByBeadByBeadIdResponse(rsp *http.Response) (*GetV0CityByCityNameMailByBeadByBeadIdResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetV0CityByCityNameMailByBeadByBeadIdResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest MailListBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON503 = &dest
 
 	}
 
