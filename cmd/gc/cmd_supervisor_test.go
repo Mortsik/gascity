@@ -4839,8 +4839,12 @@ func TestCityRegistryReportsRunningOnlyAfterStartup(t *testing.T) {
 	if cities[0].Status != "adopting_sessions" {
 		t.Fatalf("ListCities before startup Status = %q, want adopting_sessions", cities[0].Status)
 	}
-	if got := reg.CityState("bright-lights"); got != nil {
-		t.Fatalf("CityState before startup = %#v, want nil", got)
+	// CityState serves during startup (2026-10-13: the adoption barrier ran
+	// ~50 min on a full fleet and gating reads on Started blacked out the
+	// dashboard while the city was in fact working). ListCities' Running
+	// flag stays the truthful "fully started" signal above.
+	if got := reg.CityState("bright-lights"); got != cs {
+		t.Fatalf("CityState before startup with cs = %#v, want controller state", got)
 	}
 
 	reg.UpdateCallback("/city", func(m *managedCity) {

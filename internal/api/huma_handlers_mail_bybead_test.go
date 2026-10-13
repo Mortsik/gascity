@@ -50,13 +50,14 @@ func TestFilterMessagesByBead(t *testing.T) {
 		t.Fatalf("empty id: want nil, got %d", len(got))
 	}
 
-	// Deterministic tie-break on id at equal timestamps.
+	// Deterministic tie-break on id at equal timestamps: id DESC, matching
+	// the list routes' (created_at DESC, id DESC) order contract.
 	tie := []mail.Message{
 		mk("b", "r/agentforge-executor", "READY tie-id", "", base),
 		mk("a", "r/agentforge-executor", "READY tie-id", "", base),
 	}
 	got = filterMessagesByBead(tie, "tie-id", "any")
-	if len(got) != 2 || got[0].ID != "a" {
+	if len(got) != 2 || got[0].ID != "b" {
 		t.Fatalf("tie-break: got %v", []string{got[0].ID, got[1].ID})
 	}
 }
@@ -104,6 +105,47 @@ func TestMailByBeadEndpoint(t *testing.T) {
 	}
 	if out.Body.Total != 0 || len(out.Body.Items) != 0 {
 		t.Fatalf("no-match total=%d, want 0", out.Body.Total)
+	}
+}
+
+func TestMailByBeadTotalCountsBeforeTruncation(t *testing.T) {
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	mp := state.cityMailProv
+	for i := 0; i < 7; i++ {
+		if _, err := mp.Send("poe-pricer--agentforge-core__agentforge-executor-1-pool", "human",
+			"READY: poe2_pricer-qty8fz report", "attempt run"); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+	req := httptest.NewRequest("GET", cityURL(state, "/mail/by-bead/poe2_pricer-qty8fz")+"?limit=3", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var out MailListOutput
+	if err := json.Unmarshal(rec.Body.Bytes(), &out.Body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Body.Total != 7 || len(out.Body.Items) != 3 {
+		t.Fatalf("total=%d items=%d, want 7/3 (Total counts before truncation)", out.Body.Total, len(out.Body.Items))
+	}
+	for _, m := range out.Body.Items {
+		if m.Rig == "" {
+			t.Fatalf("item missing rig tag: %+v", m)
+		}
+	}
+}
+
+func TestMailByBeadLimitValidation(t *testing.T) {
+	state := newFakeState(t)
+	h := newTestCityHandler(t, state)
+	req := httptest.NewRequest("GET", cityURL(state, "/mail/by-bead/some-id")+"?limit=-1", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("limit=-1 status = %d, want 422 (minimum=1 validation)", rec.Code)
 	}
 }
 

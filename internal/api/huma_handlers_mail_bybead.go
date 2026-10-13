@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strings"
 
@@ -45,7 +46,9 @@ func filterMessagesByBead(msgs []mail.Message, beadID, kind string) []mail.Messa
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
-			return out[i].ID < out[j].ID
+			// Same direction as the list routes' order contract
+			// (created_at DESC, id DESC): newest first, id DESC tie-break.
+			return out[i].ID > out[j].ID
 		}
 		return out[i].CreatedAt.After(out[j].CreatedAt)
 	})
@@ -56,19 +59,26 @@ func filterMessagesByBead(msgs []mail.Message, beadID, kind string) []mail.Messa
 // same read the /mail all-traffic view rides), matches, and merges. A single
 // provider failure degrades to a partial list; total failure propagates to
 // the caller as an error condition to report.
-func (s *Server) collectMailByBead(ctx context.Context, providers map[string]mail.Provider, beadID, kind string) ([]mail.Message, []string) {
+func (s *Server) collectMailByBead(ctx context.Context, providers map[string]mail.Provider, beadID, kind string) ([]mail.Message, []string, bool) {
 	var allMsgs []mail.Message
 	var partialErrs []string
+	partialStoreSlow := false
 	for _, res := range withMailProviderReadDeadline(ctx, providers, func(provider mail.Provider) ([]mail.Message, error) {
 		return provider.All("")
 	}) {
 		if res.err != nil {
+			var timeoutErr *mailReadTimeoutError
+			if errors.As(res.err, &timeoutErr) {
+				partialStoreSlow = true
+			}
 			partialErrs = append(partialErrs, "mail provider "+res.name+": "+res.err.Error())
 			continue
 		}
-		allMsgs = append(allMsgs, res.value...)
+		// Tag before matching so a hit carries its provider, matching the
+		// /mail list contract (rig shown in the UI).
+		allMsgs = append(allMsgs, tagRig(res.value, res.name)...)
 	}
-	return filterMessagesByBead(allMsgs, beadID, kind), partialErrs
+	return filterMessagesByBead(allMsgs, beadID, kind), partialErrs, partialStoreSlow
 }
 
 // humaHandleMailByBead is the Huma-typed handler for GET /v0/city/{city}/mail/by-bead/{beadID}.
@@ -87,14 +97,17 @@ func (s *Server) humaHandleMailByBead(ctx context.Context, input *MailByBeadInpu
 	}
 
 	providers := s.state.MailProviders()
-	matched, partialErrs := s.collectMailByBead(ctx, providers, input.BeadID, input.Kind)
+	matched, partialErrs, partialStoreSlow := s.collectMailByBead(ctx, providers, input.BeadID, input.Kind)
 	if len(partialErrs) == len(providers) && len(providers) > 0 {
-		return nil, allMailProvidersFailedError(partialErrs, false)
+		return nil, allMailProvidersFailedError(partialErrs, partialStoreSlow)
 	}
 	if matched == nil {
 		matched = []mail.Message{}
 	}
-	if len(matched) > limit {
+	// Total counts every match BEFORE truncation (the /mail semantics) so a
+	// consumer knows when the bounded single page clipped the result.
+	total := len(matched)
+	if total > limit {
 		matched = matched[:limit]
 	}
 	return &MailListOutput{
@@ -102,7 +115,7 @@ func (s *Server) humaHandleMailByBead(ctx context.Context, input *MailByBeadInpu
 		CacheAgeS: cacheAgeSeconds(cityStore),
 		Body: MailListBody{
 			Items:         matched,
-			Total:         len(matched),
+			Total:         total,
 			Partial:       len(partialErrs) > 0,
 			PartialErrors: partialErrs,
 		},
