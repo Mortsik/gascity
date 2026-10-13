@@ -276,19 +276,25 @@ func TestCityRegistryCityState(t *testing.T) {
 	}
 	reg.Add("/path/f", mc)
 
-	// Not started — should return nil.
-	if got := reg.CityState("city-f"); got != nil {
-		t.Fatalf("CityState before start = %v, want nil", got)
+	// Not started, but the controller state exists (startup barrier phases
+	// run with cr.cs live for tens of minutes on a large fleet) — must serve.
+	if got := reg.CityState("city-f"); got != cs {
+		t.Fatalf("CityState before start with cs = %v, want controller state", got)
 	}
 
-	// Mark started.
+	// Mark started — unchanged behavior.
 	reg.UpdateCallback("/path/f", func(m *managedCity) {
 		m.started = true
 	})
-
-	// Now should return the controllerState.
 	if got := reg.CityState("city-f"); got != cs {
 		t.Fatalf("CityState after start = %v, want controller state", got)
+	}
+
+	// A city whose runtime exists but has no controller state yet (earliest
+	// startup phases) stays invisible.
+	reg.Add("/path/g", &managedCity{name: "city-g", cr: &CityRuntime{cityName: "city-g"}})
+	if got := reg.CityState("city-g"); got != nil {
+		t.Fatalf("CityState without cs = %v, want nil", got)
 	}
 
 	// Non-existent city.
@@ -628,11 +634,13 @@ func TestCityRegistryInitFailureInListCities(t *testing.T) {
 func TestCityRegistryByNameCollisionWithFailedCity(t *testing.T) {
 	reg := newCityRegistry()
 
-	// Add a running city named "foo"
+	// Add a running city named "foo" (a running city carries its controller
+	// state; toCityView deliberately drops typed-nil cs pointers, see the
+	// guard added with the adopt-window API visibility change).
 	mc := &managedCity{
 		name:    "foo",
 		started: true,
-		cr:      &CityRuntime{},
+		cr:      &CityRuntime{cs: &controllerState{}},
 		cancel:  func() {},
 		done:    make(chan struct{}),
 	}

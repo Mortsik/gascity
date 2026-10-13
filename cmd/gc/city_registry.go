@@ -406,8 +406,16 @@ func (transientCityEventProvider) Close() error {
 	return nil
 }
 
-// CityState returns the api.State for a named city, or nil if not found/not running.
-// Lock-free read from the atomic snapshot.
+// CityState returns the api.State for a named city, or nil if not found.
+// A city whose controller state exists is served even before it fully
+// started (status adopting_sessions et al.): the startup barrier phases can
+// run tens of minutes on a large fleet (2026-10-13: ~50 min config-drift
+// drain after a supervisor restart), and gating every city-scoped read on
+// Started blacked out the dashboard for the whole window while the city was
+// in fact working (sessions active, semaphore saturated). Mutations see the
+// same opening — the underlying stores are live during startup and every
+// dispatcher retries bounded, so this is the same contract a running city
+// has, only earlier. Lock-free read from the atomic snapshot.
 func (r *cityRegistry) CityState(name string) api.State {
 	snap := r.snap.Load()
 	view, ok := snap.byName[name]
@@ -417,7 +425,7 @@ func (r *cityRegistry) CityState(name string) api.State {
 	if view.Tombstoned {
 		return nil
 	}
-	if !view.Started || view.cs == nil {
+	if view.cs == nil {
 		return nil
 	}
 	return view.cs
@@ -548,7 +556,7 @@ func (r *cityRegistry) toCityView(path string, mc *managedCity) *cityView {
 	// call methods like Config(), SessionProvider(), etc. which acquire cs.mu.RLock().
 	// The Poke() method only does a non-blocking channel send — no managedCity access.
 	var cs api.State
-	if mc.cr != nil {
+	if mc.cr != nil && mc.cr.cs != nil {
 		cs = mc.cr.cs
 	}
 

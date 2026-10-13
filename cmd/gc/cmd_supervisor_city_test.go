@@ -2503,8 +2503,12 @@ func TestPublishManagedCityWaitsForInitialReconcileBeforeRunning(t *testing.T) {
 	if cities[0].Status != "starting_agents" {
 		t.Fatalf("city Status = %q, want starting_agents while startup reconcile runs", cities[0].Status)
 	}
-	if got := registry.CityState("bright-lights"); got != nil {
-		t.Fatalf("CityState() = %#v before startup reconcile, want nil", got)
+	// CityState serves as soon as the controller state exists, even before
+	// the startup reconcile flips Started (2026-10-13: adopt-gate visibility
+	// change — a full-fleet startup held reads hostage for ~50 min while the
+	// city was working). The Running flag above stays the truthful signal.
+	if got := registry.CityState("bright-lights"); got == nil {
+		t.Fatal("CityState() = nil before startup reconcile, want controller state")
 	}
 
 	registry.ReadCallback(func(
