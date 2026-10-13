@@ -140,3 +140,20 @@ function sortNewestFirst(a: SupervisorMailItem, b: SupervisorMailItem): number {
 function sortOldestFirst(a: SupervisorMailItem, b: SupervisorMailItem): number {
   return a.created_at.localeCompare(b.created_at);
 }
+
+/**
+ * Messages from implementing agents (executor READY/BLOCKED mail) that mention
+ * the bead id in subject or body, newest first (owner request 2026-10-13: the
+ * closed-issues view shows the last executor message per issue). Bounded by
+ * the endpoint's max limit; callers render the first item and may list the
+ * rest. Errors surface as rejected promises so the detail modal can render a
+ * calm "unavailable" instead of crashing the panel.
+ */
+export async function fetchExecutorMailForBead(beadId: string, limit = 3): Promise<SupervisorMailItem[]> {
+  const cityName = activeCityOrThrow('fetch executor mail by bead');
+  const mailList = await supervisorApi().mailByBead(cityName, beadId, {
+    kind: 'executor',
+    ...(limit > 0 ? { limit } : {}),
+  });
+  return mailList.items ?? [];
+}

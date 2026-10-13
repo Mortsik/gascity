@@ -14008,6 +14008,65 @@ export type SendMailResponses = {
 
 export type SendMailResponse = SendMailResponses[keyof SendMailResponses];
 
+export type GetV0CityByCityNameMailByBeadByBeadIdData = {
+    body?: never;
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+        /**
+         * Bead id matched against message subject and body.
+         */
+        beadID: string;
+    };
+    query?: {
+        /**
+         * Max messages to return (default 5, max 25).
+         */
+        limit?: number;
+        /**
+         * Sender filter: executor (implementing agents only) or any (default).
+         */
+        kind?: 'executor' | 'any';
+    };
+    url: '/v0/city/{cityName}/mail/by-bead/{beadID}';
+};
+
+export type GetV0CityByCityNameMailByBeadByBeadIdErrors = {
+    /**
+     * Bad Request
+     */
+    400: ErrorModel;
+    /**
+     * Not Found
+     */
+    404: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type GetV0CityByCityNameMailByBeadByBeadIdError = GetV0CityByCityNameMailByBeadByBeadIdErrors[keyof GetV0CityByCityNameMailByBeadByBeadIdErrors];
+
+export type GetV0CityByCityNameMailByBeadByBeadIdResponses = {
+    /**
+     * OK
+     */
+    200: MailListBody;
+};
+
+export type GetV0CityByCityNameMailByBeadByBeadIdResponse = GetV0CityByCityNameMailByBeadByBeadIdResponses[keyof GetV0CityByCityNameMailByBeadByBeadIdResponses];
+
 export type GetV0CityByCityNameMailCountData = {
     body?: never;
     path: {

@@ -52,6 +52,14 @@ type MailGetInput struct {
 	Rig string `query:"rig" required:"false" doc:"Rig hint for O(1) lookup."`
 }
 
+// MailByBeadInput is the Huma input for GET /v0/city/{cityName}/mail/by-bead/{beadID}.
+type MailByBeadInput struct {
+	CityScope
+	BeadID string `path:"beadID" doc:"Bead id matched against message subject and body."`
+	Limit  int    `query:"limit" required:"false" doc:"Max messages to return (default 5, max 25)." minimum:"1"`
+	Kind   string `query:"kind" required:"false" doc:"Sender filter: executor (implementing agents only) or any (default)." enum:"executor,any"`
+}
+
 // MailSendInput is the Huma input for POST /v0/city/{cityName}/mail.
 type MailSendInput struct {
 	CityScope

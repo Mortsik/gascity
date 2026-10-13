@@ -11,6 +11,7 @@ import {
   getV0CityByCityNameFormulasFeed,
   getV0CityByCityNameHealth,
   getV0CityByCityNameMail,
+  getV0CityByCityNameMailByBeadByBeadId,
   getV0CityByCityNameMailThreadById,
   getV0CityByCityNameRigs,
   getV0CityByCityNameRunsCensus,
@@ -41,7 +42,7 @@ import type {
   GetV0CityByCityNameFormulasByNameData,
   GetHealthResponse,
   GetV0CityByCityNameHealthResponse,
-  GetV0CityByCityNameMailData,
+  GetV0CityByCityNameMailByBeadByBeadIdData, GetV0CityByCityNameMailData,
   GetV0CityByCityNameSessionByIdTranscriptData,
   GetV0CityByCityNameStatusResponse,
   GetV0CityByCityNameWorkflowByWorkflowIdData,
@@ -119,6 +120,11 @@ export interface SupervisorApi {
   listMail(
     cityName: string,
     query?: NonNullable<GetV0CityByCityNameMailData['query']>,
+  ): Promise<MailListBody>;
+  mailByBead(
+    cityName: string,
+    beadID: string,
+    query?: NonNullable<GetV0CityByCityNameMailByBeadByBeadIdData['query']>,
   ): Promise<MailListBody>;
   formulaFeed(
     cityName: string,
@@ -359,6 +365,16 @@ export function createSupervisorApi(options: CreateSupervisorApiOptions = {}): S
           ...(query === undefined ? {} : { query }),
         }) as Promise<SupervisorResult<MailListBody>>,
         'gc supervisor mail response was empty',
+      );
+    },
+    mailByBead(cityName, beadID, query) {
+      return unwrapSupervisorResult<MailListBody>(
+        getV0CityByCityNameMailByBeadByBeadId({
+          client,
+          path: { cityName, beadID },
+          ...(query === undefined ? {} : { query }),
+        }) as Promise<SupervisorResult<MailListBody>>,
+        'gc supervisor mail-by-bead response was empty',
       );
     },
     formulaFeed(cityName, query) {

@@ -93,6 +93,12 @@ var boundedLimitOnlyFeeds = map[string]bool{
 	"GET /v0/city/{cityName}/orders/feed":          true,
 	"GET /v0/city/{cityName}/runs":                 true,
 	"GET /v0/events":                               true,
+	// Bounded newest-first executor-mail lookup for the bead detail surface
+	// (dashboard 2026-10-13): hard max 25, single-page feed by design — a
+	// keyset walk over a substring match would promise more than the store
+	// indexes. Owner sign-off: the dashboard "last executor message"
+	// request, 2026-10-13 MAIN session.
+	"GET /v0/city/{cityName}/mail/by-bead/{beadID}": true,
 }
 
 type specParam struct {

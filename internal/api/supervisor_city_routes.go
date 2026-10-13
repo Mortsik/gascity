@@ -231,6 +231,7 @@ func (sm *SupervisorMux) registerCityRoutes() {
 	}, (*Server).humaHandleMailSend)
 	cityGet(sm, "/mail/count", (*Server).humaHandleMailCount, errorStatuses(http.StatusNotFound, http.StatusServiceUnavailable))
 	cityGet(sm, "/mail/thread/{id}", (*Server).humaHandleMailThread, errorStatuses(http.StatusNotFound, http.StatusServiceUnavailable))
+	cityGet(sm, "/mail/by-bead/{beadID}", (*Server).humaHandleMailByBead, errorStatuses(http.StatusBadRequest, http.StatusNotFound, http.StatusServiceUnavailable), describes("Messages whose subject or body mention the bead id, newest first — the dashboard bead detail uses it to surface the last executor READY/BLOCKED message for a closed issue."))
 	cityGet(sm, "/mail/{id}", (*Server).humaHandleMailGet, errorStatuses(http.StatusNotFound, http.StatusServiceUnavailable))
 	cityPost(sm, "/mail/{id}/read", (*Server).humaHandleMailRead, errorStatuses(http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound))
 	cityPost(sm, "/mail/{id}/mark-unread", (*Server).humaHandleMailMarkUnread, errorStatuses(http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound))
