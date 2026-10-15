@@ -2810,8 +2810,8 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 	// queued items get delivered even if the wake socket missed the
 	// enqueue (process race during supervisor restart, listener crash).
 	phaseStart = time.Now()
-	cr.nudgeDispatchTick(ctx)
-	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.nudge_dispatch_tick", phaseStart, nil)
+	nudgeTickStats := cr.nudgeDispatchTick(ctx)
+	recordPhase(TraceSiteControllerTickPhase, "bead_reconcile.nudge_dispatch_tick", phaseStart, nudgeDispatchTraceFields(nudgeTickStats))
 
 	// Idle recovery: re-nudge pool slots that are running but never claimed
 	// either their assigned/ready-routed trigger bead or the one ready graph-v2
@@ -3456,24 +3456,45 @@ func parseRFC3339Metadata(v string) (time.Time, bool) {
 // from the main run loop on wake-socket signal and (belt-and-suspenders)
 // at the end of each patrol tick so a missed wake doesn't strand a queue
 // item past the patrol interval.
-func (cr *CityRuntime) nudgeDispatchTick(_ context.Context) {
+// nudgeDispatchTickStats is one dispatch tick's outcome, surfaced so the
+// controller trace can record it (agent-forge-rs4h4 acceptance #1): the
+// delivered count and the tick's per-reason skip delta.
+type nudgeDispatchTickStats struct {
+	Delivered  int
+	SkipsDelta map[string]int64
+}
+
+// nudgeDispatchTraceFields renders tick stats as trace-record fields. The
+// delta is never nil so a clean tick still marshals as an empty object
+// rather than null.
+func nudgeDispatchTraceFields(stats nudgeDispatchTickStats) map[string]any {
+	delta := stats.SkipsDelta
+	if delta == nil {
+		delta = map[string]int64{}
+	}
+	return map[string]any{"delivered": stats.Delivered, "skips_delta": delta}
+}
+
+func (cr *CityRuntime) nudgeDispatchTick(_ context.Context) nudgeDispatchTickStats {
 	if !nudgeDispatcherIsSupervisor(cr.cfg) {
-		return
+		return nudgeDispatchTickStats{}
 	}
 	// Nudge ops route through the nudges accessor; the session snapshot it pairs
 	// them with is loaded via the sessions accessor inside loadSessionBeadSnapshot.
 	// Both collapse to the city store today.
 	store := cr.nudgesBeadStore()
 	if store.Store == nil {
-		return
+		return nudgeDispatchTickStats{}
 	}
 	sessionBeads := cr.loadSessionBeadSnapshot()
 	if sessionBeads == nil {
-		return
+		return nudgeDispatchTickStats{}
 	}
-	if _, err := dispatchAllQueuedNudges(cr.cityPath, cr.cfg, store.Store, cr.sessionsBeadStore().Store, cr.sp, sessionBeads, cr.stderr); err != nil {
+	delivered, skipDelta, err := dispatchAllQueuedNudges(cr.cityPath, cr.cfg, store.Store, cr.sessionsBeadStore().Store, cr.sp, sessionBeads, cr.stderr)
+	if err != nil {
 		fmt.Fprintf(cr.stderr, "%s: nudge dispatcher: %v\n", cr.logPrefix, err) //nolint:errcheck
 	}
+	return nudgeDispatchTickStats{Delivered: delivered, SkipsDelta: skipDelta}
 }
 
 func (cr *CityRuntime) controlDispatcherTick(ctx context.Context) {

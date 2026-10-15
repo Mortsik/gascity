@@ -156,6 +156,13 @@ type nudgeStatusJSON struct {
 	// file was created. Omitted when empty (legacy-mode cities never
 	// populate it; a fresh queue has no ticks recorded yet).
 	DispatchSkips map[string]int64 `json:"dispatch_skips,omitempty"`
+
+	// DispatchSkipLast is the most recent occurrence per skip reason (the
+	// counterpart of DispatchSkips), so the age — not just the running
+	// total — is visible: a reason with 4000 skips that last fired three
+	// weeks ago reads differently from one that fired two minutes ago.
+	// Omitted under the same conditions as DispatchSkips.
+	DispatchSkipLast map[string]time.Time `json:"dispatch_skip_last,omitempty"`
 }
 
 type nudgeStatusCounts struct {
@@ -366,8 +373,10 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 	// above already ran. Best-effort: a load failure here must not fail the
 	// whole status command over a diagnostics-only field.
 	var dispatchSkips map[string]int64
+	var dispatchSkipLast map[string]time.Time
 	if qs, qsErr := nudgequeue.LoadState(target.cityPath); qsErr == nil {
 		dispatchSkips = qs.DispatchSkips
+		dispatchSkipLast = qs.DispatchSkipLast
 	}
 
 	if jsonOutput {
@@ -386,7 +395,8 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 			Pending:       nonNilQueuedNudges(pending),
 			InFlight:      nonNilQueuedNudges(inFlight),
 			Dead:          nonNilQueuedNudges(dead),
-			DispatchSkips: dispatchSkips,
+			DispatchSkips:    dispatchSkips,
+			DispatchSkipLast: dispatchSkipLast,
 		}); err != nil {
 			fmt.Fprintf(stderr, "gc nudge status: writing JSON: %v\n", err) //nolint:errcheck
 			return 1
@@ -424,8 +434,13 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 	if len(dispatchSkips) > 0 {
 		fmt.Fprintln(stdout, "")                                                         //nolint:errcheck
 		fmt.Fprintln(stdout, "dispatch-tick skips (city-wide, all agents, cumulative):") //nolint:errcheck
+		now := time.Now()
 		for _, reason := range sortedNudgeDispatchSkipReasons(dispatchSkips) {
-			_, _ = fmt.Fprintf(stdout, "  %s=%d\n", reason, dispatchSkips[reason])
+			line := fmt.Sprintf("  %s=%d", reason, dispatchSkips[reason])
+			if last := dispatchSkipLast[reason]; !last.IsZero() {
+				line += fmt.Sprintf("  last=%s ago", now.Sub(last).Round(time.Second))
+			}
+			_, _ = fmt.Fprintln(stdout, line) //nolint:errcheck
 		}
 	}
 	return 0
@@ -849,7 +864,7 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 			if pollErr != nil {
 				skipReason = "not-delivered-error"
 			}
-			if recErr := recordNudgeDispatchSkips(target.cityPath, map[string]int64{skipReason: 1}); recErr != nil {
+			if recErr := recordNudgeDispatchSkips(target.cityPath, map[string]int64{skipReason: 1}, time.Now()); recErr != nil {
 				fmt.Fprintf(stderr, "gc nudge poll: recording dispatch skip counter: %v\n", recErr) //nolint:errcheck
 			}
 		}
@@ -2776,7 +2791,7 @@ func noMaintenanceDeadline() time.Time {
 // the per-session loop finishes, so it never nests inside the loop's own
 // withNudgeQueueState-backed calls (claimDueQueuedNudgesForTarget et al) —
 // the queue lock is a per-process flock and is not reentrant.
-func recordNudgeDispatchSkips(cityPath string, counts map[string]int64) error {
+func recordNudgeDispatchSkips(cityPath string, counts map[string]int64, now time.Time) error {
 	if len(counts) == 0 {
 		return nil
 	}
@@ -2784,8 +2799,18 @@ func recordNudgeDispatchSkips(cityPath string, counts map[string]int64) error {
 		if state.DispatchSkips == nil {
 			state.DispatchSkips = make(map[string]int64, len(counts))
 		}
+		if state.DispatchSkipLast == nil {
+			state.DispatchSkipLast = make(map[string]time.Time, len(counts))
+		}
 		for reason, n := range counts {
 			state.DispatchSkips[reason] += n
+			// Max INSIDE the locked callback: both the dispatcher and the
+			// poller stamp under this flock, and a slow tick finishing
+			// after a newer one must never roll the last-occurrence stamp
+			// back (critic REQUEST_CHANGES, candidate 16f112ae7 rework).
+			if now.After(state.DispatchSkipLast[reason]) {
+				state.DispatchSkipLast[reason] = now
+			}
 		}
 		return nil
 	})

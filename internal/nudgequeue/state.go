@@ -63,6 +63,15 @@ type State struct {
 	// stays visible to a `gc nudge status` invocation running in a
 	// different process than the supervisor that incremented it.
 	DispatchSkips map[string]int64 `json:"dispatch_skips,omitempty"`
+
+	// DispatchSkipLast records, per skip reason, the most recent time the
+	// dispatch tick recorded that skip. Maintained under the same flock as
+	// DispatchSkips; writers must merge with max() inside the locked
+	// callback — an out-of-order writer (a slow tick finishing after a
+	// newer one) must never roll the stamp back, or `gc nudge status`
+	// would report a false last-occurrence age (critic REQUEST_CHANGES on
+	// candidate 16f112ae7, rework admission).
+	DispatchSkipLast map[string]time.Time `json:"dispatch_skip_last,omitempty"`
 }
 
 // SortState orders items deterministically inside each queue bucket.

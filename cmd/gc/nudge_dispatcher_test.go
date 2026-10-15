@@ -118,7 +118,7 @@ func TestDispatchAllQueuedNudgesNoOpInLegacyMode(t *testing.T) {
 		t.Fatalf("enqueueQueuedNudge: %v", err)
 	}
 	cfg := &config.City{Daemon: config.DaemonConfig{}} // legacy default
-	delivered, err := dispatchAllQueuedNudges(dir, cfg, nil, nil, nil, newSessionBeadSnapshot(nil), nil)
+	delivered, _, err := dispatchAllQueuedNudges(dir, cfg, nil, nil, nil, newSessionBeadSnapshot(nil), nil)
 	if err != nil {
 		t.Fatalf("dispatchAllQueuedNudges: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestDispatchAllQueuedNudgesEmptyQueue(t *testing.T) {
 	disableManagedDoltRecoveryForTest(t)
 
 	dir := t.TempDir()
-	delivered, err := dispatchAllQueuedNudges(dir, supervisorCfg(), nil, nil, nil, newSessionBeadSnapshot(nil), nil)
+	delivered, _, err := dispatchAllQueuedNudges(dir, supervisorCfg(), nil, nil, nil, newSessionBeadSnapshot(nil), nil)
 	if err != nil {
 		t.Fatalf("dispatchAllQueuedNudges: %v", err)
 	}
@@ -163,7 +163,7 @@ func TestDispatchAllQueuedNudgesSweepsExpiredOrphanEvenWithoutMatch(t *testing.T
 		t.Fatalf("enqueueQueuedNudge: %v", err)
 	}
 
-	delivered, err := dispatchAllQueuedNudges(dir, supervisorCfg(), nil, nil, nil, newSessionBeadSnapshot(nil), nil)
+	delivered, _, err := dispatchAllQueuedNudges(dir, supervisorCfg(), nil, nil, nil, newSessionBeadSnapshot(nil), nil)
 	if err != nil {
 		t.Fatalf("dispatchAllQueuedNudges: %v", err)
 	}
@@ -209,7 +209,7 @@ func TestDispatchAllQueuedNudgesSkipsNotYetDue(t *testing.T) {
 		},
 	}
 	snapshot := newSessionBeadSnapshot([]beads.Bead{bead})
-	delivered, err := dispatchAllQueuedNudges(dir, supervisorCfg(), nil, nil, runtime.NewFake(), snapshot, nil)
+	delivered, _, err := dispatchAllQueuedNudges(dir, supervisorCfg(), nil, nil, runtime.NewFake(), snapshot, nil)
 	if err != nil {
 		t.Fatalf("dispatchAllQueuedNudges: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestDispatchAllQueuedNudgesDeliversAndAcks(t *testing.T) {
 		t.Fatalf("loadSessionBeadSnapshot: %v", err)
 	}
 
-	delivered, err := dispatchAllQueuedNudges(dir, supervisorCfg(), store.Store, store.Store, fake, snapshot, nil)
+	delivered, _, err := dispatchAllQueuedNudges(dir, supervisorCfg(), store.Store, store.Store, fake, snapshot, nil)
 	if err != nil {
 		t.Fatalf("dispatchAllQueuedNudges: %v", err)
 	}
@@ -331,7 +331,7 @@ func TestDispatchAllQueuedNudgesDeliversToIdleACPSession(t *testing.T) {
 	}
 	snapshot := newSessionBeadSnapshot([]beads.Bead{created})
 
-	delivered, err := dispatchAllQueuedNudges(dir, supervisorCfg(), store, store, fake, snapshot, nil)
+	delivered, _, err := dispatchAllQueuedNudges(dir, supervisorCfg(), store, store, fake, snapshot, nil)
 	if err != nil {
 		t.Fatalf("dispatchAllQueuedNudges: %v", err)
 	}
@@ -407,7 +407,7 @@ func TestDispatchAllQueuedNudgesSkipsACPSessionWhenNotRunning(t *testing.T) {
 	}
 	snapshot := newSessionBeadSnapshot([]beads.Bead{bead})
 	// Fake has no started session, so IsRunning("worker-session") is false.
-	delivered, err := dispatchAllQueuedNudges(dir, supervisorCfg(), nil, nil, runtime.NewFake(), snapshot, nil)
+	delivered, _, err := dispatchAllQueuedNudges(dir, supervisorCfg(), nil, nil, runtime.NewFake(), snapshot, nil)
 	if err != nil {
 		t.Fatalf("dispatchAllQueuedNudges: %v", err)
 	}
@@ -451,7 +451,7 @@ func TestDispatchAllQueuedNudgesRecordsSkipReasons(t *testing.T) {
 	// Fake has no started session, so IsRunning("worker-session") is false —
 	// the target is matched (queue has a pending "worker" item) but obs.Running
 	// comes back false, hitting the "not-running" skip.
-	delivered, err := dispatchAllQueuedNudges(dir, supervisorCfg(), nil, nil, runtime.NewFake(), snapshot, &debugOut)
+	delivered, delta, err := dispatchAllQueuedNudges(dir, supervisorCfg(), nil, nil, runtime.NewFake(), snapshot, &debugOut)
 	if err != nil {
 		t.Fatalf("dispatchAllQueuedNudges: %v", err)
 	}
@@ -472,6 +472,11 @@ func TestDispatchAllQueuedNudgesRecordsSkipReasons(t *testing.T) {
 	if got := state.DispatchSkips["not-running"]; got != 1 {
 		t.Fatalf("DispatchSkips[not-running] = %d, want 1 (full map: %#v)", got, state.DispatchSkips)
 	}
+	// Acceptance #1 (agent-forge-rs4h4): the tick's own delta returns to the
+	// caller so the controller trace can carry it as fields.
+	if delta == nil || delta["not-running"] != 1 {
+		t.Fatalf("skip delta = %#v, want not-running=1", delta)
+	}
 
 	// The routine skip: a fresh city whose queue holds a pending item for one
 	// agent while the only open session belongs to another. The loop reaches
@@ -483,7 +488,7 @@ func TestDispatchAllQueuedNudgesRecordsSkipReasons(t *testing.T) {
 		t.Fatalf("enqueueQueuedNudge: %v", err)
 	}
 	var unmatchedOut strings.Builder
-	delivered, err = dispatchAllQueuedNudges(otherDir, supervisorCfg(), nil, nil, runtime.NewFake(), snapshot, &unmatchedOut)
+	delivered, delta, err = dispatchAllQueuedNudges(otherDir, supervisorCfg(), nil, nil, runtime.NewFake(), snapshot, &unmatchedOut)
 	if err != nil {
 		t.Fatalf("dispatchAllQueuedNudges (not-matched): %v", err)
 	}
@@ -500,6 +505,34 @@ func TestDispatchAllQueuedNudgesRecordsSkipReasons(t *testing.T) {
 	}
 	if got := otherState.DispatchSkips["not-matched"]; got != 1 {
 		t.Fatalf("DispatchSkips[not-matched] = %d, want 1 (full map: %#v)", got, otherState.DispatchSkips)
+	}
+	if delta == nil || delta["not-matched"] != 1 {
+		t.Fatalf("second tick skip delta = %#v, want not-matched=1 (delta is per-tick, not cumulative)", delta)
+	}
+}
+
+// TestNudgeDispatchTraceFieldsCarriesDeliveredAndSkipDelta pins the
+// trace-field shape for the bead_reconcile.nudge_dispatch_tick phase record
+// (agent-forge-rs4h4 acceptance #1): the delivered count and the tick's
+// per-reason skip delta ride along as fields, and a clean tick still
+// marshals an empty delta object instead of null.
+func TestNudgeDispatchTraceFieldsCarriesDeliveredAndSkipDelta(t *testing.T) {
+	fields := nudgeDispatchTraceFields(nudgeDispatchTickStats{Delivered: 3, SkipsDelta: map[string]int64{"not-running": 2}})
+	if got := fields["delivered"]; got != 3 {
+		t.Fatalf("delivered field = %v, want 3", got)
+	}
+	delta, ok := fields["skips_delta"].(map[string]int64)
+	if !ok || delta["not-running"] != 2 {
+		t.Fatalf("skips_delta field = %#v, want map with not-running=2", fields["skips_delta"])
+	}
+
+	clean := nudgeDispatchTraceFields(nudgeDispatchTickStats{})
+	if got := clean["delivered"]; got != 0 {
+		t.Fatalf("clean tick delivered = %v, want 0", got)
+	}
+	delta, ok = clean["skips_delta"].(map[string]int64)
+	if !ok || delta == nil {
+		t.Fatalf("clean tick skips_delta = %#v, want non-nil empty map (null would read as missing)", clean["skips_delta"])
 	}
 }
 
@@ -523,7 +556,7 @@ func TestDispatchAllQueuedNudgesNilCfg(t *testing.T) {
 	if err := enqueueQueuedNudge(dir, newQueuedNudge("worker", "msg", time.Now().Add(-time.Minute))); err != nil {
 		t.Fatalf("enqueueQueuedNudge: %v", err)
 	}
-	delivered, err := dispatchAllQueuedNudges(dir, nil, nil, nil, nil, newSessionBeadSnapshot(nil), nil)
+	delivered, _, err := dispatchAllQueuedNudges(dir, nil, nil, nil, nil, newSessionBeadSnapshot(nil), nil)
 	if err != nil {
 		t.Fatalf("dispatchAllQueuedNudges: %v", err)
 	}
@@ -652,7 +685,7 @@ func TestDispatchAllQueuedNudgesResumesNotRunningTarget(t *testing.T) {
 		t.Fatalf("loadSessionBeadSnapshot: %v", err)
 	}
 
-	delivered, err := dispatchAllQueuedNudges(dir, supervisorCfg(), store.Store, store.Store, fake, snapshot, nil)
+	delivered, _, err := dispatchAllQueuedNudges(dir, supervisorCfg(), store.Store, store.Store, fake, snapshot, nil)
 	if err != nil {
 		t.Fatalf("dispatchAllQueuedNudges: %v", err)
 	}

@@ -2590,7 +2590,11 @@ func TestCmdNudgeStatusSurfacesDispatchSkips(t *testing.T) {
 	}
 	t.Setenv("GC_CITY", cityDir)
 
-	if err := recordNudgeDispatchSkips(cityDir, map[string]int64{"not-running": 3, "observe-error": 1}); err != nil {
+	// Fixed last-occurrence stamp: the status surface must expose the AGE
+	// of each skip reason (agent-forge-rs4h4 acceptance #2), not just the
+	// running total — an old total reads differently from a fresh one.
+	skipLast := time.Now().Add(-90 * time.Second)
+	if err := recordNudgeDispatchSkips(cityDir, map[string]int64{"not-running": 3, "observe-error": 1}, skipLast); err != nil {
 		t.Fatalf("recordNudgeDispatchSkips: %v", err)
 	}
 
@@ -2606,6 +2610,9 @@ func TestCmdNudgeStatusSurfacesDispatchSkips(t *testing.T) {
 	if result.DispatchSkips["not-running"] != 3 || result.DispatchSkips["observe-error"] != 1 {
 		t.Fatalf("dispatch_skips = %#v, want not-running=3 observe-error=1", result.DispatchSkips)
 	}
+	if !result.DispatchSkipLast["not-running"].Equal(skipLast) || !result.DispatchSkipLast["observe-error"].Equal(skipLast) {
+		t.Fatalf("dispatch_skip_last = %#v, want both stamps at %v", result.DispatchSkipLast, skipLast)
+	}
 
 	var textOut, textErr bytes.Buffer
 	code = cmdNudgeStatus([]string{"mayor"}, false, &textOut, &textErr)
@@ -2614,6 +2621,41 @@ func TestCmdNudgeStatusSurfacesDispatchSkips(t *testing.T) {
 	}
 	if !strings.Contains(textOut.String(), "not-running=3") || !strings.Contains(textOut.String(), "observe-error=1") {
 		t.Fatalf("text status missing skip-reason lines, got: %s", textOut.String())
+	}
+	if !strings.Contains(textOut.String(), "last=") {
+		t.Fatalf("text status missing last-occurrence age, got: %s", textOut.String())
+	}
+}
+
+// TestRecordNudgeDispatchSkipsPreservesMaxLastTimestamp pins the race fix
+// from the REQUEST_CHANGES verdict on candidate 16f112ae7 (rework of
+// agent-forge-rs4h4): both the dispatcher and the poller stamp
+// DispatchSkipLast under the queue flock, and a slow tick finishing after a
+// newer one must never roll the stamp back — otherwise `gc nudge status`
+// reports a false last-occurrence age. The merge must take the max INSIDE
+// the locked callback.
+func TestRecordNudgeDispatchSkipsPreservesMaxLastTimestamp(t *testing.T) {
+	cityDir := t.TempDir()
+	newer := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	older := newer.Add(-2 * time.Minute)
+
+	if err := recordNudgeDispatchSkips(cityDir, map[string]int64{"not-running": 1}, newer); err != nil {
+		t.Fatalf("record (newer): %v", err)
+	}
+	// Out-of-order writer: an older event arriving after the newer one.
+	if err := recordNudgeDispatchSkips(cityDir, map[string]int64{"not-running": 1}, older); err != nil {
+		t.Fatalf("record (older): %v", err)
+	}
+
+	state, err := nudgequeue.LoadState(cityDir)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if got := state.DispatchSkipLast["not-running"]; !got.Equal(newer) {
+		t.Fatalf("DispatchSkipLast[not-running] = %v, want newer %v preserved (out-of-order writer must not roll the stamp back)", got, newer)
+	}
+	if got := state.DispatchSkips["not-running"]; got != 2 {
+		t.Fatalf("DispatchSkips[not-running] = %d, want 2 (both events counted)", got)
 	}
 }
 
