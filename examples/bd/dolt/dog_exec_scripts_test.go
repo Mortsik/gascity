@@ -15,7 +15,12 @@ import (
 func runDogScriptCommand(t *testing.T, scriptName, binDir, cityPath, dataDir string, extraEnv ...string) (string, error) {
 	t.Helper()
 	root := repoRoot(t)
-	cmd := exec.Command("bash", filepath.Join(root, "assets", "scripts", scriptName))
+	// Absolute /bin/bash and a scrubbed BASH_ENV/ENV: binDir is prepended to
+	// PATH and holds fake executables with bash shebangs. A `bash` resolved
+	// from PATH (a user shim) plus an inherited BASH_ENV that shells out to
+	// grep/tail from that same PATH recurses on every fixture exec until the
+	// process limit is exhausted (12k+ processes on 2026-10-17).
+	cmd := exec.Command("/bin/bash", filepath.Join(root, "assets", "scripts", scriptName))
 	cmd.Env = append(filteredEnv(
 		"PATH",
 		"GC_CITY_PATH",
@@ -38,6 +43,8 @@ func runDogScriptCommand(t *testing.T, scriptName, binDir, cityPath, dataDir str
 		"GC_MAINTENANCE_DONE_TARGET",
 	),
 		"PATH="+binDir+":"+os.Getenv("PATH"),
+		"BASH_ENV=",
+		"ENV=",
 		"GC_CITY_PATH="+cityPath,
 		"GC_PACK_DIR="+root,
 		"GC_DOLT_DATA_DIR="+dataDir,

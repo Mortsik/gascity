@@ -112,8 +112,13 @@ func doctorSandbox(t *testing.T, opts doctorSandboxOpts) string {
 func runDoctorCheck(t *testing.T, sandboxBin string) (int, string) {
 	t.Helper()
 	root := repoRoot(t)
-	cmd := exec.Command("bash", filepath.Join(root, doctorCheckScript))
-	cmd.Env = append(filteredEnv("PATH"), "PATH="+sandboxBin)
+	// Absolute /bin/bash and a scrubbed BASH_ENV/ENV: sandboxBin is prepended
+	// to PATH and holds fake executables with bash shebangs. A PATH-resolved
+	// `bash` (a user shim) plus an inherited BASH_ENV that shells out to
+	// grep/tail from that same PATH recurses on every fixture exec (12k+
+	// processes on 2026-10-17).
+	cmd := exec.Command("/bin/bash", filepath.Join(root, doctorCheckScript))
+	cmd.Env = append(filteredEnv("PATH"), "PATH="+sandboxBin, "BASH_ENV=", "ENV=")
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		return 0, string(out)
