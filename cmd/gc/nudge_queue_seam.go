@@ -2,6 +2,7 @@ package main
 
 import (
 	"sync"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
@@ -24,8 +25,9 @@ type nudgeQueueHandle struct {
 
 // nudgeDispatchSkipRecorder persists and reads the dispatch skip counters.
 type nudgeDispatchSkipRecorder interface {
-	RecordDispatchSkips(map[string]int64) error
+	RecordDispatchSkips(counts map[string]int64, now time.Time) error
 	DispatchSkips() (map[string]int64, error)
+	DispatchSkipLast() (map[string]time.Time, error)
 }
 
 // nudgeClaimRepinner pins in-flight claims to a delivery key, all or nothing.

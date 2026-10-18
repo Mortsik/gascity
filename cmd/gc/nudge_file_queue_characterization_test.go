@@ -50,7 +50,7 @@ var nqCharVerbs = struct {
 	snapshotFor   func(city string, target nudgeTarget, now time.Time) ([]queuedNudge, []queuedNudge, []queuedNudge, error)
 	listFor       func(city string, target nudgeTarget, now time.Time) ([]queuedNudge, []queuedNudge, []queuedNudge, error)
 	listForAgent  func(city, agent string, now time.Time) ([]queuedNudge, []queuedNudge, []queuedNudge, error)
-	recordSkips   func(city string, counts map[string]int64) error
+	recordSkips   func(city string, counts map[string]int64, now time.Time) error
 	dispatchSkips func(city string) map[string]int64
 	rekey         func(city string, items []queuedNudge, bookkeepErr error) ([]queuedNudge, error)
 }{
@@ -72,7 +72,9 @@ var nqCharVerbs = struct {
 	snapshotFor:  listQueuedNudgesForTargetSnapshot,
 	listFor:      listQueuedNudgesForTarget,
 	listForAgent: listQueuedNudges,
-	recordSkips:  recordNudgeDispatchSkips,
+	recordSkips: func(city string, counts map[string]int64, now time.Time) error {
+		return recordNudgeDispatchSkips(city, counts, now)
+	},
 	dispatchSkips: func(city string) map[string]int64 {
 		skips, err := openNudgeQueue(city, beads.NudgesStore{}).Skips.DispatchSkips()
 		if err != nil {
@@ -723,12 +725,12 @@ func TestNudgeFileQueueCharacterizationMaintenanceAndReads(t *testing.T) {
 		return nqCharStatuses(v.classify(h.city, []string{"n-pad", "n-lapse", "n-kept", "n-nope"}, h.at(2*time.Second)))
 	})
 	h.step("record dispatch skips", func() string {
-		return nqCharErr(v.recordSkips(h.city, map[string]int64{"not-matched": 2, "kill-pending": 1}))
+		return nqCharErr(v.recordSkips(h.city, map[string]int64{"not-matched": 2, "kill-pending": 1}, time.Now()))
 	})
 	h.step("record dispatch skips again", func() string {
-		return nqCharErr(v.recordSkips(h.city, map[string]int64{"not-matched": 1}))
+		return nqCharErr(v.recordSkips(h.city, map[string]int64{"not-matched": 1}, time.Now()))
 	})
-	h.step("record no dispatch skips", func() string { return nqCharErr(v.recordSkips(h.city, nil)) })
+	h.step("record no dispatch skips", func() string { return nqCharErr(v.recordSkips(h.city, nil, time.Now())) })
 	h.step("read the dispatch skips", func() string { return fmt.Sprint(v.dispatchSkips(h.city)) })
 	h.storeOff = true
 	h.step("a sweep with no store keeps shadowed dead letters", func() string {
@@ -821,7 +823,7 @@ func TestNudgeFileQueueCharacterizationDispatch(t *testing.T) {
 	}
 	snapshot := newSessionBeadSnapshot([]beads.Bead{session("s-alpha", "alpha"), session("s-beta", "beta"), session("s-gamma", "gamma")})
 	h.step("dispatch one supervisor pass", func() string {
-		delivered, err := dispatchAllQueuedNudges(h.city, supervisorCfg(), h.store(), nil, runtime.NewFake(), snapshot, nil)
+		delivered, _, err := dispatchAllQueuedNudges(h.city, supervisorCfg(), h.store(), nil, runtime.NewFake(), snapshot, nil)
 		return fmt.Sprintf("delivered=%d err=%s", delivered, nqCharErr(err))
 	})
 	h.step("read the dispatch skip counters", func() string {

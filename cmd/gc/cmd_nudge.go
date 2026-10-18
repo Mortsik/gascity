@@ -177,6 +177,13 @@ type nudgeStatusJSON struct {
 	// file was created. Omitted when empty (legacy-mode cities never
 	// populate it; a fresh queue has no ticks recorded yet).
 	DispatchSkips map[string]int64 `json:"dispatch_skips,omitempty"`
+
+	// DispatchSkipLast is the most recent occurrence per skip reason (the
+	// counterpart of DispatchSkips), so the age — not just the running
+	// total — is visible: a reason with 4000 skips that last fired three
+	// weeks ago reads differently from one that fired two minutes ago.
+	// Omitted under the same conditions as DispatchSkips.
+	DispatchSkipLast map[string]time.Time `json:"dispatch_skip_last,omitempty"`
 }
 
 type nudgeStatusCounts struct {
@@ -447,6 +454,10 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 	if skips, skipsErr := openNudgeQueue(target.cityPath, beads.NudgesStore{}).Skips.DispatchSkips(); skipsErr == nil {
 		dispatchSkips = skips
 	}
+	var dispatchSkipLast map[string]time.Time
+	if last, lastErr := openNudgeQueue(target.cityPath, beads.NudgesStore{}).Skips.DispatchSkipLast(); lastErr == nil {
+		dispatchSkipLast = last
+	}
 
 	if jsonOutput {
 		if err := writeCLIJSONLine(stdout, nudgeStatusJSON{
@@ -461,10 +472,11 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 				InFlight: len(inFlight),
 				Dead:     len(dead),
 			},
-			Pending:       nonNilQueuedNudges(pending),
-			InFlight:      nonNilQueuedNudges(inFlight),
-			Dead:          nonNilQueuedNudges(dead),
-			DispatchSkips: dispatchSkips,
+			Pending:          nonNilQueuedNudges(pending),
+			InFlight:         nonNilQueuedNudges(inFlight),
+			Dead:             nonNilQueuedNudges(dead),
+			DispatchSkips:    dispatchSkips,
+			DispatchSkipLast: dispatchSkipLast,
 		}); err != nil {
 			fmt.Fprintf(stderr, "gc nudge status: writing JSON: %v\n", err) //nolint:errcheck
 			return 1
@@ -502,8 +514,13 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 	if len(dispatchSkips) > 0 {
 		fmt.Fprintln(stdout, "")                                                         //nolint:errcheck
 		fmt.Fprintln(stdout, "dispatch-tick skips (city-wide, all agents, cumulative):") //nolint:errcheck
+		now := time.Now()
 		for _, reason := range sortedNudgeDispatchSkipReasons(dispatchSkips) {
-			_, _ = fmt.Fprintf(stdout, "  %s=%d\n", reason, dispatchSkips[reason])
+			line := fmt.Sprintf("  %s=%d", reason, dispatchSkips[reason])
+			if last := dispatchSkipLast[reason]; !last.IsZero() {
+				line += fmt.Sprintf("  last=%s ago", now.Sub(last).Round(time.Second))
+			}
+			_, _ = fmt.Fprintln(stdout, line) //nolint:errcheck
 		}
 	}
 	return 0
@@ -1119,7 +1136,7 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 			if pollErr != nil {
 				skipReason = "not-delivered-error"
 			}
-			if recErr := openNudgeQueue(target.cityPath, beads.NudgesStore{}).Skips.RecordDispatchSkips(map[string]int64{skipReason: 1}); recErr != nil {
+			if recErr := openNudgeQueue(target.cityPath, beads.NudgesStore{}).Skips.RecordDispatchSkips(map[string]int64{skipReason: 1}, time.Now()); recErr != nil {
 				fmt.Fprintf(stderr, "gc nudge poll: recording dispatch skip counter: %v\n", recErr) //nolint:errcheck
 			}
 		}

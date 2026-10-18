@@ -122,12 +122,17 @@ func startNudgeWakeListener(ctx context.Context, cityPath string, wakeCh chan<- 
 // logNudgeDispatchSkip); pass nil to suppress (skip counts still accumulate
 // into the persisted queue state's DispatchSkips regardless of debugOut, so
 // `gc nudge status` stays informative even with GC_DEBUG unset).
-func dispatchAllQueuedNudges(cityPath string, cfg *config.City, store, sessStore beads.Store, sp runtime.Provider, sessionBeads *sessionBeadSnapshot, debugOut io.Writer) (int, error) {
+// dispatchAllQueuedNudges delivers every due queued nudge whose target has a
+// claimable open session, and returns the tick's outcome: the delivered count
+// plus this tick's per-reason skip delta (nil when nothing skipped), so the
+// controller trace can carry both as fields (agent-forge-rs4h4 acceptance #1)
+// instead of leaving silent skips invisible outside GC_DEBUG.
+func dispatchAllQueuedNudges(cityPath string, cfg *config.City, store, sessStore beads.Store, sp runtime.Provider, sessionBeads *sessionBeadSnapshot, debugOut io.Writer) (int, map[string]int64, error) {
 	if cfg == nil || sessionBeads == nil || cityPath == "" {
-		return 0, nil
+		return 0, nil, nil
 	}
 	if !nudgeDispatcherIsSupervisor(cfg) {
-		return 0, nil
+		return 0, nil, nil
 	}
 	return dispatchQueuedNudges(openNudgeQueue(cityPath, beads.NudgesStore{Store: store}), cityPath, cfg, store, sessStore, sp, sessionBeads, debugOut)
 }
@@ -135,7 +140,7 @@ func dispatchAllQueuedNudges(cityPath string, cfg *config.City, store, sessStore
 // dispatchQueuedNudges is the dispatcher pass of dispatchAllQueuedNudges over
 // queue. A DueKeys read that comes back partial still dispatches the agents it
 // read, and the pass reports its error.
-func dispatchQueuedNudges(queue nudgeQueueHandle, cityPath string, cfg *config.City, store, sessStore beads.Store, sp runtime.Provider, sessionBeads *sessionBeadSnapshot, debugOut io.Writer) (int, error) {
+func dispatchQueuedNudges(queue nudgeQueueHandle, cityPath string, cfg *config.City, store, sessStore beads.Store, sp runtime.Provider, sessionBeads *sessionBeadSnapshot, debugOut io.Writer) (int, map[string]int64, error) {
 	now := time.Now()
 	// Run the queue's TTL/max-attempts maintenance sweep unconditionally,
 	// independent of whether any item below matches an open session. The
@@ -145,7 +150,7 @@ func dispatchQueuedNudges(queue nudgeQueueHandle, cityPath string, cfg *config.C
 	// reach — leaving it in Pending past its ExpiresAt forever. See
 	// ra-oudpha finding-3.
 	if _, err := queue.Queue.Maintain(context.Background(), now); err != nil {
-		return 0, fmt.Errorf("nudge queue maintenance sweep: %w", err)
+		return 0, nil, fmt.Errorf("nudge queue maintenance sweep: %w", err)
 	}
 	// The agents with a due pending item, or with an in-flight item whose
 	// lease has expired: that one is recoverable on the next claim attempt,
@@ -156,16 +161,19 @@ func dispatchQueuedNudges(queue nudgeQueueHandle, cityPath string, cfg *config.C
 	dueKeys, err := queue.Queue.DueKeys(now)
 	if err != nil {
 		if !beads.IsPartialResult(err) {
-			return 0, fmt.Errorf("loading nudge queue: %w", err)
+			return 0, nil, fmt.Errorf("loading nudge queue: %w", err)
 		}
 		firstErr = fmt.Errorf("loading nudge queue: %w", err)
 	}
 	if len(dueKeys) == 0 {
-		return 0, firstErr
+		return 0, nil, firstErr
 	}
 	pendingAgents := make(map[string]bool, len(dueKeys))
 	for _, key := range dueKeys {
 		pendingAgents[key] = true
+	}
+	if len(pendingAgents) == 0 {
+		return 0, map[string]int64{}, nil
 	}
 
 	// The dispatcher receives the nudges-class store (store) PLUS the session-class
@@ -287,10 +295,10 @@ func dispatchQueuedNudges(queue nudgeQueueHandle, cityPath string, cfg *config.C
 		}
 		logNudgeDispatchSkip(debugOut, reason, target.agentKey(), target.sessionName, detail)
 	}
-	if err := queue.Skips.RecordDispatchSkips(skipCounts); err != nil && firstErr == nil {
+	if err := queue.Skips.RecordDispatchSkips(skipCounts, now); err != nil && firstErr == nil {
 		firstErr = fmt.Errorf("recording nudge dispatch skip counters: %w", err)
 	}
-	return delivered, firstErr
+	return delivered, skipCounts, firstErr
 }
 
 // logNudgeDispatchSkip emits a single GC_DEBUG-gated line documenting one

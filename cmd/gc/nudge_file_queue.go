@@ -521,7 +521,7 @@ func noMaintenanceDeadline() time.Time {
 // the per-session loop finishes, so it never nests inside the loop's own
 // withNudgeQueueState-backed calls (claimDueQueuedNudgesForTarget et al) —
 // the queue lock is a per-process flock and is not reentrant.
-func recordNudgeDispatchSkips(cityPath string, counts map[string]int64) error {
+func recordNudgeDispatchSkips(cityPath string, counts map[string]int64, now time.Time) error {
 	if len(counts) == 0 {
 		return nil
 	}
@@ -529,8 +529,18 @@ func recordNudgeDispatchSkips(cityPath string, counts map[string]int64) error {
 		if state.DispatchSkips == nil {
 			state.DispatchSkips = make(map[string]int64, len(counts))
 		}
+		if state.DispatchSkipLast == nil {
+			state.DispatchSkipLast = make(map[string]time.Time, len(counts))
+		}
 		for reason, n := range counts {
 			state.DispatchSkips[reason] += n
+			// Max INSIDE the locked callback: both the dispatcher and the
+			// poller stamp under this flock, and a slow tick finishing
+			// after a newer one must never roll the last-occurrence stamp
+			// back (critic REQUEST_CHANGES, candidate 16f112ae7 rework).
+			if now.After(state.DispatchSkipLast[reason]) {
+				state.DispatchSkipLast[reason] = now
+			}
 		}
 		return nil
 	})
@@ -1232,8 +1242,8 @@ func (q *fileNudgeQueue) Maintain(_ context.Context, now time.Time) (storebindin
 
 // RecordDispatchSkips adds a dispatch tick's skip counts to the persisted
 // totals.
-func (q *fileNudgeQueue) RecordDispatchSkips(counts map[string]int64) error {
-	return recordNudgeDispatchSkips(q.cityPath, counts)
+func (q *fileNudgeQueue) RecordDispatchSkips(counts map[string]int64, now time.Time) error {
+	return recordNudgeDispatchSkips(q.cityPath, counts, now)
 }
 
 // DispatchSkips reads the persisted skip totals without the lock.
@@ -1243,6 +1253,15 @@ func (q *fileNudgeQueue) DispatchSkips() (map[string]int64, error) {
 		return nil, err
 	}
 	return state.DispatchSkips, nil
+}
+
+// DispatchSkipLast reads the persisted last-occurrence stamps without the lock.
+func (q *fileNudgeQueue) DispatchSkipLast() (map[string]time.Time, error) {
+	state, err := nudgequeue.LoadState(q.cityPath)
+	if err != nil {
+		return nil, err
+	}
+	return state.DispatchSkipLast, nil
 }
 
 // RepinClaims pins the in-flight ids to batch, all or nothing.

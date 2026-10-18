@@ -177,6 +177,10 @@ state.json:
   "dispatch_skips": {
     "not-matched": 2,
     "not-running": 1
+  },
+  "dispatch_skip_last": {
+    "not-matched": "T-4",
+    "not-running": "T-4"
   }
 }
 
@@ -234,6 +238,10 @@ state.json:
   "dispatch_skips": {
     "not-matched": 2,
     "not-running": 1
+  },
+  "dispatch_skip_last": {
+    "not-matched": "T-4",
+    "not-running": "T-4"
   }
 }
 
