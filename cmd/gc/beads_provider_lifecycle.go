@@ -2200,6 +2200,13 @@ func initDefaultRigBdStore(cityPath, dir, prefix, doltDatabase string) error {
 	}
 	env := map[string]string{
 		"BEADS_DIR": filepath.Join(dir, ".beads"),
+		// bd init must settle the store schema client-side: this store lives on
+		// the shared city server, and a fresh scope created by a gc whose
+		// embedded schema knowledge lags the paired bd binary would otherwise
+		// be unreadable on the next city start (ghje0.3: `init rig "X" beads`
+		// → "table i does not have column storage_class"). No-op when the
+		// schema is already current.
+		"BD_ALLOW_REMOTE_MIGRATE": "1",
 	}
 	if err := pinBdGCEnvironment(env); err != nil {
 		return err
@@ -2230,6 +2237,13 @@ func initDefaultRigBdStore(cityPath, dir, prefix, doltDatabase string) error {
 	}
 	if _, err := beads.ExecCommandRunnerWithEnv(env)(dir, "bd", args...); err != nil {
 		if isBdAlreadyInitializedError(err) {
+			// An already-initialized scope may still predate the paired bd
+			// binary's schema (legacy rig stores). Best-effort client-side
+			// migration so the readiness `bd list` below does not refuse the
+			// scope; a no-op when the schema is already current.
+			if _, migErr := beads.ExecCommandRunnerWithEnv(env)(dir, "bd", "migrate", "schema"); migErr != nil {
+				fmt.Fprintf(os.Stderr, "gc: bd migrate schema for %s: %v (continuing)\n", dir, migErr) //nolint:errcheck // best-effort warning
+			}
 			return finalizeCanonicalBdScopeInit(cityPath, dir, prefix, canonicalDoltDatabase)
 		}
 		return fmt.Errorf("bd init: %w", err)

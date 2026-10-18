@@ -14933,3 +14933,74 @@ func TestInitAndHookDirEmbeddedRigSkipsManagedInit(t *testing.T) {
 	}
 	requireEmbeddedRigContractPreserved(t, rigPath)
 }
+
+// TestInitDefaultRigBdStore_remoteMigrateEnv verifies that the default rig
+// bd init asks bd to settle the store schema client-side: a fresh rig store
+// bootstrapped by a gc whose embedded schema knowledge lags the paired bd
+// binary would be unreadable on the next city start (ghje0.3 — `init rig "X"
+// beads` → "table i does not have column storage_class").
+func TestInitDefaultRigBdStore_remoteMigrateEnv(t *testing.T) {
+	cityDir := t.TempDir()
+	rigDir := t.TempDir()
+	callLog := filepath.Join(t.TempDir(), "calls.log")
+
+	binDir := t.TempDir()
+	fakeBd := filepath.Join(binDir, "bd")
+	fakeBdScript := fmt.Sprintf(`#!/bin/sh
+printf 'BD_ALLOW_REMOTE_MIGRATE=<%%s> args: %%s\n' "${BD_ALLOW_REMOTE_MIGRATE-}" "$*" >> %q
+exit 0
+`, callLog)
+	if err := os.WriteFile(fakeBd, []byte(fakeBdScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if err := initDefaultRigBdStore(cityDir, rigDir, "tr", ""); err != nil {
+		t.Fatalf("initDefaultRigBdStore: %v", err)
+	}
+	data, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatalf("read call log: %v", err)
+	}
+	if !strings.Contains(string(data), "BD_ALLOW_REMOTE_MIGRATE=<1>") {
+		t.Fatalf("bd init must run with BD_ALLOW_REMOTE_MIGRATE=1, calls:\n%s", data)
+	}
+}
+
+// TestInitDefaultRigBdStore_legacyStoreMigratedBeforeFinalize verifies that an
+// already-initialized rig store (older schema, legacy rig) gets a best-effort
+// client-side `bd migrate schema` before finalize — otherwise the readiness
+// `bd list` refuses the scope after a city restart (ghje0.3).
+func TestInitDefaultRigBdStore_legacyStoreMigratedBeforeFinalize(t *testing.T) {
+	cityDir := t.TempDir()
+	rigDir := t.TempDir()
+	callLog := filepath.Join(t.TempDir(), "calls.log")
+
+	binDir := t.TempDir()
+	fakeBd := filepath.Join(binDir, "bd")
+	fakeBdScript := fmt.Sprintf(`#!/bin/sh
+printf 'args: %%s\n' "$*" >> %q
+case "$1" in
+	init)
+		echo "database already initialized" >&2
+		exit 1
+		;;
+esac
+exit 0
+`, callLog)
+	if err := os.WriteFile(fakeBd, []byte(fakeBdScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if err := initDefaultRigBdStore(cityDir, rigDir, "tr", ""); err != nil {
+		t.Fatalf("initDefaultRigBdStore: %v", err)
+	}
+	data, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatalf("read call log: %v", err)
+	}
+	if !strings.Contains(string(data), "args: migrate schema") {
+		t.Fatalf("already-initialized scope must be migrated before finalize, calls:\n%s", data)
+	}
+}
