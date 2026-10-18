@@ -44,6 +44,7 @@ const baseApi: SupervisorApi = {
   replyMail: vi.fn(),
   sendMail: vi.fn(),
   mailThread: vi.fn(),
+  mailByBead: vi.fn(),
   cityEventStreamUrl: vi.fn(),
   sessionStreamUrl: vi.fn(),
   listSessions: vi.fn(),

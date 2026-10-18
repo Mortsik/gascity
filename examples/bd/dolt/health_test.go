@@ -20,6 +20,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/bazeltest"
 )
 
 // healthScript is the on-disk path to the health command script. The
@@ -30,6 +32,9 @@ const healthScript = "commands/health/run.sh"
 
 func repoRoot(t *testing.T) string {
 	t.Helper()
+	if root := bazeltest.OverrideRoot(); root != "" {
+		return filepath.Join(root, "examples", "bd", "dolt")
+	}
 	_, filename, _, _ := runtime.Caller(0)
 	return filepath.Dir(filename)
 }
@@ -1503,6 +1508,15 @@ func TestHealthScriptZombieScanExcludesRigLocalServers(t *testing.T) {
 			name:      "quoted port",
 			rigConfig: "dolt.port: \"19902\"\n",
 		},
+		{
+			// bd >= 1.3.1 writes `bd config set dolt.port` nested.
+			name:      "nested port",
+			rigConfig: "dolt:\n    disable-event-flush: true\n    port: 19902\n",
+		},
+		{
+			name:      "nested quoted port with comment",
+			rigConfig: "dolt:\n  port: '19902' # rig server\n",
+		},
 	}
 
 	for _, tc := range tests {
@@ -2030,12 +2044,13 @@ func writeQuarantineMarker(t *testing.T, cityPath, db, reason, createdAt string)
 	}
 }
 
-// writeQuarantineTransients drops the two transient siblings compact/run.sh
-// leaves in the quarantine directory alongside real markers: the mktemp
-// `<db>.probe.XXXXXX` write test that ensure_compact_marker_writable performs
-// on every flatten (empty), and the `<db>.tmp.XXXXXX` staging file
-// write_compact_marker fills before its atomic rename (full marker body).
-// Neither is a marker; health must ignore both.
+// writeQuarantineTransients drops the two non-dot transient siblings an
+// interrupted compact/run.sh from an earlier release can leave in the
+// quarantine directory beside real markers: the empty `<db>.probe.XXXXXX`
+// write test from ensure_compact_marker_writable, and the `<db>.tmp.XXXXXX`
+// staging file write_compact_marker fills before its atomic rename (full
+// marker body). Current releases stage both as dotfiles, which the health
+// glob skips. Neither is a marker; health must ignore both.
 func writeQuarantineTransients(t *testing.T, cityPath, db string) {
 	t.Helper()
 	dir := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine")
@@ -2068,8 +2083,8 @@ func TestHealthScriptSurfacesQuarantineInJSON(t *testing.T) {
 	}
 	created := time.Now().UTC().Add(-2 * time.Hour).Format("2006-01-02T15:04:05Z")
 	writeQuarantineMarker(t, cityPath, "hq", "post-flatten row count decreased", created)
-	// A concurrent compaction leaves transient siblings in this same
-	// directory; only the real marker may appear in the report.
+	// An interrupted pre-upgrade compaction leaves transient siblings in this
+	// same directory; only the real marker may appear in the report.
 	writeQuarantineTransients(t, cityPath, "hq")
 
 	// No live server: lsof/nc/dolt fail so the bounded probe is skipped and the
@@ -2193,11 +2208,11 @@ func TestHealthScriptQuarantineHumanExitCode(t *testing.T) {
 		}
 	})
 
-	// ensure_compact_marker_writable runs its mktemp probe on EVERY flatten,
-	// so a healthy city with an in-flight compaction routinely has a
-	// `<db>.probe.XXXXXX` sitting in the quarantine directory with no real
-	// marker beside it. Treating it as a marker would alarm operators (and
-	// flip the exit code to 2) during ordinary compaction.
+	// Earlier releases ran ensure_compact_marker_writable's mktemp probe as a
+	// non-dot `<db>.probe.XXXXXX` on EVERY flatten, so an upgraded city can
+	// still hold one in the quarantine directory with no real marker beside
+	// it. Treating it as a marker would alarm operators (and flip the exit
+	// code to 2) over a harmless leftover.
 	t.Run("transient siblings only exits 0 without section", func(t *testing.T) {
 		cityPath := mkCity(t)
 		writeQuarantineTransients(t, cityPath, "hq")

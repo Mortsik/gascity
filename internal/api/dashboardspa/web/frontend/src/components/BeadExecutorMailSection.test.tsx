@@ -22,6 +22,8 @@ describe('BeadExecutorMailSection', () => {
           messages: [
             {
               id: 'm2',
+              to: 'me',
+              read: false,
               from: 'poe-pricer/agentforge-core.agentforge-executor-adhoc-47827dd7c3',
               subject: 'READY: execute al6lr4 — pass',
               body: 'landed 1234 on origin/master',
@@ -29,6 +31,8 @@ describe('BeadExecutorMailSection', () => {
             },
             {
               id: 'm1',
+              to: 'me',
+              read: true,
               from: 'poe-pricer/agentforge-core.agentforge-executor-adhoc-47827dd7c3',
               subject: 'BLOCKED: waiting on lock',
               body: 'retrying',

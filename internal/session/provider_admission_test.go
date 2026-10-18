@@ -26,6 +26,16 @@ func writeAdmissionFile(t *testing.T, city, name, data string) {
 	}
 }
 
+// mustCityDir is the test's CityDir for an existing temp-dir city.
+func mustCityDir(t *testing.T, city string) CityDir {
+	t.Helper()
+	d, err := NewCityDir(city)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
+}
+
 // Missing enforcement at create must not manufacture failed attempts on every retry.
 func TestProviderAdmissionCreateDeniesBeforeBead(t *testing.T) {
 	for _, tc := range []struct{ name, marker, health string }{
@@ -82,10 +92,14 @@ func TestProviderAdmissionWakeRetainsSessionAndRecovers(t *testing.T) {
 			writeAdmissionFile(t, city, "provider-health-required.json", `{"schema_version":1,"providers":["custom"]}`)
 			writeAdmissionFile(t, city, "provider-health.json", `{"providers":[{"provider":"custom","status":"unhealthy","probed_at":1,"reason":"capacity unavailable","next_check_at":2}]}`)
 			start := mgr.Start
+			by := Actor{Kind: ActorOperator, City: mustCityDir(t, city)}
 			if runtimeOnly {
 				start = mgr.StartRuntimeOnly
 			}
-			err = start(context.Background(), info.ID, "fake", runtime.Config{})
+			// Admission precedes the runtime-only lease check (chat.go), so the
+			// denial still reads its detail without a caller lease — and takes
+			// nothing, the lease record included.
+			err = start(context.Background(), by, info.ID, "fake", runtime.Config{})
 			if err == nil || !strings.Contains(err.Error(), "capacity unavailable") || !strings.Contains(err.Error(), "next_check_at=2") {
 				t.Errorf("denial detail = %v", err)
 			}
@@ -97,7 +111,18 @@ func TestProviderAdmissionWakeRetainsSessionAndRecovers(t *testing.T) {
 				t.Error("denial started or stopped runtime")
 			}
 			writeAdmissionFile(t, city, "provider-health.json", fmt.Sprintf(`{"providers":[{"provider":"custom","status":"healthy","probed_at":%d}]}`, time.Now().Unix()))
-			if err := start(context.Background(), info.ID, "fake", runtime.Config{}); err != nil {
+			if runtimeOnly {
+				// The recovery start runs under the caller's lease: a
+				// runtime-only start takes none, and its lease record lands
+				// after the before/after denial comparison above.
+				lease, lerr := TryRuntimeLease(NewStore(beads.SessionStore{Store: store}), RuntimeLeaseRequest{City: city, Name: info.SessionName, ID: info.ID, TTL: time.Minute})
+				if lerr != nil {
+					t.Fatal(lerr)
+				}
+				defer lease.Release()
+				by.Lease = lease
+			}
+			if err := start(context.Background(), by, info.ID, "fake", runtime.Config{}); err != nil {
 				t.Fatal(err)
 			}
 			if sp.CountCalls("Start", info.SessionName) != 1 {
@@ -118,12 +143,12 @@ func TestProviderAdmissionLiveNudgeDoesNotDeliver(t *testing.T) {
 	writeAdmissionFile(t, city, "provider-health-required.json", `{"schema_version":1,"providers":["custom"]}`)
 	before, _ := store.Get(info.ID)
 	for _, immediate := range []bool{false, true} {
-		delivered, err := mgr.sendLiveOnly(context.Background(), info.ID, "queued work", immediate)
+		delivered, err := mgr.sendLiveOnly(context.Background(), info.ID, "queued work", immediate, nil)
 		if delivered || err == nil {
 			t.Errorf("denied live nudge: delivered=%v err=%v", delivered, err)
 		}
 	}
-	delivered, err := mgr.TryWaitIdleNudgeLiveOnly(context.Background(), info.ID, "queue", "queued work")
+	delivered, err := mgr.TryWaitIdleNudgeLiveOnly(context.Background(), info.ID, "queue", "queued work", nil)
 	if delivered || err == nil {
 		t.Errorf("denied idle nudge: delivered=%v err=%v", delivered, err)
 	}
@@ -151,7 +176,7 @@ func TestProviderAdmissionSubmitPrecedesRuntimeMutation(t *testing.T) {
 		before[method] = sp.CountCalls(method, info.SessionName)
 	}
 	for _, intent := range []SubmitIntent{SubmitIntentFollowUp, SubmitIntentInterruptNow} {
-		_, err := mgr.Submit(context.Background(), info.ID, "work", "fake", runtime.Config{}, intent)
+		_, err := mgr.Submit(context.Background(), Actor{Kind: ActorOperator}, info.ID, "work", "fake", runtime.Config{}, intent)
 		if !errors.Is(err, ErrProviderUnavailable) {
 			t.Errorf("intent %v: got %v, want provider deferral", intent, err)
 		}

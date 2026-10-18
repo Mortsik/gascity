@@ -27,7 +27,7 @@ func TestSendKeysLiteralWithRetry_FastFailsWhenTargetVanishesMidRetry(t *testing
 	tm.exec = exec
 
 	start := time.Now()
-	err := tm.sendKeysLiteralWithRetry("gt-vanished-target", "hello", 500*time.Millisecond)
+	err := tm.sendKeysLiteralWithRetry(context.Background(), "gt-vanished-target", "hello", 500*time.Millisecond)
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -77,7 +77,7 @@ func TestSendKeysLiteralWithRetry_KeepsRetryingWhenLivenessUnknown(t *testing.T)
 	tm := NewTmuxWithConfig(Config{NudgeRetryInterval: time.Millisecond})
 	tm.exec = exec
 
-	err := tm.sendKeysLiteralWithRetry("gt-liveness-unknown", "hello", 30*time.Millisecond)
+	err := tm.sendKeysLiteralWithRetry(context.Background(), "gt-liveness-unknown", "hello", 30*time.Millisecond)
 	if err == nil {
 		t.Fatal("sendKeysLiteralWithRetry = nil, want budget-exhausted error")
 	}
@@ -105,7 +105,7 @@ func TestSendKeysLiteralWithRetry_RetriesWhileTargetAlive(t *testing.T) {
 	tm := NewTmuxWithConfig(Config{NudgeRetryInterval: time.Millisecond})
 	tm.exec = exec
 
-	err := tm.sendKeysLiteralWithRetry("gt-respawned-target", "hello", 2*time.Second)
+	err := tm.sendKeysLiteralWithRetry(context.Background(), "gt-respawned-target", "hello", 2*time.Second)
 	if err != nil {
 		t.Fatalf("sendKeysLiteralWithRetry = %v, want nil after the target came back", err)
 	}

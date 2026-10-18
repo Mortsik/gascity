@@ -132,11 +132,24 @@ func TestStartPreparedStartCandidate_ZombieRecycleStillFiresWithoutLiveLease(t *
 	if err := store.SetMetadata(siblingID, "last_woke_at", stale.Format(time.RFC3339)); err != nil {
 		t.Fatal(err)
 	}
+	// A runtime-only start borrows the controller's session-name lease; this
+	// direct unit invocation must provide the same lease the production
+	// candidate carries.
+	cityPath := t.TempDir()
+	lease, err := sessionpkg.TryRuntimeLease(sessionpkg.NewStore(beads.SessionStore{Store: store}), sessionpkg.RuntimeLeaseRequest{
+		City: cityPath, Name: item.candidate.name(), ID: item.candidate.info.ID,
+		TTL: sessionpkg.RuntimeLeaseTTL(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	item.candidate.lease = lease
 
 	started, err := startPreparedStartCandidate(
 		context.Background(),
 		item,
-		"",
+		cityPath,
 		store,
 		sp,
 		cfg,

@@ -141,6 +141,32 @@ func TestDoRigStatusJSON(t *testing.T) {
 	}
 }
 
+func TestDoRigStatusJSONUsesRuntimeRigSuspension(t *testing.T) {
+	cityPath := t.TempDir()
+	suspended := true
+	if err := suspensionstate.SetRigSuspended(fsys.OSFS{}, cityPath, "frontend", &suspended); err != nil {
+		t.Fatalf("SetRigSuspended: %v", err)
+	}
+	rig := config.Rig{Name: "frontend", Path: "/tmp/frontend"}
+
+	var stdout, stderr bytes.Buffer
+	code := doRigStatusWithStoreAndSnapshot(
+		runtime.NewFake(), newFakeDrainOps(), rig, nil,
+		cityPath, "city", "", &config.City{Rigs: []config.Rig{rig}}, nil,
+		newSessionBeadSnapshot(nil), true, &stdout, &stderr,
+	)
+	if code != 0 {
+		t.Fatalf("doRigStatusWithStoreAndSnapshot --json = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	var result RigStatusJSON
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &result); err != nil {
+		t.Fatalf("invalid JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if !result.Rig.Suspended {
+		t.Fatal("rig suspended = false, want runtime suspension")
+	}
+}
+
 func TestDoRigStatusSuspendedRig(t *testing.T) {
 	sp := runtime.NewFake()
 	dops := newFakeDrainOps()

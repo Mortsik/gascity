@@ -39,6 +39,7 @@ const baseApi: SupervisorApi = {
   replyMail: vi.fn(),
   sendMail: vi.fn(),
   mailThread: vi.fn(),
+  mailByBead: vi.fn(),
   cityEventStreamUrl: vi.fn(),
   sessionStreamUrl: vi.fn(),
   listSessions: vi.fn(),
@@ -77,7 +78,7 @@ describe('supervisor bead writes', () => {
       created_at: '2026-06-01T00:00:00Z',
     }));
     const sling = vi.fn(async () => ({
-      status: 'ok',
+      status: 'slung' as const,
       bead: 'td-new-1',
       target: 'mayor',
     }));
@@ -110,7 +111,7 @@ describe('supervisor bead writes', () => {
       issue_type: 'task',
       created_at: '2026-06-01T00:00:00Z',
     }));
-    const sling = vi.fn(async () => ({ status: 'ok', bead: 'td-new-1', target: 'mayor' }));
+    const sling = vi.fn(async () => ({ status: 'slung' as const, bead: 'td-new-1', target: 'mayor' }));
     setSupervisorApiForTests({ ...baseApi, createBead, sling });
 
     await expect(
@@ -147,7 +148,7 @@ describe('supervisor bead writes', () => {
       issue_type: 'task',
       created_at: '2026-06-01T00:00:00Z',
     }));
-    const sling = vi.fn(async () => ({ status: 'ok', bead: 'td-new-1', target: 'mayor' }));
+    const sling = vi.fn(async () => ({ status: 'slung' as const, bead: 'td-new-1', target: 'mayor' }));
     const closeBead = vi.fn(async () => ({ status: 'closed' }));
     setSupervisorApiForTests({
       ...baseApi,

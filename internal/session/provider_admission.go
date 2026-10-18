@@ -122,10 +122,21 @@ func LoadProviderHealthSnapshot(cityPath string, now time.Time) *ProviderHealthS
 // next_check_at keep the legacy probed_at TTL. A next_check_at implausibly
 // far in the future (no live publisher writes one) is not trusted either.
 func healthyEvidenceFresh(r providerHealthRecord, now float64) bool {
-	if r.NextCheckAt > 0 && r.NextCheckAt <= now+ProviderHealthTTL.Seconds() {
-		return now <= r.NextCheckAt+ProviderRefreshGrace.Seconds()
+	return HealthRecordEvidenceFresh(r.ProbedAt, r.NextCheckAt, now)
+}
+
+// HealthRecordEvidenceFresh reports whether a provider-health record's
+// evidence is still trusted at now (unix seconds). Exported for cmd/gc's
+// reconciler-side snapshot, which parses provider-health.json with its own
+// record type: the publisher's next_check_at is the refresh contract — a
+// record stays trusted until the deadline plus one refresh grace (probed_at
+// carries the upstream observation lag, agent-forge-769p); records without a
+// usable deadline keep the strict probed_at TTL.
+func HealthRecordEvidenceFresh(probedAt, nextCheckAt, now float64) bool {
+	if nextCheckAt > 0 && nextCheckAt <= now+ProviderHealthTTL.Seconds() {
+		return now <= nextCheckAt+ProviderRefreshGrace.Seconds()
 	}
-	return r.ProbedAt > 0 && r.ProbedAt <= now && now-r.ProbedAt <= ProviderHealthTTL.Seconds()
+	return probedAt > 0 && probedAt <= now && now-probedAt <= ProviderHealthTTL.Seconds()
 }
 
 // Check requires a fresh healthy observation for opted-in exact provider names.

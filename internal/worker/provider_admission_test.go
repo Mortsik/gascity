@@ -27,7 +27,7 @@ func TestProviderAdmissionStartDoesNotMaterializeAttempt(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := h.Start(context.Background()); err == nil {
+		if err := h.Start(context.Background(), sessionpkg.Actor{Kind: sessionpkg.ActorOperator}); err == nil {
 			t.Fatal("unavailable provider admitted")
 		}
 	}

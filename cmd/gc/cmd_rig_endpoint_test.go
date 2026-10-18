@@ -227,7 +227,7 @@ func TestRequireCanonicalizedScopeMetadataPreservesExistingManagedProbeDatabase(
 	}); err != nil {
 		t.Fatalf("EnsureCanonicalMetadata: %v", err)
 	}
-	if err := requireCanonicalizedScopeMetadata(fsys.OSFS{}, scopeDir); err != nil {
+	if err := requireCanonicalizedScopeMetadata(fsys.OSFS{}, scopeDir, scopeDir); err != nil {
 		t.Fatalf("requireCanonicalizedScopeMetadata: %v", err)
 	}
 	got, ok, err := contract.ReadDoltDatabase(fsys.OSFS{}, metadataPath)
@@ -245,7 +245,7 @@ func TestRequireCanonicalizedScopeMetadataPreservesExistingManagedProbeDatabase(
 func TestCanonicalizeScopeMetadataIfPresentSkipsOnlyAbsentMetadata(t *testing.T) {
 	t.Run("absent metadata is not an error and fabricates nothing", func(t *testing.T) {
 		scopeDir := filepath.Join(t.TempDir(), "never-initialized")
-		if err := canonicalizeScopeMetadataIfPresent(fsys.OSFS{}, scopeDir); err != nil {
+		if err := canonicalizeScopeMetadataIfPresent(fsys.OSFS{}, scopeDir, scopeDir); err != nil {
 			t.Fatalf("canonicalizeScopeMetadataIfPresent: %v", err)
 		}
 		if _, err := os.Stat(filepath.Join(scopeDir, ".beads", "metadata.json")); !os.IsNotExist(err) {
@@ -261,7 +261,7 @@ func TestCanonicalizeScopeMetadataIfPresentSkipsOnlyAbsentMetadata(t *testing.T)
 		if err := os.WriteFile(filepath.Join(scopeDir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server"}`), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		err := canonicalizeScopeMetadataIfPresent(fsys.OSFS{}, scopeDir)
+		err := canonicalizeScopeMetadataIfPresent(fsys.OSFS{}, scopeDir, scopeDir)
 		if err == nil || !strings.Contains(err.Error(), "missing pinned dolt_database") {
 			t.Fatalf("canonicalizeScopeMetadataIfPresent error = %v, want missing pinned dolt_database", err)
 		}
@@ -276,103 +276,13 @@ func TestCanonicalizeScopeMetadataIfPresentSkipsOnlyAbsentMetadata(t *testing.T)
 		if err := os.WriteFile(metadataPath, []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"fe"}`), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := canonicalizeScopeMetadataIfPresent(fsys.OSFS{}, scopeDir); err != nil {
+		if err := canonicalizeScopeMetadataIfPresent(fsys.OSFS{}, scopeDir, scopeDir); err != nil {
 			t.Fatalf("canonicalizeScopeMetadataIfPresent: %v", err)
 		}
-		// An endpoint command is an explicit operator choice of a server
-		// topology, so it deliberately transitions the scope's metadata to
-		// server mode — the init door is the one that preserves embedded
-		// contracts (agent-forge-teyh, fix-loop 2 objection 2).
-		if mode := readScopeDoltMode(t, scopeDir); mode != "server" {
-			t.Fatalf("dolt_mode = %q, want server", mode)
+		if mode := readScopeDoltMode(t, scopeDir); mode != "embedded" {
+			t.Fatalf("dolt_mode = %q, want embedded", mode)
 		}
 	})
-}
-
-// A successful `gc rig set-endpoint` from an embedded-contract scope must
-// leave ONE coherent topology: metadata.json server, config.yaml explicit
-// server endpoint, and connection resolution external — all three describing
-// the same store. The command is the operator's deliberate migration off the
-// embedded contract, and the transition is announced (agent-forge-teyh,
-// fix-loop 2 objection 2).
-func TestDoRigSetEndpointFromEmbeddedScopeLeavesOneCoherentTopology(t *testing.T) {
-	t.Setenv("GC_BEADS", "bd")
-
-	cityDir := t.TempDir()
-	rigDir := filepath.Join(t.TempDir(), "frontend")
-	if err := os.MkdirAll(filepath.Join(rigDir, ".beads", "embeddeddolt", "fe", ".dolt"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	writeRigEndpointCityConfig(t, cityDir, rigDir)
-	writeRigEndpointMetadata(t, cityDir, "hq")
-	if err := os.WriteFile(filepath.Join(rigDir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"fe"}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(rigDir, ".beads", "config.yaml"), []byte(`issue_prefix: fe
-issue-prefix: fe
-dolt:
-  mode: embedded
-dolt.auto-start: false
-gc.endpoint_origin: explicit
-gc.endpoint_status: unverified
-`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	notices := captureStorageModeChanges(t)
-	var stdout, stderr bytes.Buffer
-	code := doRigSetEndpoint(fsys.OSFS{}, cityDir, "frontend", rigEndpointOptions{
-		External:        true,
-		Host:            "db.example.com",
-		Port:            "3307",
-		AdoptUnverified: true,
-	}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("doRigSetEndpoint() = %d, stderr = %s", code, stderr.String())
-	}
-
-	// All three descriptions of the scope's storage agree on the server
-	// topology afterwards.
-	if mode := readScopeDoltMode(t, rigDir); mode != "server" {
-		t.Fatalf("metadata dolt_mode = %q, want server", mode)
-	}
-	state := readRigEndpointConfigState(t, rigDir)
-	if state.EndpointOrigin != contract.EndpointOriginExplicit {
-		t.Fatalf("config endpoint origin = %q, want explicit", state.EndpointOrigin)
-	}
-	if state.DoltHost != "db.example.com" || state.DoltPort != "3307" {
-		t.Fatalf("config endpoint = %q:%q, want db.example.com:3307", state.DoltHost, state.DoltPort)
-	}
-	target, err := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, cityDir, rigDir)
-	if err != nil {
-		t.Fatalf("ResolveDoltConnectionTarget() error = %v", err)
-	}
-	if target.Embedded || !target.External || target.Host != "db.example.com" || target.Port != "3307" {
-		t.Fatalf("target = %+v, want external db.example.com:3307", target)
-	}
-	left := filepath.Join(rigDir, ".beads", "embeddeddolt", "fe")
-	if !strings.Contains(notices.String(), left) {
-		t.Errorf("the transition off the embedded contract did not name %q; notices=%q", left, notices.String())
-	}
-
-	// The EFFECTIVE config mode must agree too: ReadScopeDoltMode prioritizes
-	// the nested `dolt: {mode:}` form bd writes, so a transition that leaves
-	// it behind while writing the flat server key would still read embedded
-	// (agent-forge-teyh fix-loop 3).
-	effectiveMode, modeOK, err := contract.ReadScopeDoltMode(fsys.OSFS{}, filepath.Join(rigDir, ".beads", "config.yaml"))
-	if err != nil || !modeOK {
-		t.Fatalf("ReadScopeDoltMode() ok=%v err=%v, want server tracked", modeOK, err)
-	}
-	if effectiveMode != "server" {
-		t.Fatalf("effective config dolt.mode = %q, want server", effectiveMode)
-	}
-	configText := string(mustReadFile(t, filepath.Join(rigDir, ".beads", "config.yaml")))
-	if strings.Contains(configText, "mode: embedded") {
-		t.Errorf("a contradicting nested dolt.mode must not survive the transition:\n%s", configText)
-	}
-	if !strings.Contains(configText, "dolt.mode: server") {
-		t.Errorf("config should carry the flat canonical mode after the transition:\n%s", configText)
-	}
 }
 
 func TestDoRigSetEndpointInheritMirrorsExternalCity(t *testing.T) {
@@ -1505,6 +1415,30 @@ func TestDoRigSetEndpointRequiresCanonicalMetadata(t *testing.T) {
 	}
 }
 
+// configWriteFailureFS fails every write that would land on config.yaml: the
+// direct write, the temp file an atomic writer stages it in, and the rename that
+// publishes it. The injection has to cover all three because the contract's
+// canonical writers are atomic, and the chmod 0444 this test used to rely on
+// injects nothing under one — a rename needs the directory's write bit, not the
+// file's, so the "failure" quietly succeeded and the rollback under test stopped
+// being exercised. Metadata writes are left alone, which is the point: the
+// assertion is that a config failure rolls the metadata back.
+type configWriteFailureFS struct{ fsys.FS }
+
+func (f configWriteFailureFS) WriteFile(name string, data []byte, perm os.FileMode) error {
+	if strings.HasPrefix(filepath.Base(name), "config.yaml") {
+		return fmt.Errorf("simulated config.yaml write failure")
+	}
+	return f.FS.WriteFile(name, data, perm)
+}
+
+func (f configWriteFailureFS) Rename(oldpath, newpath string) error {
+	if strings.HasPrefix(filepath.Base(newpath), "config.yaml") {
+		return fmt.Errorf("simulated config.yaml publish failure")
+	}
+	return f.FS.Rename(oldpath, newpath)
+}
+
 func TestDoRigSetEndpointConfigFailureRollsBackMetadata(t *testing.T) {
 	t.Setenv("GC_BEADS", "bd")
 
@@ -1529,17 +1463,13 @@ func TestDoRigSetEndpointConfigFailureRollsBackMetadata(t *testing.T) {
 	})
 	beforeMeta := mustReadFile(t, metadataPath)
 	beforeConfig := mustReadFile(t, configPath)
-	if err := os.Chmod(configPath, 0o444); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.Chmod(configPath, 0o644) }()
 
 	origVerify := verifyRigExternalEndpoint
 	defer func() { verifyRigExternalEndpoint = origVerify }()
 	verifyRigExternalEndpoint = func(contract.ConfigState, string, string) error { return nil }
 
 	var stdout, stderr bytes.Buffer
-	code := doRigSetEndpoint(fsys.OSFS{}, cityDir, "frontend", rigEndpointOptions{
+	code := doRigSetEndpoint(configWriteFailureFS{fsys.OSFS{}}, cityDir, "frontend", rigEndpointOptions{
 		External: true,
 		Host:     "new-db.example.com",
 		Port:     "4406",

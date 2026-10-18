@@ -56,7 +56,7 @@ func TestFrontDoorStoreFreeFilesStayStoreFree(t *testing.T) {
 	if !ok {
 		t.Fatal("runtime.Caller failed")
 	}
-	dir := filepath.Dir(currentFile)
+	dir := gcCallerDir(currentFile)
 	for _, name := range frontDoorStoreFreeFiles {
 		path := filepath.Join(dir, name)
 		data, err := os.ReadFile(path)
@@ -120,7 +120,7 @@ func TestSnapshotInfoOnlyFilesStayOnInfoAccessors(t *testing.T) {
 	if !ok {
 		t.Fatal("runtime.Caller failed")
 	}
-	dir := filepath.Dir(currentFile)
+	dir := gcCallerDir(currentFile)
 	for _, name := range snapshotInfoOnlyFiles {
 		path := filepath.Join(dir, name)
 		data, err := os.ReadFile(path)
@@ -209,7 +209,7 @@ func TestMetadataInfoOnlyFilesStayOnInfoSnapshot(t *testing.T) {
 	if !ok {
 		t.Fatal("runtime.Caller failed")
 	}
-	dir := filepath.Dir(currentFile)
+	dir := gcCallerDir(currentFile)
 	for _, name := range metadataInfoOnlyFiles {
 		path := filepath.Join(dir, name)
 		data, err := os.ReadFile(path)
@@ -409,6 +409,11 @@ var sessionRelocationRoutedFiles = []string{
 	// relocated sessions class — a green result that reads as "no stuck
 	// sessions" when the check simply looked in the wrong store.
 	"doctor_startup_health.go",
+	// `gc agent is-foreign` vouches for a claimant through this city's session
+	// records. Unrouted, it finds none under a relocated sessions class, so every
+	// dead local claim the orphan-sweep order asks about reads as foreign and is
+	// kept forever.
+	"cmd_agent_is_foreign.go",
 }
 
 // sessionRelocationForbidden are the UNROUTED session-front-door constructions a
@@ -439,7 +444,7 @@ func TestSessionRelocationRootsRouteThroughSessionClassStore(t *testing.T) {
 	if !ok {
 		t.Fatal("runtime.Caller failed")
 	}
-	dir := filepath.Dir(currentFile)
+	dir := gcCallerDir(currentFile)
 	for _, name := range sessionRelocationRoutedFiles {
 		path := filepath.Join(dir, name)
 		data, err := os.ReadFile(path)
@@ -477,7 +482,7 @@ func TestGraphRelocationRootsRouteThroughGraphClassStore(t *testing.T) {
 	if !ok {
 		t.Fatal("runtime.Caller failed")
 	}
-	dir := filepath.Dir(currentFile)
+	dir := gcCallerDir(currentFile)
 	for _, name := range graphRelocationRoutedFiles {
 		path := filepath.Join(dir, name)
 		data, err := os.ReadFile(path)

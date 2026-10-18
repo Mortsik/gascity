@@ -290,11 +290,15 @@ func doRigStatusWithStoreAndSnapshot(
 	stdout, stderr io.Writer,
 ) int {
 	registerStatusProviderACPRoutes(sp, statusSnapshot, cityName, cfg)
+	suspState, err := loadSuspensionState(fsys.OSFS{}, cityPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc rig status: loading suspension state: %v\n", err) //nolint:errcheck
+		return 1
+	}
 	if jsonOutput {
-		return renderRigStatusJSON(sp, dops, rig, agents, cityPath, cityName, sessionTemplate, cfg, store, statusSnapshot, stdout, stderr)
+		return renderRigStatusJSON(sp, dops, rig, agents, cityPath, cityName, sessionTemplate, cfg, store, statusSnapshot, suspState, stdout, stderr)
 	}
 
-	suspState, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
 	suspStr := "no"
 	if suspensionstate.EffectiveRigSuspended(suspState, rig.Name, rig.EffectiveSuspendedOnStart()) {
 		suspStr = "yes"
@@ -333,13 +337,14 @@ func renderRigStatusJSON(
 	cfg *config.City,
 	store beads.Store,
 	statusSnapshot *sessionBeadSnapshot,
+	suspState suspensionstate.State,
 	stdout, stderr io.Writer,
 ) int {
 	// Render suspension from the canonical runtime state — the same
 	// loadSuspensionState + EffectiveRigSuspended merge the text path
 	// uses — so --json and text never disagree after a runtime
 	// suspend/resume recorded in .gc/runtime/suspension-state.json.
-	suspState, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
+	suspState, _ = loadSuspensionState(fsys.OSFS{}, cityPath)
 	result := RigStatusJSON{
 		SchemaVersion: "1",
 		CityPath:      cityPath,

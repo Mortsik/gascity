@@ -32,7 +32,7 @@ func TestWaitIdleNudgeDeliversForClaudeDerivativeFamily(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := mgr.Start(context.Background(), info.ID, "", runtime.Config{WorkDir: city}); err != nil {
+			if err := mgr.Start(context.Background(), Actor{Kind: ActorOperator}, info.ID, "", runtime.Config{WorkDir: city}); err != nil {
 				t.Fatal(err)
 			}
 			// The Fake's WaitForIdle returns ErrInteractionUnsupported unless a
@@ -40,7 +40,7 @@ func TestWaitIdleNudgeDeliversForClaudeDerivativeFamily(t *testing.T) {
 			// blocks until idle and returns nil. Register nil: "supported".
 			sp.WaitForIdleErrors[info.SessionName] = nil
 			t.Logf("pre: IsRunning(%q)=%v", info.SessionName, sp.IsRunning(info.SessionName))
-			delivered, err := mgr.TryWaitIdleNudgeLiveOnly(context.Background(), info.ID, "queue", "claim the next step")
+			delivered, err := mgr.TryWaitIdleNudgeLiveOnly(context.Background(), info.ID, "queue", "claim the next step", nil)
 			if err != nil {
 				t.Fatalf("TryWaitIdleNudgeLiveOnly: %v", err)
 			}

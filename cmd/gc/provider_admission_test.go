@@ -47,8 +47,10 @@ func TestRequiredProviderQueuedNudgeDenialPrecedesObservation(t *testing.T) {
 	}
 	requireAdmissionProvider(t, city)
 	beforeCalls := len(fake.SnapshotCalls())
-	delivered, err := tryDeliverQueuedNudgesByPoller(nudgeTarget{cityPath: city, agent: config.Agent{Name: "worker"}, sessionID: info.ID, sessionName: info.SessionName,
-		resolved: &config.ResolvedProvider{Name: "custom"}}, store, store, fake, 0, worker.LiveObservation{Running: true})
+	delivered, err := tryDeliverQueuedNudgesByPoller(nudgeTarget{
+		cityPath: city, agent: config.Agent{Name: "worker"}, sessionID: info.ID, sessionName: info.SessionName,
+		resolved: &config.ResolvedProvider{Name: "custom"},
+	}, store, store, fake, 0, worker.LiveObservation{Running: true})
 	if delivered || err != nil {
 		t.Fatalf("provider hold should leave work queued: delivered=%v err=%v", delivered, err)
 	}
@@ -75,6 +77,30 @@ func TestRequiredProviderSnapshotDoesNotFailOpen(t *testing.T) {
 		if healthy, _ := snap.check("second"); !healthy {
 			t.Error("optional second provider denied")
 		}
+	}
+	// Fresh, healthy evidence is the one admission a required provider gets.
+	writeHealthCache(t, city, "custom", "healthy", nowSecs())
+	snap := loadProviderHealthSnapshot(city)
+	if healthy, present := snap.check("custom"); !healthy || !present {
+		t.Errorf("fresh healthy required = (%v, %v), want (true, true)", healthy, present)
+	}
+	// A malformed policy denies every provider, required or not, mirroring
+	// session.ProviderHealthSnapshot.Check on the admission side.
+	for name, body := range map[string]string{
+		"wrong schema version": `{"schema_version":2,"providers":["custom"]}`,
+		"unparsable":           `{"schema_version":`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(filepath.Join(city, ".gc", "cache", "provider-health-required.json"), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			bad := loadProviderHealthSnapshot(city)
+			for _, provider := range []string{"custom", "second"} {
+				if healthy, present := bad.check(provider); healthy || !present {
+					t.Errorf("%s admitted under a malformed policy: healthy=%v present=%v", provider, healthy, present)
+				}
+			}
+		})
 	}
 }
 
@@ -103,7 +129,7 @@ func TestRequiredProviderPreparedStartPreservesWakeMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	candidate := startCandidate{info: sessiontest.SeedBead(t, b), tp: TemplateParams{TemplateName: "helper", ResolvedProvider: &config.ResolvedProvider{Name: "custom"}}}
-	_, err = prepareStartCandidateForCity(candidate, city, "test", &config.City{}, runtime.NewFake(), store, clock.Real{}, io.Discard, nil)
+	_, err = prepareStartCandidateForCity(candidate, city, "test", &config.City{}, runtime.NewFake(), store, clock.Real{}, io.Discard, nil, dispatchOptionSources{})
 	if err == nil {
 		t.Error("prepared an unavailable provider")
 	}

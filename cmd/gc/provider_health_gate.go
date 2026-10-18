@@ -17,6 +17,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,42 +34,151 @@ const (
 	// plist-injected env var.
 	providerHealthCacheRelPath = ".gc/cache/provider-health.json"
 
+	// providerHealthRequiredRelPath is the required-provider admission policy
+	// (agent-forge-j367): providers listed there never fail open.
+	providerHealthRequiredRelPath = ".gc/cache/provider-health-required.json"
+
 	// providerHealthTTL matches the probe interval in the voxist-city pack.
 	providerHealthTTL = 60 * time.Second
 )
 
 // --- snapshot (loaded once per tick) ---
 
+// providerHealthRecord mirrors one entry in provider-health.json.
+type providerHealthRecord struct {
+	Provider string  `json:"provider"`
+	Status   string  `json:"status"`    // "healthy" | "unhealthy"
+	ProbedAt float64 `json:"probed_at"` // Unix epoch seconds (float)
+	// NextCheckAt is the publisher's refresh contract (agent-forge-769p):
+	// probed_at carries the upstream observation lag, so a healthy record
+	// stays trusted until this deadline plus one probe interval.
+	NextCheckAt float64 `json:"next_check_at"`
+}
+
+type providerHealthFileFormat struct {
+	Providers []providerHealthRecord `json:"providers"`
+}
+
 // providerHealthSnapshot is an immutable, per-tick view of the health file.
 // It is loaded once at the top of each reconciler tick via
 // loadProviderHealthSnapshot; all per-session gate checks use the snapshot
 // (no additional file I/O).
 type providerHealthSnapshot struct {
-	admission *session.ProviderHealthSnapshot
+	// present is false when the file is absent, unreadable, or empty.
+	// A false present means the registry is unavailable — callers fail-open.
+	present bool
+	// entries maps provider name → healthy. Only entries that exist in the
+	// file and are within TTL are stored; stale or missing entries are omitted
+	// so check() returns (true, false) for them (fail-open).
+	entries map[string]bool
+	// required is the required-provider admission policy
+	// (provider-health-required.json, agent-forge-j367): a required provider's
+	// missing, stale or unhealthy evidence denies (fail-closed), where an
+	// optional provider fails open. A malformed policy denies every provider.
+	required        map[string]bool
+	policyMalformed bool
 }
 
 // loadProviderHealthSnapshot reads cityPath/.gc/cache/provider-health.json and
 // returns a snapshot for this reconciler tick. It is safe to call when the
-// file is absent; required-provider policy determines whether absence denies.
+// file is absent (returns an empty snapshot with present=false).
 func loadProviderHealthSnapshot(cityPath string) *providerHealthSnapshot {
-	return &providerHealthSnapshot{admission: session.LoadProviderHealthSnapshot(cityPath, time.Now())}
+	snap := &providerHealthSnapshot{required: map[string]bool{}}
+	// The required-provider policy is read first, as the session-side
+	// admission snapshot reads it: a malformed policy denies every provider,
+	// and a required provider is judged fail-closed by check() below even
+	// when the health file itself is absent or unreadable.
+	if data, err := os.ReadFile(filepath.Join(cityPath, providerHealthRequiredRelPath)); err == nil {
+		var policy struct {
+			SchemaVersion int      `json:"schema_version"`
+			Providers     []string `json:"providers"`
+		}
+		if json.Unmarshal(data, &policy) != nil || policy.SchemaVersion != 1 || len(policy.Providers) == 0 {
+			snap.policyMalformed = true
+		} else {
+			for _, p := range policy.Providers {
+				if strings.TrimSpace(p) == "" || strings.TrimSpace(p) != p || snap.required[p] {
+					snap.policyMalformed = true
+				}
+				snap.required[p] = true
+			}
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(cityPath, providerHealthCacheRelPath))
+	if err != nil {
+		return snap
+	}
+	f, ok := parseProviderHealthFile(data)
+	if !ok {
+		return snap
+	}
+	health := f.snapshotAt(time.Now())
+	snap.present = health.present
+	snap.entries = health.entries
+	return snap
+}
+
+// parseProviderHealthFile decodes provider-health.json; false when it does
+// not parse.
+func parseProviderHealthFile(data []byte) (providerHealthFileFormat, bool) {
+	var f providerHealthFileFormat
+	if err := json.Unmarshal(data, &f); err != nil {
+		return providerHealthFileFormat{}, false
+	}
+	return f, true
+}
+
+// snapshotAt is the file's snapshot at now: entries older than
+// providerHealthTTL are omitted.
+func (f providerHealthFileFormat) snapshotAt(now time.Time) *providerHealthSnapshot {
+	snap := &providerHealthSnapshot{
+		present: len(f.Providers) > 0,
+		entries: make(map[string]bool, len(f.Providers)),
+	}
+	nowSecs := float64(now.UnixNano()) / 1e9
+	for _, rec := range f.Providers {
+		// agent-forge-769p: probed_at carries the upstream observation lag
+		// (the publisher republishes cached records between real probes), so
+		// freshness trusts the published next_check_at deadline plus one
+		// refresh grace; records without it keep the strict probed_at TTL.
+		if !session.HealthRecordEvidenceFresh(rec.ProbedAt, rec.NextCheckAt, nowSecs) {
+			// Stale — omit so check() fails-open for this provider.
+			continue
+		}
+		snap.entries[rec.Provider] = rec.Status == "healthy"
+	}
+	return snap
 }
 
 // check returns (healthy, registryPresent).
-//   - registryPresent=false: no denial-scope entry for providerName — this
-//     happens only for providers not opted into required health (file absent,
-//     unreadable, or no fresh entry). Callers MUST treat this as healthy=true
-//     (fail-open).
+//   - registryPresent=false: file absent, unreadable, or no fresh entry for
+//     providerName. Callers MUST treat this as healthy=true (fail-open).
 //   - registryPresent=true, healthy=false: provider is red; gate respawn.
-//     A required provider's missing, malformed or stale evidence is reported
-//     here as an observation, so gates fail closed for required providers.
 //   - registryPresent=true, healthy=true: provider is green; allow respawn.
+//
+// A required provider never fails open: its missing, stale or unhealthy
+// evidence is itself the denial (agent-forge-j367), and a malformed
+// required-policy denies every provider. This mirrors
+// session.ProviderHealthSnapshot.Check.
 func (s *providerHealthSnapshot) check(providerName string) (healthy, registryPresent bool) {
 	if s == nil {
 		return true, false
 	}
-	d := s.admission.Check(providerName)
-	return d.Allowed, d.Observed
+	if s.policyMalformed {
+		return false, true
+	}
+	if s.required[providerName] {
+		v, ok := s.entries[providerName]
+		return v && ok, true // no fresh entry → denied, not fail-open
+	}
+	if !s.present {
+		return true, false
+	}
+	v, ok := s.entries[providerName]
+	if !ok {
+		return true, false // no fresh entry → fail-open
+	}
+	return v, true
 }
 
 // healthyProviders returns all provider names that are confirmed healthy in
@@ -75,7 +187,13 @@ func (s *providerHealthSnapshot) healthyProviders() []string {
 	if s == nil {
 		return nil
 	}
-	return s.admission.HealthyProviders()
+	out := make([]string, 0, len(s.entries))
+	for p, healthy := range s.entries {
+		if healthy {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // --- episode state (lives across ticks on CityRuntime) ---

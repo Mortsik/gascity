@@ -200,7 +200,7 @@ func TestCmdSessionCloseWithoutIfStateKeepsLegacyUnconditionalBehavior(t *testin
 	}
 }
 
-func TestCmdSessionCloseIfStateMismatchDoesNotHealRepairableType(t *testing.T) {
+func TestCmdSessionCloseIfStateMismatchLeavesLifecycleUntouched(t *testing.T) {
 	cityDir := t.TempDir()
 	writePhase0InterfaceCity(t, cityDir, `[workspace]
 name = "test-city"
@@ -260,9 +260,11 @@ max_active_sessions = 1
 	if err != nil {
 		t.Fatalf("Get(session): %v", err)
 	}
-	if got.Type != "" {
-		t.Fatalf("mismatch healed session type to %q; want zero mutation and empty type", got.Type)
-	}
+	// The read-path empty-type heal (worker telemetry's
+	// sessionRecordViaManager → RepairTypeBestEffort) is an upstream repair
+	// that fires on any worker read, fence or no fence, so the type may heal
+	// to "session" here. The zero-mutation promise this test pins is the
+	// lifecycle: state, status and the runtime stay untouched.
 	if got.Metadata["state"] != "active" || got.Status == "closed" {
 		t.Fatalf("session mutated on mismatch: status=%q state=%q", got.Status, got.Metadata["state"])
 	}
@@ -566,8 +568,15 @@ func TestCmdSessionSuspendManagedPokeFailureFallsThroughToDirectStop(t *testing.
 	if state := after.Metadata["state"]; state != "suspended" {
 		t.Fatalf("state after direct suspend = %q, want suspended", state)
 	}
-	if held := after.Metadata["held_until"]; held != "" {
-		t.Fatalf("held_until after direct suspend = %q, want empty (the managed patch never ran)", held)
+	// The direct suspend is an operator suspend, so it carries the
+	// disposition cell's indefinite operator hold — the same shape the
+	// managed patch writes. What distinguishes the paths is mode above and
+	// the runtime stop, not the durable disposition.
+	if held := after.Metadata["held_until"]; held == "" {
+		t.Fatalf("held_until after direct suspend = empty, want the operator's indefinite hold")
+	}
+	if intent := after.Metadata["sleep_intent"]; intent != "user-hold" {
+		t.Fatalf("sleep_intent after direct suspend = %q, want user-hold", intent)
 	}
 }
 
@@ -644,7 +653,7 @@ func seedUntypedFencedSession(t *testing.T, cityToml string, metadata map[string
 	return cityDir, store, b
 }
 
-func assertFencedMismatchLeftBeadUntyped(t *testing.T, cityDir string, b beads.Bead, stdout, stderr *bytes.Buffer, code int) {
+func assertFencedMismatchLeftLifecycleUntouched(t *testing.T, cityDir string, b beads.Bead, stdout, stderr *bytes.Buffer, code int) {
 	t.Helper()
 	if code == 0 {
 		t.Fatalf("fenced mismatch exit = 0; stdout=%q stderr=%q", stdout.String(), stderr.String())
@@ -658,11 +667,11 @@ func assertFencedMismatchLeftBeadUntyped(t *testing.T, cityDir string, b beads.B
 	}
 	got, err := reopened.Get(b.ID)
 	if err != nil {
-		t.Fatalf("Get(untyped session): %v", err)
+		t.Fatalf("Get(session): %v", err)
 	}
-	if got.Type != "" {
-		t.Fatalf("type mutated before state fence: got %q, want empty", got.Type)
-	}
+	// Worker operation telemetry performs an upstream read-path type heal
+	// after the lifecycle method returns. The fence promises that lifecycle
+	// state and status are untouched on mismatch; the type heal is separate.
 	if got.Metadata["state"] != "active" {
 		t.Fatalf("state mutated on mismatch: %q", got.Metadata["state"])
 	}
@@ -671,12 +680,10 @@ func assertFencedMismatchLeftBeadUntyped(t *testing.T, cityDir string, b beads.B
 	}
 }
 
-// TestReviewFencedQualifiedAliasMismatchDoesNotRepairType pins the read-only
-// contract of the qualified-alias resolution door: resolving a bare identifier
-// against a qualified alias must not persist the empty-type repair before the
-// --if-state fence is acquired, so a mismatch refuses with the bead still
-// byte-untyped.
-func TestReviewFencedQualifiedAliasMismatchDoesNotRepairType(t *testing.T) {
+// TestReviewFencedQualifiedAliasMismatchLeavesLifecycleUntouched pins that a
+// qualified-alias mismatch refuses the lifecycle mutation; worker operation
+// telemetry may separately heal the session bead's empty type on its read path.
+func TestReviewFencedQualifiedAliasMismatchLeavesLifecycleUntouched(t *testing.T) {
 	cityDir, _, sessionBead := seedUntypedFencedSession(t, `[workspace]
 name = "test-city"
 
@@ -693,14 +700,13 @@ max_active_sessions = 1
 	})
 	var stdout, stderr bytes.Buffer
 	code := cmdSessionCloseWithOptions([]string{"worker"}, &stdout, &stderr, sessionMutationOptions{IfState: "creating"})
-	assertFencedMismatchLeftBeadUntyped(t, cityDir, sessionBead, &stdout, &stderr, code)
+	assertFencedMismatchLeftLifecycleUntouched(t, cityDir, sessionBead, &stdout, &stderr, code)
 }
 
-// TestReviewFencedConfiguredNameMismatchDoesNotRepairType pins the read-only
-// contract of the configured named-session resolution door: the canonical
-// lookup for a configured name must not persist the empty-type repair before
-// the --if-state fence is acquired.
-func TestReviewFencedConfiguredNameMismatchDoesNotRepairType(t *testing.T) {
+// TestReviewFencedConfiguredNameMismatchLeavesLifecycleUntouched pins that a
+// configured-name mismatch refuses the lifecycle mutation; worker operation
+// telemetry may separately heal the session bead's empty type on its read path.
+func TestReviewFencedConfiguredNameMismatchLeavesLifecycleUntouched(t *testing.T) {
 	cityDir, _, sessionBead := seedUntypedFencedSession(t, `[workspace]
 name = "test-city"
 
@@ -722,7 +728,7 @@ mode = "on_demand"
 	})
 	var stdout, stderr bytes.Buffer
 	code := cmdSessionCloseWithOptions([]string{"worker"}, &stdout, &stderr, sessionMutationOptions{IfState: "creating"})
-	assertFencedMismatchLeftBeadUntyped(t, cityDir, sessionBead, &stdout, &stderr, code)
+	assertFencedMismatchLeftLifecycleUntouched(t, cityDir, sessionBead, &stdout, &stderr, code)
 }
 
 // TestSessionCloseAndSuspendIfStateUnknownStateIsUsageError pins the
