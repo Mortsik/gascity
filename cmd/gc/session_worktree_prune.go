@@ -51,12 +51,14 @@ func standaloneCloneDir(dir string) bool {
 // legacy method), while a standalone clone (.git directory) is removed as a
 // plain directory — only ever done under the guard, which has by then
 // secured a copy of HEAD in the rig repo. Guard off keeps the legacy method
-// verbatim, including its failure on standalone clones.
-func removeWorkerDir(rigRoot, workerDir string, guardOn bool) error {
+// verbatim, including its failure on standalone clones. wtForce is the
+// force flag for the WorktreeRemove call (the prune path forces; the reaper
+// does not, keeping its dirty-tree defense in depth).
+func removeWorkerDir(rigRoot, workerDir string, guardOn, wtForce bool) error {
 	if guardOn && standaloneCloneDir(workerDir) {
 		return os.RemoveAll(workerDir)
 	}
-	return newGitProbe(rigRoot).WorktreeRemove(workerDir, true)
+	return newGitProbe(rigRoot).WorktreeRemove(workerDir, wtForce)
 }
 
 // writeWorktreeStaleMarker records why workerDir was left in place instead of
@@ -184,7 +186,7 @@ func pruneAgentHomeWorktreeIfSafe(session beads.Bead, cityPath string, cfg *conf
 		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: rig path unresolved\n", workerDir) //nolint:errcheck
 		return false
 	}
-	if err := removeWorkerDir(rigRoot, workerDir, guardOn); err != nil {
+	if err := removeWorkerDir(rigRoot, workerDir, guardOn, true); err != nil {
 		fmt.Fprintf(stderr, "session reconciler: pruning worker_dir %s: %v\n", workerDir, err) //nolint:errcheck
 		return false
 	}
@@ -278,7 +280,7 @@ func pruneAgentHomeWorktreeIfSafeInfo(info sessionpkg.Info, cityPath string, cfg
 		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: rig path unresolved\n", workerDir) //nolint:errcheck
 		return
 	}
-	if err := removeWorkerDir(rigRoot, workerDir, guardOn); err != nil {
+	if err := removeWorkerDir(rigRoot, workerDir, guardOn, true); err != nil {
 		fmt.Fprintf(stderr, "session reconciler: pruning worker_dir %s: %v\n", workerDir, err) //nolint:errcheck
 		return
 	}

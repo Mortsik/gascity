@@ -62,9 +62,12 @@ func TestReapClosedBeadWorktrees_ReapsWorktreeWhoseMergedBranchWasDeleted(t *tes
 }
 
 // TestReapClosedBeadWorktrees_ProtectsDetachedHEADWithOrphanCommits pins the
-// safety half of the same gate. A detached HEAD carrying a commit that no
-// branch, tag, or remote reaches WOULD be orphaned by removing the worktree, so
-// the reaper must still protect it and say why.
+// safety half of the same gate under the LEGACY regime (guard off): a detached
+// HEAD carrying a commit that no branch, tag, or remote reaches WOULD be
+// orphaned by removing the worktree, so the reaper must still protect it and
+// say why. Under the guard (default on) this shape is secured into
+// quarantine and reaped instead — see
+// TestReapClosedBeadWorktrees_GuardSecuresDetachedOrphanClone.
 func TestReapClosedBeadWorktrees_ProtectsDetachedHEADWithOrphanCommits(t *testing.T) {
 	cityPath, rigRoot := initReapRig(t)
 	wt := filepath.Join(cityPath, ".gc", "worktrees", reapTestRigName, "builder", "ga-orphan1")
@@ -77,6 +80,8 @@ func TestReapClosedBeadWorktrees_ProtectsDetachedHEADWithOrphanCommits(t *testin
 
 	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-orphan1", Status: "closed"}}, nil)
 	cfg := reapTestConfig(rigRoot)
+	off := false
+	cfg.Daemon.WorktreeRemovalGuard = &off
 	injectLiveness(t, liveWorktreeState{scanned: true})
 
 	var stderr bytes.Buffer
