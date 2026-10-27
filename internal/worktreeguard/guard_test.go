@@ -18,28 +18,49 @@ type fakeProbe struct {
 	reachErr    bool
 	siblings    []string
 	siblingsErr error
+	rigInside   bool
+	rigErr      error
 	fetchErr    error
 	verifyErr   error
 	fetchCalls  int
+	// laterShas, when set, are returned by HeadInfo calls after the first
+	// (one per call, last one sticks) — a HEAD moving under the guard.
+	laterShas []string
+	headCalls int
 }
 
 func (f *fakeProbe) IsRepo() bool { return f.isRepo }
 
 func (f *fakeProbe) HeadInfo() (string, string, error) {
+	f.headCalls++
 	if f.headErr {
 		return "", "", errFake("head probe failed")
+	}
+	if f.headCalls > 1 && len(f.laterShas) > 0 {
+		i := f.headCalls - 2
+		if i >= len(f.laterShas) {
+			i = len(f.laterShas) - 1
+		}
+		return f.branch, f.laterShas[i], nil
 	}
 	return f.branch, f.headSha, nil
 }
 
-func (f *fakeProbe) HeadReachableInRigRepo() (bool, error) {
+func (f *fakeProbe) SecuredInRig(string) (bool, error) {
 	if f.reachErr {
 		return false, errFake("reachability probe failed")
 	}
 	return f.reach, nil
 }
 
-func (f *fakeProbe) UnsecuredSiblingBranches() ([]string, error) {
+func (f *fakeProbe) RigOutsideRepo() (bool, error) {
+	if f.rigErr != nil {
+		return false, f.rigErr
+	}
+	return !f.rigInside, nil
+}
+
+func (f *fakeProbe) UnsecuredRefs(string) ([]string, error) {
 	if f.siblingsErr != nil {
 		return nil, f.siblingsErr
 	}
@@ -103,23 +124,23 @@ func TestDecideTable(t *testing.T) {
 		},
 		{
 			name:  "unsecured non-head branch refuses even when head is secured",
-			facts: Facts{IsRepo: true, Branch: "work", HeadSha: "abc123def4", HeadReachableInRig: true, NonHeadUnsecured: []string{"feature/x"}},
-			want:  Verdict{Action: "refuse", Secured: false, Reason: "non-head-branches-unsecured: feature/x"},
+			facts: Facts{IsRepo: true, Branch: "work", HeadSha: "abc123def4", HeadReachableInRig: true, UnsecuredRefs: []string{"feature/x"}},
+			want:  Verdict{Action: "refuse", Secured: false, Reason: "non-head-refs-unsecured: feature/x"},
 		},
 		{
 			name:  "unsecured non-head branch refuses before the copy runs",
-			facts: Facts{IsRepo: true, Branch: "work", HeadSha: "abc123def4", NonHeadUnsecured: []string{"a", "b"}},
-			want:  Verdict{Action: "refuse", Secured: false, Reason: "non-head-branches-unsecured: a, b"},
+			facts: Facts{IsRepo: true, Branch: "work", HeadSha: "abc123def4", UnsecuredRefs: []string{"a", "b"}},
+			want:  Verdict{Action: "refuse", Secured: false, Reason: "non-head-refs-unsecured: a, b"},
 		},
 		{
 			name:  "unborn head with unsecured siblings still refuses",
-			facts: Facts{IsRepo: true, HeadSha: "", NonHeadUnsecured: []string{"orphaned-work"}},
-			want:  Verdict{Action: "refuse", Secured: false, Reason: "non-head-branches-unsecured: orphaned-work"},
+			facts: Facts{IsRepo: true, HeadSha: "", UnsecuredRefs: []string{"orphaned-work"}},
+			want:  Verdict{Action: "refuse", Secured: false, Reason: "non-head-refs-unsecured: orphaned-work"},
 		},
 		{
-			name:  "sibling probe failure refuses fail-closed",
-			facts: Facts{IsRepo: true, HeadSha: "abc123def4", NonHeadProbeErr: true},
-			want:  Verdict{Action: "refuse", Secured: false, Reason: "sibling-probe-failed"},
+			name:  "ref probe failure refuses fail-closed",
+			facts: Facts{IsRepo: true, HeadSha: "abc123def4", RefProbeErr: true},
+			want:  Verdict{Action: "refuse", Secured: false, Reason: "ref-probe-failed"},
 		},
 		{
 			name:  "secured siblings do not block an otherwise secured head",
@@ -208,8 +229,8 @@ func TestGuardRemovalSiblingRefuseSkipsFetch(t *testing.T) {
 	if v.Secured || v.Action != "refuse" {
 		t.Fatalf("verdict = %+v, want refuse on unsecured sibling", v)
 	}
-	if !strings.Contains(v.Reason, "non-head-branches-unsecured") {
-		t.Fatalf("reason = %q, want non-head-branches-unsecured", v.Reason)
+	if !strings.Contains(v.Reason, "non-head-refs-unsecured") {
+		t.Fatalf("reason = %q, want non-head-refs-unsecured", v.Reason)
 	}
 	if p.fetchCalls != 0 {
 		t.Fatalf("fetch calls = %d, want 0 (refuse must precede the copy)", p.fetchCalls)
@@ -275,9 +296,40 @@ func TestDecideCapsSiblingList(t *testing.T) {
 	for i := 1; i <= 12; i++ {
 		names = append(names, fmt.Sprintf("b%02d", i))
 	}
-	v := Decide(Facts{IsRepo: true, HeadSha: "abc123def4", NonHeadUnsecured: names})
-	want := "non-head-branches-unsecured: b01, b02, b03, b04, b05, b06, b07, b08, b09, b10 (+2 more)"
+	v := Decide(Facts{IsRepo: true, HeadSha: "abc123def4", UnsecuredRefs: names})
+	want := "non-head-refs-unsecured: b01, b02, b03, b04, b05, b06, b07, b08, b09, b10 (+2 more)"
 	if v.Reason != want {
 		t.Fatalf("reason = %q, want %q", v.Reason, want)
+	}
+}
+
+// TestDecideRefusesWhenRigLivesInsideDoomedTree: a "copy" whose storage
+// dies with the directory is no copy — Sol REWORK 2026-10-28 (2).
+func TestDecideRefusesWhenRigLivesInsideDoomedTree(t *testing.T) {
+	for _, tc := range []struct {
+		facts Facts
+		want  string
+	}{
+		{Facts{IsRepo: true, HeadSha: "abc123def4", HeadReachableInRig: true, RigInsideDoomed: true}, "rig-inside-doomed-tree"},
+		{Facts{IsRepo: true, HeadSha: "abc123def4", HeadReachableInRig: true, RigProbeErr: true}, "rig-probe-failed"},
+	} {
+		v := Decide(tc.facts)
+		if v.Secured || v.Action != ActionRefuse || v.Reason != tc.want {
+			t.Fatalf("Decide(%+v) = %+v, want refuse/%s", tc.facts, v, tc.want)
+		}
+	}
+}
+
+// TestGuardRemovalRefusesWhenHeadMoves: the decision, the copy and the
+// verification are bound to ONE HEAD reading; a HEAD that moved by the time
+// the guard finishes refuses (Sol REWORK 2026-10-28 (3)).
+func TestGuardRemovalRefusesWhenHeadMoves(t *testing.T) {
+	for _, reach := range []bool{false, true} {
+		p := &fakeProbe{isRepo: true, branch: "work", headSha: "aaaaaaaaaaaa1", reach: reach, laterShas: []string{"bbbbbbbbbbbb2"}}
+		var stderr bytes.Buffer
+		v := GuardRemoval(p, "/wt/x", "sess-1", &stderr)
+		if v.Secured || v.Reason != "head-moved" {
+			t.Fatalf("reach=%v: verdict = %+v, want refuse head-moved (stderr %q)", reach, v, stderr.String())
+		}
 	}
 }

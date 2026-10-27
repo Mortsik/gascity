@@ -34,10 +34,14 @@ type Probe interface {
 	// HeadInfo returns the checked-out branch ("" when detached) and the
 	// HEAD commit sha; an error is a fail-closed fact.
 	HeadInfo() (branch string, headSha string, err error)
-	// HeadReachableInRigRepo reports whether the HEAD commit is reachable
-	// from a surviving ref of the rig repository — mere object existence is
-	// not enough (a linked worktree shares the rig's object store).
-	HeadReachableInRigRepo() (bool, error)
+	// SecuredInRig reports whether sha is reachable from a surviving ref of
+	// the rig repository — mere object existence is not enough (a linked
+	// worktree shares the rig's object store).
+	SecuredInRig(sha string) (bool, error)
+	// RigOutsideRepo reports whether the rig repository's object storage
+	// (common git dir, objects dir, alternates) lives OUTSIDE the doomed
+	// directory — a copy stored inside it dies with it.
+	RigOutsideRepo() (bool, error)
 	// FetchIntoQuarantine copies headSha into QuarantineRef(tag, branch,
 	// headSha) under the rig repository, never overwriting an existing ref.
 	FetchIntoQuarantine(tag, branch, headSha string) error
@@ -45,11 +49,11 @@ type Probe interface {
 	// repository — a fetch that reports success but secures nothing must
 	// never authorize a removal.
 	VerifyQuarantied(headSha string) error
-	// UnsecuredSiblingBranches returns every branch other than the
-	// checked-out one whose tip is NOT reachable from a surviving rig ref —
-	// branches whose only copy dies with the directory. An error is a
-	// fail-closed fact.
-	UnsecuredSiblingBranches() ([]string, error)
+	// UnsecuredRefs returns every ref of the doomed repository other than
+	// refs/heads/<headBranch> and remote-tracking refs whose target is NOT
+	// secured in the rig repository — refs whose only copy dies with the
+	// directory. An error is a fail-closed fact.
+	UnsecuredRefs(headBranch string) ([]string, error)
 }
 
 // Facts is the closed decision input: probe results only, with explicit
@@ -61,10 +65,14 @@ type Facts struct {
 	HeadReachableInRig bool
 	HeadProbeErr       bool
 	ReachableProbeErr  bool
-	// NonHeadUnsecured names non-checked-out branches with no copy outside
-	// the doomed directory; NonHeadProbeErr flags a failed sibling probe.
-	NonHeadUnsecured []string
-	NonHeadProbeErr  bool
+	// RigInsideDoomed: the rig's object storage lives inside the doomed
+	// directory; RigProbeErr flags a failed independence probe.
+	RigInsideDoomed bool
+	RigProbeErr     bool
+	// UnsecuredRefs names refs (other than HEAD's branch) with no copy
+	// outside the doomed directory; RefProbeErr flags a failed ref probe.
+	UnsecuredRefs []string
+	RefProbeErr   bool
 }
 
 // Verdict is one removal decision. Secured true means a copy provably exists
@@ -86,22 +94,26 @@ const (
 )
 
 // Decide maps facts to a verdict. Pure: no I/O, no clock. Fail-closed on
-// every unknown — an unprovable fact never authorizes a removal. The
-// sibling gate runs BEFORE the head's copy/no-commits questions: a refused
-// removal must not write quarantine state, and an unborn HEAD never excuses
-// losing other branches' only copies.
+// every unknown — an unprovable fact never authorizes a removal. The rig
+// independence and ref gates run BEFORE the head's copy/no-commits
+// questions: a refused removal must not write quarantine state, and an
+// unborn HEAD never excuses losing other refs' only copies.
 func Decide(facts Facts) Verdict {
 	switch {
 	case !facts.IsRepo:
 		return Verdict{Action: ActionRefuse, Secured: false, Reason: "not-a-repo"}
 	case facts.HeadProbeErr:
 		return Verdict{Action: ActionRefuse, Secured: false, Reason: "head-probe-failed"}
-	case facts.NonHeadProbeErr:
-		return Verdict{Action: ActionRefuse, Secured: false, Reason: "sibling-probe-failed"}
-	case len(facts.NonHeadUnsecured) > 0:
+	case facts.RigProbeErr:
+		return Verdict{Action: ActionRefuse, Secured: false, Reason: "rig-probe-failed"}
+	case facts.RigInsideDoomed:
+		return Verdict{Action: ActionRefuse, Secured: false, Reason: "rig-inside-doomed-tree"}
+	case facts.RefProbeErr:
+		return Verdict{Action: ActionRefuse, Secured: false, Reason: "ref-probe-failed"}
+	case len(facts.UnsecuredRefs) > 0:
 		return Verdict{
 			Action: ActionRefuse, Secured: false,
-			Reason: "non-head-branches-unsecured: " + joinCapped(facts.NonHeadUnsecured, maxReasonNames),
+			Reason: "non-head-refs-unsecured: " + joinCapped(facts.UnsecuredRefs, maxReasonNames),
 		}
 	case facts.HeadSha == "":
 		return Verdict{Action: ActionNothingToSecure, Secured: true, Reason: "no-commits"}
@@ -116,7 +128,7 @@ func Decide(facts Facts) Verdict {
 	}
 }
 
-// maxReasonNames bounds the sibling list carried in a refuse reason (and so
+// maxReasonNames bounds the unsecured-ref list carried in a refuse reason (and so
 // in the notify line and the protected-reason surfaces downstream).
 const maxReasonNames = 10
 
@@ -133,10 +145,13 @@ func joinCapped(names []string, limit int) string {
 // exactly one structured line to stderr — a refusal is never silent, and
 // neither is rescued work landing somewhere an operator must know about.
 func GuardRemoval(p Probe, repoPath, tag string, stderr io.Writer) Verdict {
-	// Branch stays RAW here: QuarantineRef sanitizes it into one ref path
-	// component, and the stderr display field is sanitized at write time.
-	branch, headSha, _ := p.HeadInfo()
-	v := Assess(p)
+	// One HEAD reading binds the decision, the copy and the verification;
+	// branch stays RAW (QuarantineRef sanitizes it into one ref component,
+	// the stderr display field is sanitized at write time).
+	facts := assessFacts(p)
+	branch, headSha := facts.Branch, facts.HeadSha
+	v := Decide(facts)
+	copied := false
 	if v.Action == ActionSecuredCopy {
 		if err := p.FetchIntoQuarantine(tag, branch, headSha); err != nil {
 			v = Verdict{
@@ -150,10 +165,24 @@ func GuardRemoval(p Probe, repoPath, tag string, stderr io.Writer) Verdict {
 			}
 		} else {
 			v = Verdict{Action: ActionSecuredCopy, Secured: true, Reason: "fetched-into-quarantine"}
-			fmt.Fprintf(stderr, "worktreeguard: %s repo=%s branch=%s sha=%s ref=%s\n",
-				v.Action, repoPath, displayOrDash(sanitizeRefSegment(branch)), headSha,
-				QuarantineRef(tag, branch, headSha)) //nolint:errcheck // notify line, best-effort
+			copied = true
 		}
+	}
+	if v.Secured {
+		// The tree must still be the one the verdict was about: a HEAD or
+		// ref that moved meanwhile (a live writer the caller's liveness
+		// gates missed) leaves new work no verdict covered.
+		if _, now, err := p.HeadInfo(); err != nil || now != headSha {
+			v = Verdict{Action: ActionRefuse, Secured: false, Reason: "head-moved"}
+		} else if refs, err := p.UnsecuredRefs(branch); err != nil || len(refs) > 0 {
+			v = Verdict{Action: ActionRefuse, Secured: false, Reason: "refs-moved"}
+		}
+	}
+	if copied {
+		// The copy landed whatever the final verdict: name where it went.
+		fmt.Fprintf(stderr, "worktreeguard: %s repo=%s branch=%s sha=%s ref=%s\n",
+			ActionSecuredCopy, repoPath, displayOrDash(sanitizeRefSegment(branch)), headSha,
+			QuarantineRef(tag, branch, headSha)) //nolint:errcheck // notify line, best-effort
 	}
 	if !v.Secured {
 		fmt.Fprintf(stderr, "worktreeguard: %s repo=%s branch=%s sha=%s reason=%s\n",
@@ -173,19 +202,34 @@ func displayOrDash(s string) string {
 // Assess gathers the probe facts and decides — no copy, no notify line. It
 // answers what GuardRemoval WOULD do (dry-run surfaces).
 func Assess(p Probe) Verdict {
+	return Decide(assessFacts(p))
+}
+
+// assessFacts reads HEAD ONCE and asks every other question about that
+// reading, so the facts describe one consistent state of the doomed repo.
+func assessFacts(p Probe) Facts {
 	branch, headSha, headErr := p.HeadInfo()
-	reach, reachErr := p.HeadReachableInRigRepo()
-	siblings, siblingErr := p.UnsecuredSiblingBranches()
-	return Decide(Facts{
-		IsRepo:             p.IsRepo(),
-		Branch:             branch,
-		HeadSha:            headSha,
-		HeadReachableInRig: reach,
-		HeadProbeErr:       headErr != nil,
-		ReachableProbeErr:  reachErr != nil,
-		NonHeadUnsecured:   siblings,
-		NonHeadProbeErr:    siblingErr != nil,
-	})
+	facts := Facts{
+		IsRepo:       p.IsRepo(),
+		Branch:       branch,
+		HeadSha:      headSha,
+		HeadProbeErr: headErr != nil,
+	}
+	if headErr != nil {
+		return facts
+	}
+	outside, rigErr := p.RigOutsideRepo()
+	facts.RigProbeErr = rigErr != nil
+	facts.RigInsideDoomed = rigErr == nil && !outside
+	refs, refErr := p.UnsecuredRefs(branch)
+	facts.UnsecuredRefs = refs
+	facts.RefProbeErr = refErr != nil
+	if headSha != "" {
+		reach, reachErr := p.SecuredInRig(headSha)
+		facts.HeadReachableInRig = reach
+		facts.ReachableProbeErr = reachErr != nil
+	}
+	return facts
 }
 
 // QuarantineRef names the rig-repo ref a copy of headSha lands under:

@@ -1,7 +1,10 @@
 // The real Probe over git subprocesses: every git invocation of this
 // package lives here, so the decision core (guard.go) stays pure. All probes
 // degrade to their fail-closed shapes on error — a failed probe proves
-// nothing and never authorizes a removal.
+// nothing and never authorizes a removal. Every subprocess runs with
+// gitutil.SanitizedEnv(): a GIT_DIR/GIT_WORK_TREE leaked from a hook or
+// nested tooling would otherwise answer every question about the WRONG
+// repository and let an unpushed clone look secured.
 package worktreeguard
 
 import (
@@ -11,6 +14,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	gitutil "github.com/gastownhall/gascity/internal/git"
 )
 
 // GitProbe answers the Probe questions over a doomed repository (repoPath)
@@ -56,16 +61,84 @@ func (g *GitProbe) HeadInfo() (string, string, error) {
 	return branch, strings.TrimSpace(shaOut), nil
 }
 
-// HeadReachableInRigRepo reports whether the HEAD commit is SECURED in the
-// rig repository — reachable from a ref that survives the removal. Object
-// existence alone is not enough: a linked worktree shares the rig's object
-// store, so its orphan commits "exist" there until the next gc drops them.
-func (g *GitProbe) HeadReachableInRigRepo() (bool, error) {
-	_, headSha, err := g.HeadInfo()
+// SecuredInRig reports whether sha is SECURED in the rig repository —
+// reachable from a ref that survives the removal. Object existence alone is
+// not enough: a linked worktree shares the rig's object store, so its orphan
+// commits "exist" there until the next gc drops them.
+func (g *GitProbe) SecuredInRig(sha string) (bool, error) {
+	return securedInRig(g.rigRoot, sha)
+}
+
+// RigOutsideRepo reports whether the rig repository's object storage — its
+// common git dir, objects dir and every (transitive) alternate — lives
+// outside the doomed directory, symlinks resolved. A rig misconfigured as
+// the doomed clone itself, or borrowing objects from it, "secures" commits
+// in storage that dies with the directory.
+func (g *GitProbe) RigOutsideRepo() (bool, error) {
+	doomed, err := resolvedAbs(g.repoPath)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("doomed path: %w", err)
 	}
-	return securedInRig(g.rigRoot, headSha)
+	commonOut, err := gitOut(g.rigRoot, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return false, fmt.Errorf("rig common dir: %w", err)
+	}
+	common, err := resolvedAbs(strings.TrimSpace(commonOut))
+	if err != nil {
+		return false, fmt.Errorf("rig common dir: %w", err)
+	}
+	if within(common, doomed) {
+		return false, nil
+	}
+	pending := []string{filepath.Join(common, "objects")}
+	seen := map[string]bool{}
+	for len(pending) > 0 {
+		dir := pending[0]
+		pending = pending[1:]
+		objects, err := resolvedAbs(dir)
+		if err != nil {
+			return false, fmt.Errorf("rig object dir %s: %w", dir, err)
+		}
+		if seen[objects] {
+			continue
+		}
+		seen[objects] = true
+		if within(objects, doomed) {
+			return false, nil
+		}
+		data, err := os.ReadFile(filepath.Join(objects, "info", "alternates"))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("rig alternates: %w", err)
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if !filepath.IsAbs(line) {
+				line = filepath.Join(objects, line)
+			}
+			pending = append(pending, line)
+		}
+	}
+	return true, nil
+}
+
+func resolvedAbs(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(abs)
+}
+
+// within reports whether path is dir or lies beneath it (both resolved).
+func within(path, dir string) bool {
+	rel, err := filepath.Rel(dir, path)
+	return err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))))
 }
 
 // securedInRig: sha exists in the rig repo AND some branch, tag,
@@ -92,6 +165,7 @@ func securedInRig(rigRoot, sha string) (bool, error) {
 // repo, missing binary) is an ERROR, never a masked "absent".
 func objectExists(dir, sha string) (bool, error) {
 	cmd := exec.Command("git", "-C", dir, "cat-file", "-e", sha)
+	cmd.Env = gitutil.SanitizedEnv()
 	if err := cmd.Run(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 			return false, nil
@@ -127,25 +201,22 @@ func (g *GitProbe) VerifyQuarantied(headSha string) error {
 	return nil
 }
 
-// UnsecuredSiblingBranches lists every branch other than the checked-out
-// one whose tip is not secured in the rig repository (securedInRig: a
-// secured tip carries its whole history). A linked worktree (.git FILE) has
-// no siblings: its refs/heads live in the shared repository and survive the
-// directory's removal. A broken rig or a failed listing is an ERROR, never
-// an empty list — the caller fails closed.
-func (g *GitProbe) UnsecuredSiblingBranches() ([]string, error) {
+// UnsecuredRefs lists every ref of the doomed repository — branches, local
+// tags, notes, any custom namespace, the stash — other than HEAD's own
+// branch and remote-tracking refs (copies of a remote's state by
+// definition) whose target is not secured in the rig repository
+// (securedInRig: a secured tip carries its whole history; an annotated tag
+// object must itself exist there). A linked worktree (.git FILE) has none to
+// lose: its refs live in the shared repository and survive the directory's
+// removal. A broken rig or a failed listing is an ERROR, never an empty
+// list — the caller fails closed.
+func (g *GitProbe) UnsecuredRefs(headBranch string) ([]string, error) {
 	if fi, err := os.Lstat(filepath.Join(g.repoPath, ".git")); err == nil && fi.Mode().IsRegular() {
 		return nil, nil
 	}
-	out, err := gitOut(g.repoPath, "for-each-ref", "refs/heads/", "--format=%(objectname) %(refname)")
+	out, err := gitOut(g.repoPath, "for-each-ref", "--format=%(objectname) %(refname)")
 	if err != nil {
-		return nil, fmt.Errorf("sibling listing: %w", err)
-	}
-	headBranch, _, headErr := g.HeadInfo()
-	if headErr != nil {
-		// Without the HEAD branch name nothing can be exempted — treat all
-		// branches as siblings; the head-probe failure refuses anyway.
-		headBranch = ""
+		return nil, fmt.Errorf("ref listing: %w", err)
 	}
 	var unsecured []string
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
@@ -154,18 +225,17 @@ func (g *GitProbe) UnsecuredSiblingBranches() ([]string, error) {
 		}
 		sha, ref, ok := strings.Cut(line, " ")
 		if !ok {
-			return nil, fmt.Errorf("sibling listing: malformed line %q", line)
+			return nil, fmt.Errorf("ref listing: malformed line %q", line)
 		}
-		name := strings.TrimPrefix(ref, "refs/heads/")
-		if name == headBranch {
-			continue // the checked-out branch is the head question, handled above
+		if strings.HasPrefix(ref, "refs/remotes/") || (headBranch != "" && ref == "refs/heads/"+headBranch) {
+			continue // remote copies, and HEAD's branch (the head question)
 		}
 		secured, err := securedInRig(g.rigRoot, sha)
 		if err != nil {
 			return nil, err
 		}
 		if !secured {
-			unsecured = append(unsecured, name)
+			unsecured = append(unsecured, strings.TrimPrefix(ref, "refs/heads/"))
 		}
 	}
 	return unsecured, nil
@@ -182,6 +252,7 @@ func sha12(sha string) string {
 
 func gitRun(dir string, args ...string) error {
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = gitutil.SanitizedEnv()
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git -C %s %s: %w: %.200s", dir, strings.Join(args, " "), err, out)
 	}
@@ -204,6 +275,7 @@ func gitOutCode(dir string, args ...string) (string, int, error) {
 
 func gitOut(dir string, args ...string) (string, error) {
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = gitutil.SanitizedEnv()
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

@@ -80,9 +80,9 @@ func TestGitProbeGuardSecuresStandaloneUnpushedBranch(t *testing.T) {
 	if err != nil || branch != "work" || len(sha) < 12 {
 		t.Fatalf("HeadInfo = %q %q %v", branch, sha, err)
 	}
-	reach, err := p.HeadReachableInRigRepo()
+	reach, err := p.SecuredInRig(sha)
 	if err != nil || reach {
-		t.Fatalf("HeadReachableInRigRepo = %v %v, want false nil (unpushed)", reach, err)
+		t.Fatalf("SecuredInRig = %v %v, want false nil (unpushed)", reach, err)
 	}
 
 	var stderr bytes.Buffer
@@ -109,10 +109,10 @@ func TestGitProbeGuardRefusesWhenRigUnusable(t *testing.T) {
 	p := NewGitProbe(clone, notRig)
 	var stderr bytes.Buffer
 	v := GuardRemoval(p, clone, "sess-43", &stderr)
-	// The sibling gate runs first: the clone's own main branch makes the
-	// probe cat-file against the broken rig, which errors fail-closed.
-	if v.Secured || v.Action != "refuse" || v.Reason != "sibling-probe-failed" {
-		t.Fatalf("verdict = %+v, want refuse/sibling-probe-failed with unusable rig", v)
+	// The rig-independence probe runs first: an unusable rig cannot even
+	// report where its object store lives, which refuses fail-closed.
+	if v.Secured || v.Action != "refuse" || v.Reason != "rig-probe-failed" {
+		t.Fatalf("verdict = %+v, want refuse/rig-probe-failed with unusable rig", v)
 	}
 	if !strings.Contains(stderr.String(), "worktreeguard: refuse repo="+clone) {
 		t.Fatalf("stderr = %q, want refuse line", stderr.String())
@@ -196,8 +196,8 @@ func TestGitProbeGuardRefusesOnUnsecuredSiblingBranch(t *testing.T) {
 	if v.Secured || v.Action != "refuse" {
 		t.Fatalf("verdict = %+v, want refuse (stderr: %q)", v, stderr.String())
 	}
-	if v.Reason != "non-head-branches-unsecured: sibling" {
-		t.Fatalf("reason = %q, want non-head-branches-unsecured: sibling", v.Reason)
+	if v.Reason != "non-head-refs-unsecured: sibling" {
+		t.Fatalf("reason = %q, want non-head-refs-unsecured: sibling", v.Reason)
 	}
 	refs := git(t, rig, "for-each-ref", "--format=%(refname)", QuarantineRefPrefix)
 	if strings.Contains(refs, QuarantineRefPrefix) {
@@ -293,9 +293,9 @@ func TestGitProbeGuardSecuresLinkedDetachedOrphan(t *testing.T) {
 	sha := strings.TrimSpace(git(t, wt, "rev-parse", "HEAD"))
 
 	p := NewGitProbe(wt, rig)
-	reach, err := p.HeadReachableInRigRepo()
+	reach, err := p.SecuredInRig(sha)
 	if err != nil || reach {
-		t.Fatalf("HeadReachableInRigRepo = %v %v, want false nil (object present, unreferenced)", reach, err)
+		t.Fatalf("SecuredInRig = %v %v, want false nil (object present, unreferenced)", reach, err)
 	}
 	var stderr bytes.Buffer
 	v := GuardRemoval(p, wt, "ga-lnk01", &stderr)
@@ -379,5 +379,66 @@ func TestGitProbeAssessWritesNoRefs(t *testing.T) {
 	}
 	if refs := git(t, rig, "for-each-ref", "--format=%(refname)", QuarantineRefPrefix); refs != "" {
 		t.Fatalf("quarantine refs after Assess = %q, want none", refs)
+	}
+}
+
+// TestGitProbeGuardIgnoresLeakedGitDir: gc running under a hook may inherit
+// GIT_DIR; every probe must ask the doomed repo itself, never the leaked one
+// (local critic, REVIEW-GATE 2026-10-28 — the leak made an unpushed clone
+// look already-secured).
+func TestGitProbeGuardIgnoresLeakedGitDir(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	sha := strings.TrimSpace(git(t, clone, "rev-parse", "HEAD"))
+	t.Setenv("GIT_DIR", filepath.Join(rig, ".git"))
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(clone, rig), clone, "sess-60", &stderr)
+	os.Unsetenv("GIT_DIR") //nolint:errcheck // t.Setenv restores at cleanup; the helpers below need a clean env now
+	if !v.Secured || v.Action != ActionSecuredCopy {
+		t.Fatalf("verdict = %+v, want secured-copy despite leaked GIT_DIR (stderr %q)", v, stderr.String())
+	}
+	ref := QuarantineRef("sess-60", "work", sha)
+	if got := strings.TrimSpace(git(t, rig, "rev-parse", ref)); got != sha {
+		t.Fatalf("%s = %q, want %q", ref, got, sha)
+	}
+}
+
+// TestGitProbeGuardRefusesOnLocalOnlyTag: a standalone clone whose only copy
+// of a commit is a LOCAL TAG (branch reset away from it) must refuse — the
+// tag dies with the directory (Sol REWORK 2026-10-28 (1)).
+func TestGitProbeGuardRefusesOnLocalOnlyTag(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	git(t, clone, "tag", "rescue-me")
+	git(t, clone, "checkout", "-q", "main")
+	git(t, clone, "branch", "-D", "work")
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(clone, rig), clone, "sess-61", &stderr)
+	if v.Secured || v.Reason != "non-head-refs-unsecured: refs/tags/rescue-me" {
+		t.Fatalf("verdict = %+v, want refuse non-head-refs-unsecured: refs/tags/rescue-me", v)
+	}
+}
+
+// TestGitProbeGuardRefusesWhenRigIsTheDoomedRepo: a misconfigured rig that
+// IS the doomed clone "secures" everything through refs that die with it.
+func TestGitProbeGuardRefusesWhenRigIsTheDoomedRepo(t *testing.T) {
+	_, clone := newStandaloneWithUnpushedBranch(t)
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(clone, clone), clone, "sess-62", &stderr)
+	if v.Secured || v.Reason != "rig-inside-doomed-tree" {
+		t.Fatalf("verdict = %+v, want refuse rig-inside-doomed-tree", v)
+	}
+}
+
+// TestGitProbeGuardRefusesWhenRigBorrowsObjectsFromDoomed: a rig whose
+// alternates point into the doomed clone loses those objects with it.
+func TestGitProbeGuardRefusesWhenRigBorrowsObjectsFromDoomed(t *testing.T) {
+	_, clone := newStandaloneWithUnpushedBranch(t)
+	rig2 := filepath.Join(t.TempDir(), "shared-rig")
+	if out, err := exec.Command("git", "clone", "-q", "--shared", clone, rig2).CombinedOutput(); err != nil {
+		t.Fatalf("clone --shared: %v\n%s", err, out)
+	}
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(clone, rig2), clone, "sess-63", &stderr)
+	if v.Secured || v.Reason != "rig-inside-doomed-tree" {
+		t.Fatalf("verdict = %+v, want refuse rig-inside-doomed-tree", v)
 	}
 }
