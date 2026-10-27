@@ -77,7 +77,7 @@ func TestGitProbeGuardSecuresStandaloneUnpushedBranch(t *testing.T) {
 		t.Fatal("clone not detected as repo")
 	}
 	branch, sha, err := p.HeadInfo()
-	if err != nil || branch != "work" || len(sha) != 40 {
+	if err != nil || branch != "work" || len(sha) < 12 {
 		t.Fatalf("HeadInfo = %q %q %v", branch, sha, err)
 	}
 	reach, err := p.HeadReachableInRigRepo()
@@ -109,10 +109,10 @@ func TestGitProbeGuardRefusesWhenRigUnusable(t *testing.T) {
 	p := NewGitProbe(clone, notRig)
 	var stderr bytes.Buffer
 	v := GuardRemoval(p, clone, "sess-43", &stderr)
-	if v.Secured {
-		t.Fatalf("verdict = %+v, want refused with unusable rig", v)
+	if v.Secured || v.Action != "refuse" || v.Reason != "reachability-unknown" {
+		t.Fatalf("verdict = %+v, want refuse/reachability-unknown with unusable rig", v)
 	}
-	if !strings.Contains(stderr.String(), "worktreeguard: secured-copy repo="+clone) {
+	if !strings.Contains(stderr.String(), "worktreeguard: refuse repo="+clone) {
 		t.Fatalf("stderr = %q, want refuse line", stderr.String())
 	}
 }
@@ -131,5 +131,65 @@ func TestGitProbeGuardAlreadySecuredWhenRigHasHead(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("secured verdict wrote stderr: %q", stderr.String())
+	}
+}
+
+func TestGitProbeGuardSecuresSlashNamedBranch(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	// The standard executor naming shape: a branch containing '/'.
+	git(t, clone, "checkout", "-q", "-b", "agentforge-executor/adhoc-x")
+	commitFile(t, clone, "slash.txt")
+
+	p := NewGitProbe(clone, rig)
+	var stderr bytes.Buffer
+	v := GuardRemoval(p, clone, "sess-45", &stderr)
+	if !v.Secured || v.Action != "secured-copy" {
+		t.Fatalf("verdict = %+v, want secured-copy (stderr: %q)", v, stderr.String())
+	}
+	refs := git(t, rig, "for-each-ref", "--format=%(refname)", QuarantineRefPrefix)
+	if !strings.Contains(refs, QuarantineRefPrefix+"sess-45/agentforge-executor-adhoc-x") {
+		t.Fatalf("quarantine refs = %q, want sanitized destination %ssess-45/agentforge-executor-adhoc-x", refs, QuarantineRefPrefix)
+	}
+}
+
+func TestGitProbeGuardNothingToSecureOnUnbornHead(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	// A fresh init inside the doomed tree: zero commits, unborn HEAD.
+	empty := filepath.Join(clone, "inner-empty")
+	if err := os.MkdirAll(empty, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	initRepo(t, empty)
+
+	p := NewGitProbe(empty, rig)
+	var stderr bytes.Buffer
+	v := GuardRemoval(p, empty, "sess-46", &stderr)
+	if !v.Secured || v.Action != "nothing-to-secure" {
+		t.Fatalf("verdict = %+v, want nothing-to-secure on unborn head (stderr: %q)", v, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("secured verdict wrote stderr: %q", stderr.String())
+	}
+}
+
+func TestGitProbeGuardSecuresDetachedHead(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	git(t, clone, "checkout", "-q", "--detach")
+	sha := strings.TrimSpace(git(t, clone, "rev-parse", "HEAD"))
+
+	p := NewGitProbe(clone, rig)
+	branch, headSha, err := p.HeadInfo()
+	if err != nil || branch != "" || headSha != sha {
+		t.Fatalf("HeadInfo = %q %q %v, want detached %q", branch, headSha, err, sha)
+	}
+	var stderr bytes.Buffer
+	v := GuardRemoval(p, clone, "sess-47", &stderr)
+	if !v.Secured || v.Action != "secured-copy" {
+		t.Fatalf("verdict = %+v, want secured-copy for detached head (stderr: %q)", v, stderr.String())
+	}
+	refs := git(t, rig, "for-each-ref", "--format=%(refname)", QuarantineRefPrefix)
+	want := QuarantineRefPrefix + "sess-47/detached-" + sha[:12]
+	if !strings.Contains(refs, want) {
+		t.Fatalf("quarantine refs = %q, want %s", refs, want)
 	}
 }

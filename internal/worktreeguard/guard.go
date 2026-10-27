@@ -101,8 +101,11 @@ func Decide(facts Facts) Verdict {
 // sanitized). Every non-secured verdict writes exactly one structured line
 // to stderr — never silent.
 func GuardRemoval(p Probe, repoPath, tag string, stderr io.Writer) Verdict {
+	// Branch stays RAW here: FetchIntoQuarantine needs the real ref name as
+	// the refspec SOURCE (a sanitized "feature-foo" would not exist when the
+	// branch is "feature/foo") and sanitizes only the DESTINATION segment
+	// itself. The stderr display field is sanitized at write time below.
 	branch, headSha, headErr := p.HeadInfo()
-	branch = sanitizeRefSegment(branch)
 	reach, reachErr := p.HeadReachableInRigRepo()
 	facts := Facts{
 		IsRepo:             p.IsRepo(),
@@ -129,7 +132,7 @@ func GuardRemoval(p Probe, repoPath, tag string, stderr io.Writer) Verdict {
 		}
 	}
 	if !v.Secured {
-		b, s := branch, headSha
+		b, s := sanitizeRefSegment(branch), headSha
 		if b == "" {
 			b = "-"
 		}

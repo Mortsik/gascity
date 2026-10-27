@@ -86,6 +86,11 @@ func TestDecideTable(t *testing.T) {
 			facts: Facts{IsRepo: true, Branch: "work", HeadSha: "abc123def4"},
 			want:  Verdict{Action: "secured-copy", Secured: false, Reason: "copy-absent-rig-repo-available"},
 		},
+		{
+			name:  "detached head without branch still needs a copy",
+			facts: Facts{IsRepo: true, Branch: "", HeadSha: "abc123def4567890"},
+			want:  Verdict{Action: "secured-copy", Secured: false, Reason: "copy-absent-rig-repo-available"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
