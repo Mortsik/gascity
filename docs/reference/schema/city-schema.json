@@ -1517,6 +1517,11 @@
           "type": "boolean",
           "description": "AutoPruneWorkerDir controls whether the reconciler removes a\npool-managed session's worker_dir (agent worktree) after the session\nbead is closed. Removal is gated on: path lives under the city's\n.gc/worktrees/ tree, clean working tree, no unpushed commits, no\nstashed work. Nil (unset) defaults to true so pool worktrees do not\naccumulate without bound across pool recycles. Set to false to\nretain worktrees for post-session diagnostics.",
           "default": true
+        },
+        "worktree_removal_guard": {
+          "type": "boolean",
+          "description": "WorktreeRemovalGuard controls whether the two legacy worktree-removal\nsurfaces (session worker_dir prune and the closed-bead worktree\nreaper) run the worktreeguard reachability gate before removing a\ndirectory under .gc/worktrees/: a copy of the doomed HEAD must exist\nOUTSIDE the directory (already in the rig repo, or fetched into\nrefs/gc-quarantine/) before removal may proceed; otherwise the tree is\nkept and the refusal is logged. Default true — the incident class it\nprevents (agent-forge 3zf46 / ga0r1.1.1, 2026-10-14: a standalone\nexecutor clone holding the ONLY copy of an unpushed branch was deleted\nby pool cleanup) loses work silently. Set to false to restore the\nlegacy probes verbatim (rollback lever).",
+          "default": true
         }
       },
       "additionalProperties": false,

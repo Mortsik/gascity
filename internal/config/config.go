@@ -2883,6 +2883,28 @@ type DaemonConfig struct {
 	// accumulate without bound across pool recycles. Set to false to
 	// retain worktrees for post-session diagnostics.
 	AutoPruneWorkerDir *bool `toml:"auto_prune_worker_dir,omitempty" jsonschema:"default=true"`
+	// WorktreeRemovalGuard controls whether the two legacy worktree-removal
+	// surfaces (session worker_dir prune and the closed-bead worktree
+	// reaper) run the worktreeguard reachability gate before removing a
+	// directory under .gc/worktrees/: a copy of the doomed HEAD must exist
+	// OUTSIDE the directory (already in the rig repo, or fetched into
+	// refs/gc-quarantine/) before removal may proceed; otherwise the tree is
+	// kept and the refusal is logged. Default true — the incident class it
+	// prevents (agent-forge 3zf46 / ga0r1.1.1, 2026-10-14: a standalone
+	// executor clone holding the ONLY copy of an unpushed branch was deleted
+	// by pool cleanup) loses work silently. Set to false to restore the
+	// legacy probes verbatim (rollback lever).
+	WorktreeRemovalGuard *bool `toml:"worktree_removal_guard,omitempty" jsonschema:"default=true"`
+}
+
+// WorktreeRemovalGuardEnabled reports whether the worktreeguard reachability
+// gate is active for legacy removal surfaces. Nil (unset) defaults to true;
+// a nil receiver also reports true — the guard must fail ON, not off.
+func (d *DaemonConfig) WorktreeRemovalGuardEnabled() bool {
+	if d == nil || d.WorktreeRemovalGuard == nil {
+		return true
+	}
+	return *d.WorktreeRemovalGuard
 }
 
 // AutoRestartOnDriftEnabled reports whether the supervisor should be
