@@ -110,6 +110,9 @@ func TestReapClosedBeadWorktrees_ProtectsStandaloneCloneWhenCopyFails(t *testing
 	cfg := reapTestConfig(rigRoot)
 	injectLiveness(t, liveWorktreeState{scanned: true})
 
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions: the read-only rig cannot block the copy")
+	}
 	gitDir := filepath.Join(rigRoot, ".git")
 	if err := os.Chmod(gitDir, 0o555); err != nil {
 		t.Fatalf("chmod .git read-only: %v", err)
@@ -227,5 +230,128 @@ func TestReapClosedBeadWorktrees_GuardSecuresDetachedOrphanClone(t *testing.T) {
 	want := "refs/gc-quarantine/ga-stnd05/detached-" + sha[:12]
 	if !strings.Contains(refs, want) {
 		t.Fatalf("quarantine refs = %q, want %s", refs, want)
+	}
+}
+
+// TestReapClosedBeadWorktrees_GuardSecuresLinkedDetachedOrphan is the
+// guard-ON counterpart of ProtectsDetachedHEADWithOrphanCommits (the final
+// review's Critical): a LINKED worktree shares the rig's object store, so its
+// orphan detached commit already "exists" there while no ref reaches it. The
+// guard must quarantine it before the worktree goes — existence is not
+// reachability.
+func TestReapClosedBeadWorktrees_GuardSecuresLinkedDetachedOrphan(t *testing.T) {
+	cityPath, rigRoot := initReapRig(t)
+	wt := filepath.Join(cityPath, ".gc", "worktrees", reapTestRigName, "builder", "ga-orphan2")
+	if err := os.MkdirAll(filepath.Dir(wt), 0o755); err != nil {
+		t.Fatalf("mkdir worktree parent: %v", err)
+	}
+	mustGit(t, rigRoot, "worktree", "add", "--detach", wt)
+	mustGit(t, wt, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "orphan work")
+	sha := strings.TrimSpace(reapGitOut(t, wt, "rev-parse", "HEAD"))
+	backdateWorktreeGitFile(t, wt, 24*time.Hour)
+
+	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-orphan2", Status: "closed"}}, nil)
+	cfg := reapTestConfig(rigRoot)
+	injectLiveness(t, liveWorktreeState{scanned: true})
+
+	var stderr bytes.Buffer
+	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, nil, &stderr)
+
+	if len(report.Reaped) != 1 {
+		t.Fatalf("Reaped = %+v, want exactly 1\nProtected: %+v\nstderr:\n%s", report.Reaped, report.Protected, stderr.String())
+	}
+	ref := "refs/gc-quarantine/ga-orphan2/detached-" + sha[:12]
+	if got := strings.TrimSpace(reapGitOut(t, rigRoot, "rev-parse", ref)); got != sha {
+		t.Fatalf("%s = %q, want the orphan commit %q\nstderr:\n%s", ref, got, sha, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "worktreeguard: secured-copy") {
+		t.Fatalf("stderr must name the secured copy:\n%s", stderr.String())
+	}
+}
+
+// TestReapClosedBeadWorktrees_DryRunWritesNoQuarantine: dry-run answers
+// "would reap" for a clone the guard COULD secure, without landing a single
+// quarantine ref or touching the clone.
+func TestReapClosedBeadWorktrees_DryRunWritesNoQuarantine(t *testing.T) {
+	cityPath, rigRoot := initReapRig(t)
+	wt := addClosedStandaloneClone(t, rigRoot, cityPath, "builder", "ga-stnd07")
+	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-stnd07", Status: "closed"}}, nil)
+	cfg := reapTestConfig(rigRoot)
+	injectLiveness(t, liveWorktreeState{scanned: true})
+
+	var stderr bytes.Buffer
+	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, true, events.Discard, nil, &stderr)
+
+	if len(report.Reaped) != 1 || len(report.Protected) != 0 {
+		t.Fatalf("dry-run Reaped=%+v Protected=%+v, want 1 would-reap\nstderr:\n%s", report.Reaped, report.Protected, stderr.String())
+	}
+	if refs := reapGitOut(t, rigRoot, "for-each-ref", "--format=%(refname)", "refs/gc-quarantine/"); refs != "" {
+		t.Fatalf("dry-run wrote quarantine refs: %q", refs)
+	}
+	if _, err := os.Stat(wt); err != nil {
+		t.Fatalf("dry-run touched the clone: %v", err)
+	}
+}
+
+// TestReapClosedBeadWorktrees_IgnoresForeignLinkedWorktree: a linked worktree
+// of SOME OTHER repository parked under the rig's tree is not the rig's to
+// reap — discovery adds only standalone clones (.git directory) to what
+// porcelain reports.
+func TestReapClosedBeadWorktrees_IgnoresForeignLinkedWorktree(t *testing.T) {
+	cityPath, rigRoot := initReapRig(t)
+	foreign := filepath.Join(t.TempDir(), "foreign")
+	if err := os.MkdirAll(foreign, 0o755); err != nil {
+		t.Fatalf("mkdir foreign: %v", err)
+	}
+	mustGit(t, foreign, "init", "-q", "--initial-branch=main")
+	mustGit(t, foreign, "-c", "user.email=t@example.com", "-c", "user.name=T", "-c", "commit.gpgsign=false",
+		"commit", "--allow-empty", "-m", "foreign base")
+	wt := filepath.Join(cityPath, ".gc", "worktrees", reapTestRigName, "builder", "ga-frgn01")
+	if err := os.MkdirAll(filepath.Dir(wt), 0o755); err != nil {
+		t.Fatalf("mkdir worktree parent: %v", err)
+	}
+	mustGit(t, foreign, "worktree", "add", "-q", "-b", "polecat/ga-frgn01", wt)
+	backdateWorktreeGitFile(t, wt, 24*time.Hour)
+
+	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-frgn01", Status: "closed"}}, nil)
+	cfg := reapTestConfig(rigRoot)
+	injectLiveness(t, liveWorktreeState{scanned: true})
+
+	var stderr bytes.Buffer
+	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, nil, &stderr)
+
+	if len(report.Reaped) != 0 || len(report.Protected) != 0 {
+		t.Fatalf("foreign linked worktree touched: Reaped=%+v Protected=%+v\nstderr:\n%s", report.Reaped, report.Protected, stderr.String())
+	}
+	if _, err := os.Stat(wt); err != nil {
+		t.Fatalf("foreign linked worktree removed: %v", err)
+	}
+	if refs := reapGitOut(t, rigRoot, "for-each-ref", "--format=%(refname)", "refs/gc-quarantine/"); refs != "" {
+		t.Fatalf("foreign worktree's commits copied into the rig: %q", refs)
+	}
+}
+
+// TestReapClosedBeadWorktrees_ProtectsStandaloneCloneWithUntrackedFile pins
+// the dirty-tree gate for the RemoveAll path: a standalone clone is torn down
+// without `git worktree remove`'s own dirty check, so an untracked file must
+// protect it before the guard is even asked.
+func TestReapClosedBeadWorktrees_ProtectsStandaloneCloneWithUntrackedFile(t *testing.T) {
+	cityPath, rigRoot := initReapRig(t)
+	wt := addClosedStandaloneClone(t, rigRoot, cityPath, "builder", "ga-stnd08")
+	if err := os.WriteFile(filepath.Join(wt, "notes.txt"), []byte("unsaved\n"), 0o644); err != nil {
+		t.Fatalf("write untracked: %v", err)
+	}
+	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-stnd08", Status: "closed"}}, nil)
+	cfg := reapTestConfig(rigRoot)
+	injectLiveness(t, liveWorktreeState{scanned: true})
+
+	var stderr bytes.Buffer
+	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, nil, &stderr)
+
+	if len(report.Reaped) != 0 || len(report.Protected) != 1 || !strings.Contains(report.Protected[0].Reason, "unsafe git state") {
+		t.Fatalf("Reaped=%+v Protected=%+v, want 1 protected with unsafe git state\nstderr:\n%s", report.Reaped, report.Protected, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(wt, "notes.txt")); err != nil {
+		t.Fatalf("untracked file lost: %v", err)
 	}
 }

@@ -341,6 +341,13 @@ func reapClosedBeadWorktrees(
 						reason = fmt.Sprintf("git probe failed (failing closed): %v", stashErr)
 					case hasUncommitted || hasStashes:
 						reason = fmt.Sprintf("unsafe git state: uncommitted=%v stashes=%v", hasUncommitted, hasStashes)
+					case dryRun:
+						// Dry-run asks the same question without executing the
+						// copy: a secured-copy verdict is a "would secure, then
+						// reap", so only a refusal protects here.
+						if v := worktreeAssess(worktreeguard.NewGitProbe(worktreePath, rigRoot)); !v.Secured && v.Action != worktreeguard.ActionSecuredCopy {
+							reason = fmt.Sprintf("branch-unsecured: %s: %s", v.Action, v.Reason)
+						}
 					default:
 						if v := worktreeGuard(worktreeguard.NewGitProbe(worktreePath, rigRoot), worktreePath, beadID, stderr); !v.Secured {
 							reason = fmt.Sprintf("branch-unsecured: %s: %s", v.Action, v.Reason)
@@ -434,13 +441,16 @@ type reapCandidate struct {
 }
 
 // discoverUnlinkedRepos walks the rig's worktree tree and returns every
-// directory holding a .git FILE OR DIRECTORY that `git worktree list` never
+// STANDALONE clone (a .git DIRECTORY) that `git worktree list` never
 // reported — standalone clones are invisible to porcelain, which is exactly
-// how the ga0r1.1.1 incident clone leaked past every gate. It never descends
-// into a found repo, never reports anything outside the tree, and never fails
-// the pass (an unreadable subtree is skipped, and every pass-1 gate still
-// applies to what it finds). seen (normalized porcelain paths) dedupes linked
-// worktrees; liveness uses the same per-path check porcelain results get.
+// how the ga0r1.1.1 incident clone leaked past every gate. A .git FILE is a
+// linked worktree: the rig's own are already in porcelain, and one porcelain
+// did not report belongs to some other repository — never the rig's to copy
+// from or remove. It never descends into a found repo, never reports
+// anything outside the tree, and never fails the pass (an unreadable subtree
+// is skipped, and every pass-1 gate still applies to what it finds). seen
+// (normalized porcelain paths) dedupes; liveness uses the same per-path
+// check porcelain results get.
 func discoverUnlinkedRepos(root string, live liveWorktreeState, sessionDirs []string, seen map[string]bool) []worktreeLiveness {
 	var out []worktreeLiveness
 	//nolint:errcheck // best-effort scan: an unreadable tree yields no candidates, never a failed pass
@@ -448,10 +458,11 @@ func discoverUnlinkedRepos(root string, live liveWorktreeState, sessionDirs []st
 		if err != nil || !d.IsDir() {
 			return nil
 		}
-		if _, statErr := os.Stat(filepath.Join(path, ".git")); statErr != nil {
+		marker, statErr := os.Lstat(filepath.Join(path, ".git"))
+		if statErr != nil {
 			return nil // not a repo marker: keep descending
 		}
-		if !seen[pathutil.NormalizePathForCompare(path)] {
+		if marker.IsDir() && !seen[pathutil.NormalizePathForCompare(path)] {
 			wl := worktreeLiveness{Path: path}
 			if branch, branchErr := git.New(path).CurrentBranch(); branchErr == nil {
 				wl.Branch = branch

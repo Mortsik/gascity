@@ -552,6 +552,35 @@ func TestPruneAgentHomeWorktreeIfSafe_GuardSecuresStandaloneClone(t *testing.T) 
 	}
 }
 
+// Guard ON, LINKED worktree with an orphan detached commit: the object lives
+// in the rig's shared store but no ref reaches it, so the guard must
+// quarantine it before `git worktree remove` (existence is not reachability).
+func TestPruneAgentHomeWorktreeIfSafe_GuardSecuresLinkedDetachedOrphan(t *testing.T) {
+	fx := newRealPruneFixture(t)
+	if err := os.RemoveAll(fx.workerDir); err != nil {
+		t.Fatalf("drop clone: %v", err)
+	}
+	runPruneGit(t, fx.rigRoot, "worktree", "add", "-q", "--detach", fx.workerDir)
+	if err := os.WriteFile(filepath.Join(fx.workerDir, "orphan.txt"), []byte("orphan\n"), 0o644); err != nil {
+		t.Fatalf("write orphan.txt: %v", err)
+	}
+	runPruneGit(t, fx.workerDir, "add", "orphan.txt")
+	runPruneGit(t, fx.workerDir, "commit", "-q", "-m", "orphan work")
+	sha := strings.TrimSpace(runPruneGit(t, fx.workerDir, "rev-parse", "HEAD"))
+
+	var stderr bytes.Buffer
+	if !pruneAgentHomeWorktreeIfSafe(fx.sessionBead(), fx.cityPath, fx.cfg, &stderr) {
+		t.Fatalf("prune returned false on securable linked orphan; stderr=%s", stderr.String())
+	}
+	if _, err := os.Stat(fx.workerDir); !os.IsNotExist(err) {
+		t.Fatalf("worker dir still present after secured prune: %v", err)
+	}
+	ref := "refs/gc-quarantine/session-1/detached-" + sha[:12]
+	if got := strings.TrimSpace(runPruneGit(t, fx.rigRoot, "rev-parse", ref)); got != sha {
+		t.Fatalf("%s = %q, want the orphan commit %q", ref, got, sha)
+	}
+}
+
 // Guard ON, rig repo unusable: the guard cannot secure a copy, so removal is
 // REFUSED, the dir stays intact, and the stale marker names the unsecured
 // branch.
@@ -632,5 +661,23 @@ func TestLookupRigRootForSession(t *testing.T) {
 				t.Errorf("lookupRigRootForSession(%q) = %q, want %q", c.template, got, c.want)
 			}
 		})
+	}
+}
+
+// The guard's kill switch never goes unannounced: one line when off,
+// silence when on (the default) or with no config at all.
+func TestWarnWorktreeGuardDisabled(t *testing.T) {
+	off := false
+	var offOut, onOut, nilOut bytes.Buffer
+	cfgOff := &config.City{}
+	cfgOff.Daemon.WorktreeRemovalGuard = &off
+	warnWorktreeGuardDisabled(cfgOff, &offOut)
+	warnWorktreeGuardDisabled(&config.City{}, &onOut)
+	warnWorktreeGuardDisabled(nil, &nilOut)
+	if n := strings.Count(offOut.String(), "\n"); n != 1 || !strings.Contains(offOut.String(), "worktree_removal_guard = false") {
+		t.Fatalf("guard off: stderr = %q, want exactly one disabled line", offOut.String())
+	}
+	if onOut.Len() != 0 || nilOut.Len() != 0 {
+		t.Fatalf("guard on/nil cfg wrote: %q / %q", onOut.String(), nilOut.String())
 	}
 }

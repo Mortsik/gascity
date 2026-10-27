@@ -34,21 +34,21 @@ type Probe interface {
 	// HeadInfo returns the checked-out branch ("" when detached) and the
 	// HEAD commit sha; an error is a fail-closed fact.
 	HeadInfo() (branch string, headSha string, err error)
-	// HeadReachableInRigRepo reports whether the HEAD commit already exists
-	// as an object in the rig repository — a copy outside the doomed
-	// directory by construction.
+	// HeadReachableInRigRepo reports whether the HEAD commit is reachable
+	// from a surviving ref of the rig repository — mere object existence is
+	// not enough (a linked worktree shares the rig's object store).
 	HeadReachableInRigRepo() (bool, error)
-	// FetchIntoQuarantine copies the branch (or bare sha, branch "") into
-	// QuarantineRefPrefix+tag+"/"+branch under the rig repository.
+	// FetchIntoQuarantine copies headSha into QuarantineRef(tag, branch,
+	// headSha) under the rig repository, never overwriting an existing ref.
 	FetchIntoQuarantine(tag, branch, headSha string) error
-	// VerifyQuarantied confirms the copied object actually landed in the
-	// rig repository — a fetch that reports success but transfers nothing
-	// must never authorize a removal.
+	// VerifyQuarantied confirms the copy is now reachable in the rig
+	// repository — a fetch that reports success but secures nothing must
+	// never authorize a removal.
 	VerifyQuarantied(headSha string) error
 	// UnsecuredSiblingBranches returns every branch other than the
-	// checked-out one whose tip commit does NOT exist as an object in the
-	// rig repository — branches whose only copy dies with the directory.
-	// An error is a fail-closed fact.
+	// checked-out one whose tip is NOT reachable from a surviving rig ref —
+	// branches whose only copy dies with the directory. An error is a
+	// fail-closed fact.
 	UnsecuredSiblingBranches() ([]string, error)
 }
 
@@ -101,7 +101,7 @@ func Decide(facts Facts) Verdict {
 	case len(facts.NonHeadUnsecured) > 0:
 		return Verdict{
 			Action: ActionRefuse, Secured: false,
-			Reason: "non-head-branches-unsecured: " + strings.Join(facts.NonHeadUnsecured, ", "),
+			Reason: "non-head-branches-unsecured: " + joinCapped(facts.NonHeadUnsecured, maxReasonNames),
 		}
 	case facts.HeadSha == "":
 		return Verdict{Action: ActionNothingToSecure, Secured: true, Reason: "no-commits"}
@@ -116,29 +116,27 @@ func Decide(facts Facts) Verdict {
 	}
 }
 
+// maxReasonNames bounds the sibling list carried in a refuse reason (and so
+// in the notify line and the protected-reason surfaces downstream).
+const maxReasonNames = 10
+
+func joinCapped(names []string, limit int) string {
+	if len(names) <= limit {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s (+%d more)", strings.Join(names[:limit], ", "), len(names)-limit)
+}
+
 // GuardRemoval decides and executes the securing of one removal candidate.
 // tag names the quarantine sub-namespace (the caller's session/bead id,
-// sanitized). Every non-secured verdict writes exactly one structured line
-// to stderr — never silent.
+// sanitized). Every non-secured verdict AND every executed copy writes
+// exactly one structured line to stderr — a refusal is never silent, and
+// neither is rescued work landing somewhere an operator must know about.
 func GuardRemoval(p Probe, repoPath, tag string, stderr io.Writer) Verdict {
-	// Branch stays RAW here: FetchIntoQuarantine needs the real ref name as
-	// the refspec SOURCE (a sanitized "feature-foo" would not exist when the
-	// branch is "feature/foo") and sanitizes only the DESTINATION segment
-	// itself. The stderr display field is sanitized at write time below.
-	branch, headSha, headErr := p.HeadInfo()
-	reach, reachErr := p.HeadReachableInRigRepo()
-	siblings, siblingErr := p.UnsecuredSiblingBranches()
-	facts := Facts{
-		IsRepo:             p.IsRepo(),
-		Branch:             branch,
-		HeadSha:            headSha,
-		HeadReachableInRig: reach,
-		HeadProbeErr:       headErr != nil,
-		ReachableProbeErr:  reachErr != nil,
-		NonHeadUnsecured:   siblings,
-		NonHeadProbeErr:    siblingErr != nil,
-	}
-	v := Decide(facts)
+	// Branch stays RAW here: QuarantineRef sanitizes it into one ref path
+	// component, and the stderr display field is sanitized at write time.
+	branch, headSha, _ := p.HeadInfo()
+	v := Assess(p)
 	if v.Action == ActionSecuredCopy {
 		if err := p.FetchIntoQuarantine(tag, branch, headSha); err != nil {
 			v = Verdict{
@@ -152,20 +150,54 @@ func GuardRemoval(p Probe, repoPath, tag string, stderr io.Writer) Verdict {
 			}
 		} else {
 			v = Verdict{Action: ActionSecuredCopy, Secured: true, Reason: "fetched-into-quarantine"}
+			fmt.Fprintf(stderr, "worktreeguard: %s repo=%s branch=%s sha=%s ref=%s\n",
+				v.Action, repoPath, displayOrDash(sanitizeRefSegment(branch)), headSha,
+				QuarantineRef(tag, branch, headSha)) //nolint:errcheck // notify line, best-effort
 		}
 	}
 	if !v.Secured {
-		b, s := sanitizeRefSegment(branch), headSha
-		if b == "" {
-			b = "-"
-		}
-		if s == "" {
-			s = "-"
-		}
 		fmt.Fprintf(stderr, "worktreeguard: %s repo=%s branch=%s sha=%s reason=%s\n",
-			v.Action, repoPath, b, s, v.Reason) //nolint:errcheck // notify line, best-effort
+			v.Action, repoPath, displayOrDash(sanitizeRefSegment(branch)), displayOrDash(headSha),
+			v.Reason) //nolint:errcheck // notify line, best-effort
 	}
 	return v
+}
+
+func displayOrDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// Assess gathers the probe facts and decides — no copy, no notify line. It
+// answers what GuardRemoval WOULD do (dry-run surfaces).
+func Assess(p Probe) Verdict {
+	branch, headSha, headErr := p.HeadInfo()
+	reach, reachErr := p.HeadReachableInRigRepo()
+	siblings, siblingErr := p.UnsecuredSiblingBranches()
+	return Decide(Facts{
+		IsRepo:             p.IsRepo(),
+		Branch:             branch,
+		HeadSha:            headSha,
+		HeadReachableInRig: reach,
+		HeadProbeErr:       headErr != nil,
+		ReachableProbeErr:  reachErr != nil,
+		NonHeadUnsecured:   siblings,
+		NonHeadProbeErr:    siblingErr != nil,
+	})
+}
+
+// QuarantineRef names the rig-repo ref a copy of headSha lands under:
+// <prefix><tag>/<branch>-<sha12>, or <prefix><tag>/detached-<sha12>. The
+// name is per CONTENT, so a later copy under the same tag and branch gets
+// its own ref instead of overwriting an earlier rescue. Pure.
+func QuarantineRef(tag, branch, headSha string) string {
+	name := "detached"
+	if branch != "" {
+		name = sanitizeRefSegment(branch)
+	}
+	return QuarantineRefPrefix + sanitizeRefSegment(tag) + "/" + name + "-" + sha12(headSha)
 }
 
 // sanitizeRefSegment keeps a caller-supplied tag/branch inside ONE ref

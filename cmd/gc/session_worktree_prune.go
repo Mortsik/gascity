@@ -37,6 +37,21 @@ var newGitProbe = func(workDir string) gitProbe { return git.New(workDir) }
 // stub it to keep probe-fake fixtures off the subprocess surface.
 var worktreeGuard = worktreeguard.GuardRemoval
 
+// worktreeAssess is the side-effect-free twin of worktreeGuard for dry-run
+// surfaces: the same verdict, no copy, no notify line.
+var worktreeAssess = worktreeguard.Assess
+
+// warnWorktreeGuardDisabled announces, once per controller start, that the
+// worktree removal guard is off: the kill switch is a rollback lever, and a
+// city running the legacy probes (which cannot see standalone clones) must
+// not do so silently.
+func warnWorktreeGuardDisabled(cfg *config.City, stderr io.Writer) {
+	if cfg == nil || cfg.Daemon.WorktreeRemovalGuardEnabled() {
+		return
+	}
+	fmt.Fprintln(stderr, "worktreeguard: disabled ([daemon] worktree_removal_guard = false): worker_dir prune and closed-bead reap use the legacy probes, no quarantine copy") //nolint:errcheck
+}
+
 // standaloneCloneDir reports whether dir holds a full .git DIRECTORY (a
 // standalone clone) rather than a linked worktree's .git FILE. Standalone
 // clones are not registered in the rig repo's worktree list, so

@@ -2,6 +2,7 @@ package worktreeguard
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -146,8 +147,8 @@ func TestGuardRemovalSecuredCopySuccess(t *testing.T) {
 	if p.fetchCalls != 1 {
 		t.Fatalf("fetch calls = %d, want 1", p.fetchCalls)
 	}
-	if stderr.Len() != 0 {
-		t.Fatalf("secured verdict wrote stderr: %q", stderr.String())
+	if !strings.Contains(stderr.String(), "secured-copy") {
+		t.Fatalf("secured copy must name itself on stderr: %q", stderr.String())
 	}
 }
 
@@ -215,5 +216,68 @@ func TestGuardRemovalSiblingRefuseSkipsFetch(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "worktreeguard: refuse repo=/wt/x") {
 		t.Fatalf("stderr = %q, want refuse line", stderr.String())
+	}
+}
+
+// TestQuarantineRefNames: a branch copy is named per CONTENT
+// (<tag>/<branch>-<sha12>) so a later copy under the same tag and branch can
+// never overwrite an earlier one; a detached copy already carries its sha.
+func TestQuarantineRefNames(t *testing.T) {
+	cases := []struct {
+		tag, branch, sha, want string
+	}{
+		{"sess/1", "feature/x", "abc123def4567890", "refs/gc-quarantine/sess-1/feature-x-abc123def456"},
+		{"ga-1", "work", "abc123def4", "refs/gc-quarantine/ga-1/work-abc123def4"},
+		{"t", "", "abc123def4567890", "refs/gc-quarantine/t/detached-abc123def456"},
+	}
+	for _, c := range cases {
+		if got := QuarantineRef(c.tag, c.branch, c.sha); got != c.want {
+			t.Errorf("QuarantineRef(%q, %q, %q) = %q, want %q", c.tag, c.branch, c.sha, got, c.want)
+		}
+	}
+}
+
+// TestGuardRemovalSecuredCopyNamesRef: rescued work must never vanish
+// silently — a secured copy writes exactly one line naming where it went.
+func TestGuardRemovalSecuredCopyNamesRef(t *testing.T) {
+	p := &fakeProbe{isRepo: true, branch: "work", headSha: "abc123def4", reach: false}
+	var stderr bytes.Buffer
+	GuardRemoval(p, "/wt/x", "sess-1", &stderr)
+	line := stderr.String()
+	if n := strings.Count(line, "\n"); n != 1 {
+		t.Fatalf("stderr lines = %d, want exactly 1: %q", n, line)
+	}
+	if !strings.HasPrefix(line, "worktreeguard: secured-copy repo=/wt/x") {
+		t.Fatalf("stderr = %q, want secured-copy line", line)
+	}
+	if !strings.Contains(line, "ref=refs/gc-quarantine/sess-1/work-abc123def4") {
+		t.Fatalf("stderr = %q, want ref=refs/gc-quarantine/sess-1/work-abc123def4", line)
+	}
+}
+
+// TestAssessHasNoSideEffects: Assess answers what GuardRemoval WOULD do
+// (dry-run surfaces) without copying anything or writing a line.
+func TestAssessHasNoSideEffects(t *testing.T) {
+	p := &fakeProbe{isRepo: true, branch: "work", headSha: "abc123def4", reach: false}
+	v := Assess(p)
+	if v.Action != ActionSecuredCopy || v.Secured {
+		t.Fatalf("Assess = %+v, want secured-copy (not yet secured)", v)
+	}
+	if p.fetchCalls != 0 {
+		t.Fatalf("fetch calls = %d, want 0", p.fetchCalls)
+	}
+}
+
+// TestDecideCapsSiblingList: a repo with many unsecured branches yields a
+// bounded reason (first ten names + count), not an unbounded log line.
+func TestDecideCapsSiblingList(t *testing.T) {
+	var names []string
+	for i := 1; i <= 12; i++ {
+		names = append(names, fmt.Sprintf("b%02d", i))
+	}
+	v := Decide(Facts{IsRepo: true, HeadSha: "abc123def4", NonHeadUnsecured: names})
+	want := "non-head-branches-unsecured: b01, b02, b03, b04, b05, b06, b07, b08, b09, b10 (+2 more)"
+	if v.Reason != want {
+		t.Fatalf("reason = %q, want %q", v.Reason, want)
 	}
 }

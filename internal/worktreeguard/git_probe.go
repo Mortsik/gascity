@@ -5,6 +5,7 @@
 package worktreeguard
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -30,47 +31,65 @@ func (g *GitProbe) IsRepo() bool {
 	return err == nil
 }
 
-// HeadInfo returns branch ("" when detached) and HEAD sha. An UNBORN head
-// (a repo with no commits yet: rev-parse fails, symbolic-ref still resolves)
-// is a fact, not an error — it reports (branch, "", nil) so Decide reaches
-// nothing-to-secure; such a directory holds no commits to lose.
+// HeadInfo returns branch ("" when detached) and HEAD sha. The branch comes
+// from symbolic-ref (the full ref, never an --abbrev-ref guess that an
+// equally named tag can disambiguate into "heads/x"); exit 1 there is the
+// detached fact. An UNBORN head (symbolic-ref resolves, rev-parse --verify
+// exits 1) is a fact, not an error — it reports (branch, "", nil) so Decide
+// reaches nothing-to-secure; such a directory holds no commits to lose.
 func (g *GitProbe) HeadInfo() (string, string, error) {
-	branchOut, err := gitOut(g.repoPath, "rev-parse", "--abbrev-ref", "HEAD")
-	if err != nil {
-		// Unborn head? symbolic-ref resolves the branch name even with zero
-		// commits; a repo where it also fails is genuinely unprobeable.
-		if symOut, symErr := gitOut(g.repoPath, "symbolic-ref", "--short", "HEAD"); symErr == nil {
-			return strings.TrimSpace(symOut), "", nil
-		}
+	branch := ""
+	refOut, code, err := gitOutCode(g.repoPath, "symbolic-ref", "-q", "HEAD")
+	switch {
+	case err == nil:
+		branch = strings.TrimPrefix(strings.TrimSpace(refOut), "refs/heads/")
+	case code != 1:
 		return "", "", fmt.Errorf("branch probe: %w", err)
 	}
-	branch := strings.TrimSpace(branchOut)
-	if branch == "HEAD" {
-		branch = ""
-	}
-	shaOut, err := gitOut(g.repoPath, "rev-parse", "HEAD")
+	shaOut, code, err := gitOutCode(g.repoPath, "rev-parse", "--verify", "-q", "HEAD")
 	if err != nil {
+		if code == 1 && branch != "" {
+			return branch, "", nil
+		}
 		return "", "", fmt.Errorf("head probe: %w", err)
 	}
 	return branch, strings.TrimSpace(shaOut), nil
 }
 
-// HeadReachableInRigRepo reports whether the HEAD commit already exists as
-// an object in the rig repository. Plain existence, no ^{commit} peel: git
-// exits 1 for an absent object but 128 when the peel of an UNKNOWN sha fails
-// (empirically pinned), which would make "absent" indistinguishable from
-// "broken rig" by exit code. With the plain form: exit 1 = absent (a calm
-// false); any other failure (128: not a repo, missing binary) is an ERROR —
-// a broken rig surfaces as reachability-unknown, never as a masked
-// "not reachable".
+// HeadReachableInRigRepo reports whether the HEAD commit is SECURED in the
+// rig repository — reachable from a ref that survives the removal. Object
+// existence alone is not enough: a linked worktree shares the rig's object
+// store, so its orphan commits "exist" there until the next gc drops them.
 func (g *GitProbe) HeadReachableInRigRepo() (bool, error) {
 	_, headSha, err := g.HeadInfo()
 	if err != nil {
 		return false, err
 	}
-	return objectExists(g.rigRoot, headSha)
+	return securedInRig(g.rigRoot, headSha)
 }
 
+// securedInRig: sha exists in the rig repo AND some branch, tag,
+// remote-tracking or quarantine ref there reaches it. Deliberately not
+// --all: that would count HEADs and the doomed worktree's own HEAD among
+// them. Existence is checked first because rev-list on an absent sha exits
+// 128 — indistinguishable from a broken rig by exit code.
+func securedInRig(rigRoot, sha string) (bool, error) {
+	exists, err := objectExists(rigRoot, sha)
+	if err != nil || !exists {
+		return false, err
+	}
+	out, err := gitOut(rigRoot, "rev-list", "-n1", sha, "--not",
+		"--branches", "--tags", "--remotes", "--glob="+QuarantineRefPrefix+"*")
+	if err != nil {
+		return false, fmt.Errorf("rig repo reachability: %w", err)
+	}
+	return strings.TrimSpace(out) == "", nil
+}
+
+// objectExists: plain existence, no ^{commit} peel — git exits 1 for an
+// absent object but 128 when the peel of an UNKNOWN sha fails (empirically
+// pinned). Exit 1 = absent (a calm false); any other failure (128: not a
+// repo, missing binary) is an ERROR, never a masked "absent".
 func objectExists(dir, sha string) (bool, error) {
 	cmd := exec.Command("git", "-C", dir, "cat-file", "-e", sha)
 	if err := cmd.Run(); err != nil {
@@ -82,41 +101,43 @@ func objectExists(dir, sha string) (bool, error) {
 	return true, nil
 }
 
-// FetchIntoQuarantine copies the branch (or the bare sha when detached)
-// into QuarantineRefPrefix+tag+"/"+name in the rig repo — a fetch-shaped
-// copy that never touches the rig repo's refs/heads. The SOURCE side keeps
-// the raw branch ref (it may contain slashes); only the DESTINATION name is
-// sanitized into one path component.
+// FetchIntoQuarantine copies headSha into QuarantineRef(tag, branch,
+// headSha) in the rig repo — a fetch-shaped copy that never touches the rig
+// repo's refs/heads. The source is the exact sha (a branch that moved since
+// HeadInfo cannot substitute other content), and the refspec is NOT forced:
+// the destination is content-named, so an existing ref holding other content
+// is a collision that must fail, never an overwrite of an earlier rescue.
 func (g *GitProbe) FetchIntoQuarantine(tag, branch, headSha string) error {
-	name := sanitizeRefSegment(branch)
-	refspec := fmt.Sprintf("+refs/heads/%s:%s%s/%s", branch, QuarantineRefPrefix, sanitizeRefSegment(tag), name)
-	if branch == "" {
-		name = "detached-" + sha12(headSha)
-		refspec = fmt.Sprintf("+%s:%s%s/%s", headSha, QuarantineRefPrefix, sanitizeRefSegment(tag), name)
-	}
+	refspec := headSha + ":" + QuarantineRef(tag, branch, headSha)
 	return gitRun(g.rigRoot, "fetch", "--", g.repoPath, refspec)
 }
 
-// VerifyQuarantied confirms the copied object landed (plain existence —
-// same exit-code semantics as the reachability probe): a fetch that reports
-// success but transferred nothing must never authorize a removal.
+// VerifyQuarantied asks the reachability question again after the copy: a
+// fetch that reports success but secured nothing must never authorize a
+// removal (for a linked worktree the object pre-exists, so existence would
+// prove nothing).
 func (g *GitProbe) VerifyQuarantied(headSha string) error {
-	if ok, err := objectExists(g.rigRoot, headSha); err != nil || !ok {
-		if err != nil {
-			return err
-		}
-		return fmt.Errorf("quarantined object %s absent from rig repo after fetch", sha12(headSha))
+	ok, err := securedInRig(g.rigRoot, headSha)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("quarantined commit %s unreachable in rig repo after fetch", sha12(headSha))
 	}
 	return nil
 }
 
 // UnsecuredSiblingBranches lists every branch other than the checked-out
-// one whose tip commit is absent from the rig repository. A tip's presence
-// carries its whole reachable history (objects transfer by reachability),
-// so tip existence is a complete per-branch copy test. A broken rig or a
-// failed listing is an ERROR, never an empty list — the caller fails closed.
+// one whose tip is not secured in the rig repository (securedInRig: a
+// secured tip carries its whole history). A linked worktree (.git FILE) has
+// no siblings: its refs/heads live in the shared repository and survive the
+// directory's removal. A broken rig or a failed listing is an ERROR, never
+// an empty list — the caller fails closed.
 func (g *GitProbe) UnsecuredSiblingBranches() ([]string, error) {
-	out, err := gitOut(g.repoPath, "for-each-ref", "refs/heads/", "--format=%(refname:short) %(objectname)")
+	if fi, err := os.Lstat(filepath.Join(g.repoPath, ".git")); err == nil && fi.Mode().IsRegular() {
+		return nil, nil
+	}
+	out, err := gitOut(g.repoPath, "for-each-ref", "refs/heads/", "--format=%(objectname) %(refname)")
 	if err != nil {
 		return nil, fmt.Errorf("sibling listing: %w", err)
 	}
@@ -131,18 +152,19 @@ func (g *GitProbe) UnsecuredSiblingBranches() ([]string, error) {
 		if line == "" {
 			continue
 		}
-		name, sha, ok := strings.Cut(line, " ")
+		sha, ref, ok := strings.Cut(line, " ")
 		if !ok {
 			return nil, fmt.Errorf("sibling listing: malformed line %q", line)
 		}
+		name := strings.TrimPrefix(ref, "refs/heads/")
 		if name == headBranch {
 			continue // the checked-out branch is the head question, handled above
 		}
-		exists, err := objectExists(g.rigRoot, sha)
+		secured, err := securedInRig(g.rigRoot, sha)
 		if err != nil {
 			return nil, err
 		}
-		if !exists {
+		if !secured {
 			unsecured = append(unsecured, name)
 		}
 	}
@@ -164,6 +186,20 @@ func gitRun(dir string, args ...string) error {
 		return fmt.Errorf("git -C %s %s: %w: %.200s", dir, strings.Join(args, " "), err, out)
 	}
 	return nil
+}
+
+// gitOutCode is gitOut plus the process exit code (-1 when git did not run),
+// for probes where one specific exit code is a fact rather than a failure.
+func gitOutCode(dir string, args ...string) (string, int, error) {
+	out, err := gitOut(dir, args...)
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return "", exitErr.ExitCode(), err
+		}
+		return "", -1, err
+	}
+	return out, 0, nil
 }
 
 func gitOut(dir string, args ...string) (string, error) {

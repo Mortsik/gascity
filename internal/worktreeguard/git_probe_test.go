@@ -255,3 +255,129 @@ func TestGitProbeGuardSecuresDetachedHead(t *testing.T) {
 		t.Fatalf("quarantine refs = %q, want %s", refs, want)
 	}
 }
+
+// newLinkedWorktree adds a linked worktree of rig (a .git FILE sharing the
+// rig's object store) at a fresh path and returns that path. detach=true
+// checks out a detached HEAD; otherwise a new branch named branch.
+func newLinkedWorktree(t *testing.T, rig, branch string, detach bool) string {
+	t.Helper()
+	wt := filepath.Join(t.TempDir(), "linked")
+	if detach {
+		git(t, rig, "worktree", "add", "-q", "--detach", wt)
+	} else {
+		git(t, rig, "worktree", "add", "-q", "-b", branch, wt)
+	}
+	return wt
+}
+
+func newRig(t *testing.T) string {
+	t.Helper()
+	rig := filepath.Join(t.TempDir(), "rig")
+	if err := os.MkdirAll(rig, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	initRepo(t, rig)
+	commitFile(t, rig, "base.txt")
+	return rig
+}
+
+// TestGitProbeGuardSecuresLinkedDetachedOrphan is the final review's
+// Critical: a linked worktree SHARES the rig's object store, so its orphan
+// detached commit "exists" in the rig while no ref there reaches it — the
+// next gc would drop it. Existence is not reachability: the guard must
+// quarantine it.
+func TestGitProbeGuardSecuresLinkedDetachedOrphan(t *testing.T) {
+	rig := newRig(t)
+	wt := newLinkedWorktree(t, rig, "", true)
+	commitFile(t, wt, "orphan.txt")
+	sha := strings.TrimSpace(git(t, wt, "rev-parse", "HEAD"))
+
+	p := NewGitProbe(wt, rig)
+	reach, err := p.HeadReachableInRigRepo()
+	if err != nil || reach {
+		t.Fatalf("HeadReachableInRigRepo = %v %v, want false nil (object present, unreferenced)", reach, err)
+	}
+	var stderr bytes.Buffer
+	v := GuardRemoval(p, wt, "ga-lnk01", &stderr)
+	if !v.Secured || v.Action != ActionSecuredCopy {
+		t.Fatalf("verdict = %+v, want secured-copy (stderr: %q)", v, stderr.String())
+	}
+	ref := QuarantineRef("ga-lnk01", "", sha)
+	if got := strings.TrimSpace(git(t, rig, "rev-parse", ref)); got != sha {
+		t.Fatalf("%s = %q, want %q", ref, got, sha)
+	}
+}
+
+// TestGitProbeGuardLinkedBranchAlreadySecured: a linked worktree's branch
+// lives in the rig's refs/heads and survives the directory's removal, so its
+// head is secured without a copy — and the rig's other branches are never
+// "siblings" of the doomed directory.
+func TestGitProbeGuardLinkedBranchAlreadySecured(t *testing.T) {
+	rig := newRig(t)
+	git(t, rig, "branch", "unrelated-unpushed")
+	wt := newLinkedWorktree(t, rig, "polecat/ga-lnk02", false)
+	commitFile(t, wt, "work.txt")
+
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(wt, rig), wt, "ga-lnk02", &stderr)
+	if !v.Secured || v.Action != ActionAlreadySecured {
+		t.Fatalf("verdict = %+v, want already-secured (stderr: %q)", v, stderr.String())
+	}
+}
+
+// TestGitProbeGuardSecuresUnreferencedObjectInRig: the standalone shape of
+// the same Critical — the head object reached the rig once (a fetch whose
+// ref was later deleted) but nothing references it any more.
+func TestGitProbeGuardSecuresUnreferencedObjectInRig(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	git(t, rig, "fetch", "-q", clone, "work:refs/heads/tmp")
+	git(t, rig, "update-ref", "-d", "refs/heads/tmp")
+	sha := strings.TrimSpace(git(t, clone, "rev-parse", "HEAD"))
+
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(clone, rig), clone, "sess-50", &stderr)
+	if !v.Secured || v.Action != ActionSecuredCopy {
+		t.Fatalf("verdict = %+v, want secured-copy for unreferenced object (stderr: %q)", v, stderr.String())
+	}
+	ref := QuarantineRef("sess-50", "work", sha)
+	if got := strings.TrimSpace(git(t, rig, "rev-parse", ref)); got != sha {
+		t.Fatalf("%s = %q, want %q", ref, got, sha)
+	}
+}
+
+// TestGitProbeGuardNeverOverwritesEarlierCopy: two removals under the same
+// tag and branch name with DIVERGENT heads must leave two quarantine refs —
+// a forced overwrite would orphan the first rescued commit.
+func TestGitProbeGuardNeverOverwritesEarlierCopy(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	first := strings.TrimSpace(git(t, clone, "rev-parse", "HEAD"))
+	var stderr bytes.Buffer
+	if v := GuardRemoval(NewGitProbe(clone, rig), clone, "sess-51", &stderr); !v.Secured {
+		t.Fatalf("first verdict = %+v (stderr: %q)", v, stderr.String())
+	}
+	git(t, clone, "reset", "-q", "--hard", "main")
+	commitFile(t, clone, "divergent.txt")
+	second := strings.TrimSpace(git(t, clone, "rev-parse", "HEAD"))
+	if v := GuardRemoval(NewGitProbe(clone, rig), clone, "sess-51", &stderr); !v.Secured {
+		t.Fatalf("second verdict = %+v (stderr: %q)", v, stderr.String())
+	}
+	for _, sha := range []string{first, second} {
+		ref := QuarantineRef("sess-51", "work", sha)
+		if got := strings.TrimSpace(git(t, rig, "rev-parse", ref)); got != sha {
+			t.Fatalf("%s = %q, want %q", ref, got, sha)
+		}
+	}
+}
+
+// TestGitProbeAssessWritesNoRefs: Assess (the dry-run question) reports the
+// copy verdict without landing anything in the rig.
+func TestGitProbeAssessWritesNoRefs(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	v := Assess(NewGitProbe(clone, rig))
+	if v.Action != ActionSecuredCopy || v.Secured {
+		t.Fatalf("Assess = %+v, want secured-copy (not yet secured)", v)
+	}
+	if refs := git(t, rig, "for-each-ref", "--format=%(refname)", QuarantineRefPrefix); refs != "" {
+		t.Fatalf("quarantine refs after Assess = %q, want none", refs)
+	}
+}

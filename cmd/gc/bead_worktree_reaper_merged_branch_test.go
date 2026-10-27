@@ -67,7 +67,8 @@ func TestReapClosedBeadWorktrees_ReapsWorktreeWhoseMergedBranchWasDeleted(t *tes
 // orphaned by removing the worktree, so the reaper must still protect it and
 // say why. Under the guard (default on) this shape is secured into
 // quarantine and reaped instead — see
-// TestReapClosedBeadWorktrees_GuardSecuresDetachedOrphanClone.
+// TestReapClosedBeadWorktrees_GuardSecuresLinkedDetachedOrphan (this exact
+// linked shape) and ..._GuardSecuresDetachedOrphanClone (standalone).
 func TestReapClosedBeadWorktrees_ProtectsDetachedHEADWithOrphanCommits(t *testing.T) {
 	cityPath, rigRoot := initReapRig(t)
 	wt := filepath.Join(cityPath, ".gc", "worktrees", reapTestRigName, "builder", "ga-orphan1")
