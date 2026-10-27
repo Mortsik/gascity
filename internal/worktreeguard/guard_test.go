@@ -9,15 +9,17 @@ import (
 // fakeProbe is the injectable Probe seam for the GuardRemoval tests: every
 // fact and failure is scripted per-case, no git involved.
 type fakeProbe struct {
-	isRepo     bool
-	branch     string
-	headSha    string
-	headErr    bool
-	reach      bool
-	reachErr   bool
-	fetchErr   error
-	verifyErr  error
-	fetchCalls int
+	isRepo      bool
+	branch      string
+	headSha     string
+	headErr     bool
+	reach       bool
+	reachErr    bool
+	siblings    []string
+	siblingsErr error
+	fetchErr    error
+	verifyErr   error
+	fetchCalls  int
 }
 
 func (f *fakeProbe) IsRepo() bool { return f.isRepo }
@@ -34,6 +36,13 @@ func (f *fakeProbe) HeadReachableInRigRepo() (bool, error) {
 		return false, errFake("reachability probe failed")
 	}
 	return f.reach, nil
+}
+
+func (f *fakeProbe) UnsecuredSiblingBranches() ([]string, error) {
+	if f.siblingsErr != nil {
+		return nil, f.siblingsErr
+	}
+	return f.siblings, nil
 }
 
 func (f *fakeProbe) FetchIntoQuarantine(tag, branch, headSha string) error {
@@ -90,6 +99,31 @@ func TestDecideTable(t *testing.T) {
 			name:  "detached head without branch still needs a copy",
 			facts: Facts{IsRepo: true, Branch: "", HeadSha: "abc123def4567890"},
 			want:  Verdict{Action: "secured-copy", Secured: false, Reason: "copy-absent-rig-repo-available"},
+		},
+		{
+			name:  "unsecured non-head branch refuses even when head is secured",
+			facts: Facts{IsRepo: true, Branch: "work", HeadSha: "abc123def4", HeadReachableInRig: true, NonHeadUnsecured: []string{"feature/x"}},
+			want:  Verdict{Action: "refuse", Secured: false, Reason: "non-head-branches-unsecured: feature/x"},
+		},
+		{
+			name:  "unsecured non-head branch refuses before the copy runs",
+			facts: Facts{IsRepo: true, Branch: "work", HeadSha: "abc123def4", NonHeadUnsecured: []string{"a", "b"}},
+			want:  Verdict{Action: "refuse", Secured: false, Reason: "non-head-branches-unsecured: a, b"},
+		},
+		{
+			name:  "unborn head with unsecured siblings still refuses",
+			facts: Facts{IsRepo: true, HeadSha: "", NonHeadUnsecured: []string{"orphaned-work"}},
+			want:  Verdict{Action: "refuse", Secured: false, Reason: "non-head-branches-unsecured: orphaned-work"},
+		},
+		{
+			name:  "sibling probe failure refuses fail-closed",
+			facts: Facts{IsRepo: true, HeadSha: "abc123def4", NonHeadProbeErr: true},
+			want:  Verdict{Action: "refuse", Secured: false, Reason: "sibling-probe-failed"},
+		},
+		{
+			name:  "secured siblings do not block an otherwise secured head",
+			facts: Facts{IsRepo: true, Branch: "work", HeadSha: "abc123def4", HeadReachableInRig: true},
+			want:  Verdict{Action: "already-secured", Secured: true, Reason: "reachable-in-rig-repo"},
 		},
 	}
 	for _, tc := range cases {
@@ -160,5 +194,26 @@ func TestGuardRemovalRefuseWritesExactlyOneLine(t *testing.T) {
 	GuardRemoval(p, "/wt/y", "sess-2", &stderr)
 	if n := strings.Count(stderr.String(), "\n"); n != 1 {
 		t.Fatalf("stderr lines = %d, want exactly 1: %q", n, stderr.String())
+	}
+}
+
+// TestGuardRemovalSiblingRefuseSkipsFetch: an unsecured sibling refuses
+// BEFORE the head's quarantine fetch — a refused removal must not leave
+// half-written quarantine state behind.
+func TestGuardRemovalSiblingRefuseSkipsFetch(t *testing.T) {
+	p := &fakeProbe{isRepo: true, branch: "work", headSha: "abc123def4", reach: false, siblings: []string{"feature/x"}}
+	var stderr bytes.Buffer
+	v := GuardRemoval(p, "/wt/x", "sess-9", &stderr)
+	if v.Secured || v.Action != "refuse" {
+		t.Fatalf("verdict = %+v, want refuse on unsecured sibling", v)
+	}
+	if !strings.Contains(v.Reason, "non-head-branches-unsecured") {
+		t.Fatalf("reason = %q, want non-head-branches-unsecured", v.Reason)
+	}
+	if p.fetchCalls != 0 {
+		t.Fatalf("fetch calls = %d, want 0 (refuse must precede the copy)", p.fetchCalls)
+	}
+	if !strings.Contains(stderr.String(), "worktreeguard: refuse repo=/wt/x") {
+		t.Fatalf("stderr = %q, want refuse line", stderr.String())
 	}
 }

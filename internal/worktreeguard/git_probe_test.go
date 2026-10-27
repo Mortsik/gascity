@@ -109,8 +109,10 @@ func TestGitProbeGuardRefusesWhenRigUnusable(t *testing.T) {
 	p := NewGitProbe(clone, notRig)
 	var stderr bytes.Buffer
 	v := GuardRemoval(p, clone, "sess-43", &stderr)
-	if v.Secured || v.Action != "refuse" || v.Reason != "reachability-unknown" {
-		t.Fatalf("verdict = %+v, want refuse/reachability-unknown with unusable rig", v)
+	// The sibling gate runs first: the clone's own main branch makes the
+	// probe cat-file against the broken rig, which errors fail-closed.
+	if v.Secured || v.Action != "refuse" || v.Reason != "sibling-probe-failed" {
+		t.Fatalf("verdict = %+v, want refuse/sibling-probe-failed with unusable rig", v)
 	}
 	if !strings.Contains(stderr.String(), "worktreeguard: refuse repo="+clone) {
 		t.Fatalf("stderr = %q, want refuse line", stderr.String())
@@ -138,6 +140,9 @@ func TestGitProbeGuardSecuresSlashNamedBranch(t *testing.T) {
 	rig, clone := newStandaloneWithUnpushedBranch(t)
 	// The standard executor naming shape: a branch containing '/'.
 	git(t, clone, "checkout", "-q", "-b", "agentforge-executor/adhoc-x")
+	// Drop the leftover work branch so the ONLY unpushed thing is the slash
+	// branch under test (the sibling gate refuses on any unsecured sibling).
+	git(t, clone, "branch", "-D", "work")
 	commitFile(t, clone, "slash.txt")
 
 	p := NewGitProbe(clone, rig)
@@ -172,9 +177,66 @@ func TestGitProbeGuardNothingToSecureOnUnbornHead(t *testing.T) {
 	}
 }
 
+// TestGitProbeGuardRefusesOnUnsecuredSiblingBranch: HEAD's branch plus a
+// SECOND branch whose only copy is inside the doomed clone — removal must
+// refuse rather than secure HEAD and delete the sibling's commits with the
+// directory.
+func TestGitProbeGuardRefusesOnUnsecuredSiblingBranch(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	git(t, clone, "checkout", "-q", "-b", "sibling")
+	commitFile(t, clone, "sibling.txt")
+	// Back onto the base branch: HEAD is secured in the rig, so the ONLY
+	// unsecured thing is the sibling — the exact case this test isolates.
+	git(t, clone, "checkout", "-q", "main")
+	git(t, clone, "branch", "-D", "work")
+
+	p := NewGitProbe(clone, rig)
+	var stderr bytes.Buffer
+	v := GuardRemoval(p, clone, "sess-48", &stderr)
+	if v.Secured || v.Action != "refuse" {
+		t.Fatalf("verdict = %+v, want refuse (stderr: %q)", v, stderr.String())
+	}
+	if v.Reason != "non-head-branches-unsecured: sibling" {
+		t.Fatalf("reason = %q, want non-head-branches-unsecured: sibling", v.Reason)
+	}
+	refs := git(t, rig, "for-each-ref", "--format=%(refname)", QuarantineRefPrefix)
+	if strings.Contains(refs, QuarantineRefPrefix) {
+		t.Fatalf("quarantine refs = %q, want none (refuse precedes the fetch)", refs)
+	}
+}
+
+// TestGitProbeGuardSecuredWhenSiblingTipInRig: a sibling branch whose tip
+// already exists in the rig repo does not block securing HEAD — the tip's
+// presence carries the branch's whole reachable history with it. The sibling
+// branches off MAIN (not the unpushed work branch), so fetching it into the
+// rig does not incidentally carry the work commit along.
+func TestGitProbeGuardSecuredWhenSiblingTipInRig(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	git(t, clone, "checkout", "-q", "main")
+	git(t, clone, "checkout", "-q", "-b", "sibling")
+	commitFile(t, clone, "sibling.txt")
+	git(t, rig, "fetch", "-q", clone, "sibling:refs/heads/sibling")
+	git(t, clone, "checkout", "-q", "work")
+
+	p := NewGitProbe(clone, rig)
+	var stderr bytes.Buffer
+	v := GuardRemoval(p, clone, "sess-49", &stderr)
+	if !v.Secured || v.Action != "secured-copy" {
+		t.Fatalf("verdict = %+v, want secured-copy (stderr: %q)", v, stderr.String())
+	}
+	refs := git(t, rig, "for-each-ref", "--format=%(refname)", QuarantineRefPrefix)
+	if !strings.Contains(refs, QuarantineRefPrefix+"sess-49/work") {
+		t.Fatalf("quarantine refs = %q, want %ssess-49/work", refs, QuarantineRefPrefix)
+	}
+}
+
 func TestGitProbeGuardSecuresDetachedHead(t *testing.T) {
 	rig, clone := newStandaloneWithUnpushedBranch(t)
 	git(t, clone, "checkout", "-q", "--detach")
+	// The work branch still points at the detached commit; an unsecured
+	// sibling pointing at it would (correctly) refuse. Drop it so the
+	// detached commit is the only unpushed thing under test.
+	git(t, clone, "branch", "-D", "work")
 	sha := strings.TrimSpace(git(t, clone, "rev-parse", "HEAD"))
 
 	p := NewGitProbe(clone, rig)

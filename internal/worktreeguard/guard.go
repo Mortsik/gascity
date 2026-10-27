@@ -17,6 +17,7 @@ package worktreeguard
 import (
 	"fmt"
 	"io"
+	"strings"
 )
 
 // QuarantineRefPrefix is the rig-repo namespace every secured copy lands
@@ -44,6 +45,11 @@ type Probe interface {
 	// rig repository — a fetch that reports success but transfers nothing
 	// must never authorize a removal.
 	VerifyQuarantied(headSha string) error
+	// UnsecuredSiblingBranches returns every branch other than the
+	// checked-out one whose tip commit does NOT exist as an object in the
+	// rig repository — branches whose only copy dies with the directory.
+	// An error is a fail-closed fact.
+	UnsecuredSiblingBranches() ([]string, error)
 }
 
 // Facts is the closed decision input: probe results only, with explicit
@@ -55,6 +61,10 @@ type Facts struct {
 	HeadReachableInRig bool
 	HeadProbeErr       bool
 	ReachableProbeErr  bool
+	// NonHeadUnsecured names non-checked-out branches with no copy outside
+	// the doomed directory; NonHeadProbeErr flags a failed sibling probe.
+	NonHeadUnsecured []string
+	NonHeadProbeErr  bool
 }
 
 // Verdict is one removal decision. Secured true means a copy provably exists
@@ -76,13 +86,23 @@ const (
 )
 
 // Decide maps facts to a verdict. Pure: no I/O, no clock. Fail-closed on
-// every unknown — an unprovable fact never authorizes a removal.
+// every unknown — an unprovable fact never authorizes a removal. The
+// sibling gate runs BEFORE the head's copy/no-commits questions: a refused
+// removal must not write quarantine state, and an unborn HEAD never excuses
+// losing other branches' only copies.
 func Decide(facts Facts) Verdict {
 	switch {
 	case !facts.IsRepo:
 		return Verdict{Action: ActionRefuse, Secured: false, Reason: "not-a-repo"}
 	case facts.HeadProbeErr:
 		return Verdict{Action: ActionRefuse, Secured: false, Reason: "head-probe-failed"}
+	case facts.NonHeadProbeErr:
+		return Verdict{Action: ActionRefuse, Secured: false, Reason: "sibling-probe-failed"}
+	case len(facts.NonHeadUnsecured) > 0:
+		return Verdict{
+			Action: ActionRefuse, Secured: false,
+			Reason: "non-head-branches-unsecured: " + strings.Join(facts.NonHeadUnsecured, ", "),
+		}
 	case facts.HeadSha == "":
 		return Verdict{Action: ActionNothingToSecure, Secured: true, Reason: "no-commits"}
 	case facts.ReachableProbeErr:
@@ -107,6 +127,7 @@ func GuardRemoval(p Probe, repoPath, tag string, stderr io.Writer) Verdict {
 	// itself. The stderr display field is sanitized at write time below.
 	branch, headSha, headErr := p.HeadInfo()
 	reach, reachErr := p.HeadReachableInRigRepo()
+	siblings, siblingErr := p.UnsecuredSiblingBranches()
 	facts := Facts{
 		IsRepo:             p.IsRepo(),
 		Branch:             branch,
@@ -114,6 +135,8 @@ func GuardRemoval(p Probe, repoPath, tag string, stderr io.Writer) Verdict {
 		HeadReachableInRig: reach,
 		HeadProbeErr:       headErr != nil,
 		ReachableProbeErr:  reachErr != nil,
+		NonHeadUnsecured:   siblings,
+		NonHeadProbeErr:    siblingErr != nil,
 	}
 	v := Decide(facts)
 	if v.Action == ActionSecuredCopy {

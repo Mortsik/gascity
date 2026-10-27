@@ -130,6 +130,45 @@ func TestReapClosedBeadWorktrees_ProtectsStandaloneCloneWhenCopyFails(t *testing
 	}
 }
 
+// TestReapClosedBeadWorktrees_ProtectsStandaloneCloneWithUnsecuredSibling:
+// the T4-review Important case — a standalone clone whose HEAD could be
+// secured but which ALSO carries an unpushed sibling branch must NOT be
+// reaped: the sibling's only copy dies with the directory, and no quarantine
+// ref may be written (the refusal precedes the fetch).
+func TestReapClosedBeadWorktrees_ProtectsStandaloneCloneWithUnsecuredSibling(t *testing.T) {
+	cityPath, rigRoot := initReapRig(t)
+	wt := addClosedStandaloneClone(t, rigRoot, cityPath, "builder", "ga-stnd06")
+	mustGit(t, wt, "checkout", "-q", "-b", "sibling-work")
+	mustGit(t, wt, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "sibling-only commit")
+	mustGit(t, wt, "checkout", "-q", "polecat/ga-stnd06")
+	// The sibling round-trip refreshed the .git dir mtime; re-backdate past
+	// the freshness quarantine so the git gates (not age) decide this case.
+	backdated := time.Now().Add(-24 * time.Hour)
+	if err := os.Chtimes(filepath.Join(wt, ".git"), backdated, backdated); err != nil {
+		t.Fatalf("re-backdate .git dir: %v", err)
+	}
+	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-stnd06", Status: "closed"}}, nil)
+	cfg := reapTestConfig(rigRoot)
+	injectLiveness(t, liveWorktreeState{scanned: true})
+
+	var stderr bytes.Buffer
+	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, nil, &stderr)
+
+	if len(report.Reaped) != 0 {
+		t.Fatalf("Reaped = %+v, want 0: the sibling branch would be lost\nstderr:\n%s", report.Reaped, stderr.String())
+	}
+	if len(report.Protected) != 1 || !strings.Contains(report.Protected[0].Reason, "branch-unsecured") {
+		t.Fatalf("Protected = %+v, want 1 entry with reason branch-unsecured", report.Protected)
+	}
+	if _, err := os.Stat(wt); err != nil {
+		t.Fatalf("clone %s must stay intact: %v", wt, err)
+	}
+	refs := reapGitOut(t, rigRoot, "for-each-ref", "--format=%(refname)", "refs/gc-quarantine/")
+	if strings.Contains(refs, "refs/gc-quarantine/") {
+		t.Fatalf("quarantine refs = %q, want none (refusal precedes the fetch)", refs)
+	}
+}
+
 // TestReapClosedBeadWorktrees_GuardOffStandaloneCloneStaysInvisible:
 // kill-switch parity — guard OFF keeps porcelain-only discovery, so the
 // standalone clone remains unseen (the legacy leak) and is never touched.
@@ -162,6 +201,10 @@ func TestReapClosedBeadWorktrees_GuardSecuresDetachedOrphanClone(t *testing.T) {
 	cityPath, rigRoot := initReapRig(t)
 	wt := addClosedStandaloneClone(t, rigRoot, cityPath, "builder", "ga-stnd05")
 	mustGit(t, wt, "checkout", "-q", "--detach")
+	// The clone's own branch still points at the detached commit; an
+	// unsecured sibling pointing at it would (correctly) refuse. Drop it so
+	// the detached commit is the only unpushed thing under test.
+	mustGit(t, wt, "branch", "-D", "polecat/ga-stnd05")
 	// The detached checkout touches .git (lock files refresh the dir's
 	// mtime), so re-backdate the creation signal AFTER it — otherwise the
 	// freshness quarantine protects the clone and nothing is reaped.

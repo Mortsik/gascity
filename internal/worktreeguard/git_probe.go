@@ -110,6 +110,45 @@ func (g *GitProbe) VerifyQuarantied(headSha string) error {
 	return nil
 }
 
+// UnsecuredSiblingBranches lists every branch other than the checked-out
+// one whose tip commit is absent from the rig repository. A tip's presence
+// carries its whole reachable history (objects transfer by reachability),
+// so tip existence is a complete per-branch copy test. A broken rig or a
+// failed listing is an ERROR, never an empty list — the caller fails closed.
+func (g *GitProbe) UnsecuredSiblingBranches() ([]string, error) {
+	out, err := gitOut(g.repoPath, "for-each-ref", "refs/heads/", "--format=%(refname:short) %(objectname)")
+	if err != nil {
+		return nil, fmt.Errorf("sibling listing: %w", err)
+	}
+	headBranch, _, headErr := g.HeadInfo()
+	if headErr != nil {
+		// Without the HEAD branch name nothing can be exempted — treat all
+		// branches as siblings; the head-probe failure refuses anyway.
+		headBranch = ""
+	}
+	var unsecured []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if line == "" {
+			continue
+		}
+		name, sha, ok := strings.Cut(line, " ")
+		if !ok {
+			return nil, fmt.Errorf("sibling listing: malformed line %q", line)
+		}
+		if name == headBranch {
+			continue // the checked-out branch is the head question, handled above
+		}
+		exists, err := objectExists(g.rigRoot, sha)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			unsecured = append(unsecured, name)
+		}
+	}
+	return unsecured, nil
+}
+
 // sha12 clamps a short sha instead of panicking — FetchIntoQuarantine is an
 // exported interface member and must not slice past a caller's short input.
 func sha12(sha string) string {
