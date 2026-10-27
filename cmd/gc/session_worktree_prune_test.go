@@ -3,13 +3,16 @@ package main
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/worktreeguard"
 )
 
 // fakeGitProbe is a hand-rolled gitProbe stub. Each field controls one
@@ -136,6 +139,16 @@ func newPruneFixture(t *testing.T) *pruneTestFixture {
 			fx.probesByWD[workDir] = probe
 		}
 		return probe
+	}
+
+	// The guard seam fakes a secured verdict so these probe-fake tests
+	// exercise the prune wiring, not the guard itself — real-guard behavior
+	// is covered by the realPruneFixture tests below. Tests that pin the
+	// LEGACY unpushed gate turn the guard off explicitly.
+	origGuard := worktreeGuard
+	t.Cleanup(func() { worktreeGuard = origGuard })
+	worktreeGuard = func(_ worktreeguard.Probe, _, _ string, _ io.Writer) worktreeguard.Verdict {
+		return worktreeguard.Verdict{Action: worktreeguard.ActionAlreadySecured, Secured: true, Reason: "test-fake"}
 	}
 
 	return fx
@@ -286,6 +299,11 @@ func TestPruneAgentHomeWorktreeIfSafe_HasUncommitted(t *testing.T) {
 
 func TestPruneAgentHomeWorktreeIfSafe_HasUnpushed(t *testing.T) {
 	fx := newPruneFixture(t)
+	// Pins the LEGACY gate: with the guard off, the unpushed probe drives the
+	// refusal (guard on would secure-and-remove instead — see the
+	// realPruneFixture tests).
+	off := false
+	fx.cfg.Daemon.WorktreeRemovalGuard = &off
 	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, hasUnpushed: true, currentBranch: "builder/ga-def456"})
 
 	var stderr bytes.Buffer
@@ -300,6 +318,9 @@ func TestPruneAgentHomeWorktreeIfSafe_HasUnpushed(t *testing.T) {
 
 func TestPruneAgentHomeWorktreeIfSafe_UnpushedProbeError(t *testing.T) {
 	fx := newPruneFixture(t)
+	// Pins the LEGACY gate (guard off): probe error fails closed.
+	off := false
+	fx.cfg.Daemon.WorktreeRemovalGuard = &off
 	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, unpushedErr: errors.New("boom")})
 
 	var stderr bytes.Buffer
@@ -342,6 +363,10 @@ func TestPruneAgentHomeWorktreeIfSafe_StashProbeError(t *testing.T) {
 
 func TestPruneAgentHomeWorktreeIfSafe_RigPathUnresolved(t *testing.T) {
 	fx := newPruneFixture(t)
+	// Pins the LEGACY shape (guard off): unresolved rig, no stale marker.
+	// With the guard on, an unresolved rig refuses with branch-unsecured.
+	off := false
+	fx.cfg.Daemon.WorktreeRemovalGuard = &off
 	fx.cfg.Rigs = nil
 	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true})
 
@@ -357,6 +382,9 @@ func TestPruneAgentHomeWorktreeIfSafe_RigPathUnresolved(t *testing.T) {
 
 func TestPruneAgentHomeWorktreeIfSafe_RigPathEmpty(t *testing.T) {
 	fx := newPruneFixture(t)
+	// Pins the LEGACY shape (guard off): empty rig path, no stale marker.
+	off := false
+	fx.cfg.Daemon.WorktreeRemovalGuard = &off
 	fx.cfg.Rigs = []config.Rig{{Name: "demo", Path: ""}}
 	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true})
 
@@ -423,6 +451,158 @@ func TestPruneAgentHomeWorktreeIfSafe_NilConfig(t *testing.T) {
 	if pruneAgentHomeWorktreeIfSafe(fx.sessionBead(), fx.cityPath, nil, &stderr) {
 		t.Fatal("prune returned true with nil cfg")
 	}
+}
+
+// runPruneGit runs a real git command in dir, failing the test on error —
+// for the real-git fixtures below (the probe-fake tests never call it).
+func runPruneGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	var out, errb bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errb
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git -C %s %s: %v\nstderr: %s", dir, strings.Join(args, " "), err, errb.String())
+	}
+	return out.String()
+}
+
+// realPruneFixture builds a REAL rig repo plus a standalone clone of it under
+// the city's .gc/worktrees tree carrying one unpushed commit — the exact
+// 3zf46/ga0r1.1.1 incident shape. newGitProbe and worktreeGuard are NOT
+// faked: the real git subprocess surface runs end to end.
+type realPruneFixture struct {
+	t         *testing.T
+	cityPath  string
+	rigRoot   string
+	workerDir string
+	cfg       *config.City
+}
+
+func newRealPruneFixture(t *testing.T) *realPruneFixture {
+	t.Helper()
+	cityPath := t.TempDir()
+	rigRoot := filepath.Join(cityPath, "repos", "demo")
+	workerDir := filepath.Join(cityPath, ".gc", "worktrees", "demo", "polecats", "polecat-7")
+
+	if err := os.MkdirAll(rigRoot, 0o755); err != nil {
+		t.Fatalf("mkdir rigRoot: %v", err)
+	}
+	runPruneGit(t, rigRoot, "init", "-q", "--initial-branch=main")
+	runPruneGit(t, rigRoot, "config", "user.email", "test@example.com")
+	runPruneGit(t, rigRoot, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(rigRoot, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("write base.txt: %v", err)
+	}
+	runPruneGit(t, rigRoot, "add", "base.txt")
+	runPruneGit(t, rigRoot, "commit", "-q", "-m", "base")
+
+	if err := os.MkdirAll(filepath.Dir(workerDir), 0o755); err != nil {
+		t.Fatalf("mkdir worker parent: %v", err)
+	}
+	cmd := exec.Command("git", "clone", "-q", rigRoot, workerDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("clone: %v\n%s", err, out)
+	}
+	runPruneGit(t, workerDir, "config", "user.email", "test@example.com")
+	runPruneGit(t, workerDir, "config", "user.name", "Test")
+	runPruneGit(t, workerDir, "checkout", "-q", "-b", "work")
+	if err := os.WriteFile(filepath.Join(workerDir, "work.txt"), []byte("work\n"), 0o644); err != nil {
+		t.Fatalf("write work.txt: %v", err)
+	}
+	runPruneGit(t, workerDir, "add", "work.txt")
+	runPruneGit(t, workerDir, "commit", "-q", "-m", "unpushed work")
+
+	return &realPruneFixture{
+		t:         t,
+		cityPath:  cityPath,
+		rigRoot:   rigRoot,
+		workerDir: workerDir,
+		cfg:       &config.City{Rigs: []config.Rig{{Name: "demo", Path: rigRoot}}},
+	}
+}
+
+func (fx *realPruneFixture) sessionBead() beads.Bead {
+	return beads.Bead{
+		ID: "session-1",
+		Metadata: map[string]string{
+			"worker_dir":   fx.workerDir,
+			"template":     "demo/polecat",
+			"session_name": "demo/polecat-7",
+		},
+	}
+}
+
+// Guard ON (default): an unpushed standalone clone is SECURED — copied into
+// the rig repo under refs/gc-quarantine/ — and then removed. The guard's
+// copy subsumes the old unpushed refusal, so no stale marker may survive.
+func TestPruneAgentHomeWorktreeIfSafe_GuardSecuresStandaloneClone(t *testing.T) {
+	fx := newRealPruneFixture(t)
+
+	var stderr bytes.Buffer
+	if !pruneAgentHomeWorktreeIfSafe(fx.sessionBead(), fx.cityPath, fx.cfg, &stderr) {
+		t.Fatalf("prune returned false on secured standalone clone; stderr=%s", stderr.String())
+	}
+	if _, err := os.Stat(fx.workerDir); !os.IsNotExist(err) {
+		t.Fatalf("worker dir still present after secured prune: %v", err)
+	}
+	refs := runPruneGit(t, fx.rigRoot, "for-each-ref", "--format=%(refname)", "refs/gc-quarantine/")
+	if !strings.Contains(refs, "refs/gc-quarantine/session-1/work") {
+		t.Fatalf("quarantine refs = %q, want refs/gc-quarantine/session-1/work", refs)
+	}
+}
+
+// Guard ON, rig repo unusable: the guard cannot secure a copy, so removal is
+// REFUSED, the dir stays intact, and the stale marker names the unsecured
+// branch.
+func TestPruneAgentHomeWorktreeIfSafe_GuardRefuseMarksBranchUnsecured(t *testing.T) {
+	fx := newRealPruneFixture(t)
+	notRig := filepath.Join(t.TempDir(), "not-a-repo")
+	if err := os.MkdirAll(notRig, 0o755); err != nil {
+		t.Fatalf("mkdir notRig: %v", err)
+	}
+	fx.cfg.Rigs[0].Path = notRig
+
+	var stderr bytes.Buffer
+	if pruneAgentHomeWorktreeIfSafe(fx.sessionBead(), fx.cityPath, fx.cfg, &stderr) {
+		t.Fatal("prune returned true with unusable rig")
+	}
+	if _, err := os.Stat(fx.workerDir); err != nil {
+		t.Fatalf("worker dir must stay intact after refusal: %v", err)
+	}
+	assertWorktreeStaleMarker(t, fx.workerDir, "work", "branch-unsecured")
+}
+
+// Kill-switch parity: guard OFF must reproduce today's unpushed-refusal
+// outcome verbatim (false, dir intact, marker reason=unpushed-commits).
+func TestPruneAgentHomeWorktreeIfSafe_GuardOffLegacyUnpushedRefusal(t *testing.T) {
+	fx := newRealPruneFixture(t)
+	off := false
+	fx.cfg.Daemon.WorktreeRemovalGuard = &off
+
+	var stderr bytes.Buffer
+	if pruneAgentHomeWorktreeIfSafe(fx.sessionBead(), fx.cityPath, fx.cfg, &stderr) {
+		t.Fatal("prune returned true with guard off and unpushed commits")
+	}
+	if _, err := os.Stat(fx.workerDir); err != nil {
+		t.Fatalf("worker dir must stay intact (legacy refusal): %v", err)
+	}
+	assertWorktreeStaleMarker(t, fx.workerDir, "work", "unpushed-commits")
+}
+
+// Guard ON + unresolved rig: the guard cannot run at all, so the refusal
+// carries the branch-unsecured marker (fail-closed) — unlike the legacy
+// rig-unresolved path, which leaves no marker.
+func TestPruneAgentHomeWorktreeIfSafe_GuardOnRigUnresolved(t *testing.T) {
+	fx := newPruneFixture(t)
+	fx.cfg.Rigs = nil
+	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, currentBranch: "work"})
+
+	var stderr bytes.Buffer
+	if pruneAgentHomeWorktreeIfSafe(fx.sessionBead(), fx.cityPath, fx.cfg, &stderr) {
+		t.Fatal("prune returned true with guard on and unresolved rig")
+	}
+	assertWorktreeStaleMarker(t, fx.workerDir, "work", "branch-unsecured")
 }
 
 func TestLookupRigRootForSession(t *testing.T) {
