@@ -416,6 +416,42 @@ func (m *MemStore) CloseAll(ids []string, metadata map[string]string) (int, erro
 	return closed, nil
 }
 
+// closeAllWithLabels is CloseAll that also appends labels each closed bead
+// does not already carry. It is unexported so stores embedding MemStore do not
+// silently inherit a LabeledCloser that skips their own persistence.
+func (m *MemStore) closeAllWithLabels(ids, labels []string, metadata map[string]string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	idSet := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		idSet[id] = true
+	}
+	closed := 0
+	for i := range m.beads {
+		if !idSet[m.beads[i].ID] || m.beads[i].Status == "closed" {
+			continue
+		}
+		for _, l := range labels {
+			if !slices.Contains(m.beads[i].Labels, l) {
+				m.beads[i].Labels = append(m.beads[i].Labels, l)
+			}
+		}
+		m.noteSession(m.beads[i], metadata)
+		setBeadStatus(&m.beads[i], "closed")
+		m.beads[i].UpdatedAt = time.Now()
+		m.beads[i].Revision++
+		if m.beads[i].Metadata == nil {
+			m.beads[i].Metadata = make(map[string]string, len(metadata))
+		}
+		for k, v := range metadata {
+			m.beads[i].Metadata[k] = v
+		}
+		recordCloseReason(&m.beads[i])
+		closed++
+	}
+	return closed
+}
+
 // List returns beads matching the query.
 func (m *MemStore) List(query ListQuery) ([]Bead, error) {
 	m.mu.Lock()

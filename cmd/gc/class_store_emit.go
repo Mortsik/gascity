@@ -513,6 +513,33 @@ func (s *emittingClassStore) CloseAll(ids []string, metadata map[string]string) 
 	return n, err
 }
 
+// CloseAllWithLabels forwards the one-write labeled close and emits one
+// bead.closed per bead that actually transitioned, exactly as CloseAll does.
+func (s *emittingClassStore) CloseAllWithLabels(ids, labels []string, metadata map[string]string) (int, error) {
+	closer, ok := s.Store.(beads.LabeledCloser)
+	if !ok {
+		return 0, beads.ErrLabeledCloseUnsupported
+	}
+	wasOpen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		wasOpen[id] = !s.closedBefore(id)
+	}
+	n, err := closer.CloseAllWithLabels(ids, labels, metadata)
+	var emissions []classStoreEmission
+	for _, id := range ids {
+		if !wasOpen[id] {
+			continue
+		}
+		bead, ok := s.snapshot(id)
+		if !ok || !beadStatusIsClosed(bead.Status) {
+			continue
+		}
+		emissions = append(emissions, classStoreEmission{eventType: events.BeadClosed, bead: bead})
+	}
+	s.emit(emissions...)
+	return n, err
+}
+
 func (s *emittingClassStore) Delete(id string) error {
 	snapshots := s.snapshotBeforeDelete(id)
 	if err := s.Store.Delete(id); err != nil {

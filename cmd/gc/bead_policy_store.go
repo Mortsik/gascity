@@ -193,6 +193,18 @@ func (s *beadPolicyStore) DeleteBatch(ids []string) error {
 	return deleter.DeleteBatch(ids)
 }
 
+// CloseAllWithLabels implements beads.LabeledCloser by forwarding to the
+// wrapped store, for the same reason DeleteBatch does: the embedded Store
+// interface does not promote optional capabilities. Without it an order run's
+// outcome label and close would cost two whole-file rewrites on a file store.
+func (s *beadPolicyStore) CloseAllWithLabels(ids, labels []string, metadata map[string]string) (int, error) {
+	closer, ok := s.Store.(beads.LabeledCloser)
+	if !ok {
+		return 0, beads.ErrLabeledCloseUnsupported
+	}
+	return closer.CloseAllWithLabels(ids, labels, metadata)
+}
+
 // WaitForParentProjection preserves the wrapped store's optional projection
 // wait. An inner store without that capability keeps the existing no-wait
 // behavior. beadPolicyGraphStore inherits this method through its embedding.

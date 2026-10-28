@@ -105,6 +105,16 @@ func (s orderTrackingSweepScopedStore) DeleteBatch(ids []string) error {
 	return beads.ErrBatchDeleteUnsupported
 }
 
+// CloseAllWithLabels forwards the one-write labeled close the embedded
+// beads.Store does not promote. A backing without the capability reports
+// ErrLabeledCloseUnsupported, the cue to label and close in two writes.
+func (s orderTrackingSweepScopedStore) CloseAllWithLabels(ids, labels []string, metadata map[string]string) (int, error) {
+	if closer, ok := s.Store.(beads.LabeledCloser); ok {
+		return closer.CloseAllWithLabels(ids, labels, metadata)
+	}
+	return 0, beads.ErrLabeledCloseUnsupported
+}
+
 func openCityOrderStore(stderr io.Writer, cmdName string) (beads.OrdersStore, int) {
 	cityPath, err := resolveCity()
 	if err != nil {

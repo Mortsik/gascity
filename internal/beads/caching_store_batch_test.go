@@ -3,6 +3,7 @@ package beads
 import (
 	"encoding/json"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/fsys"
@@ -357,5 +358,59 @@ func TestCachingStoreDeleteBatchFallbackContinuesAndReportsCommitted(t *testing.
 	}
 	if _, err := cs.Get(b.ID); err != nil {
 		t.Fatalf("Get(%s) = %v, want the failed id kept", b.ID, err)
+	}
+}
+
+// A labeled close through the cache lands in one backing write and is
+// reconciled like CloseAll: the cached row carries the labels and the close is
+// announced once.
+func TestCachingStoreCloseAllWithLabelsReconcilesAndAnnounces(t *testing.T) {
+	fs, err := OpenFileStore(fsys.NewFake(), "/city/.gc/beads.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var closedEvents []string
+	cs := NewCachingStoreForTest(fs, func(evtType, beadID string, _ json.RawMessage) {
+		if evtType == "bead.closed" {
+			closedEvents = append(closedEvents, beadID)
+		}
+	})
+	b, err := cs.Create(Bead{Type: "task", Title: "run", Labels: []string{"order-run:x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := cs.CloseAllWithLabels([]string{b.ID}, []string{"exec"}, map[string]string{"close_reason": "done"})
+	if err != nil || n != 1 {
+		t.Fatalf("CloseAllWithLabels = %d, %v; want 1, nil", n, err)
+	}
+	got, err := cs.Get(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "closed" || !slices.Contains(got.Labels, "exec") || got.Metadata["close_reason"] != "done" {
+		t.Fatalf("cached row = status %q labels %v metadata %v", got.Status, got.Labels, got.Metadata)
+	}
+	if len(closedEvents) != 1 || closedEvents[0] != b.ID {
+		t.Fatalf("closed events = %v, want [%s]", closedEvents, b.ID)
+	}
+}
+
+// A backing without the capability is reported, not emulated, so the caller
+// can fall back to its two writes.
+func TestCachingStoreCloseAllWithLabelsReportsUnsupportedBacking(t *testing.T) {
+	cs := NewCachingStoreForTest(NewMemStore(), nil)
+	b, err := cs.Create(Bead{Type: "task", Title: "run"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cs.CloseAllWithLabels([]string{b.ID}, []string{"exec"}, nil); !errors.Is(err, ErrLabeledCloseUnsupported) {
+		t.Fatalf("err = %v, want ErrLabeledCloseUnsupported", err)
+	}
+	got, err := cs.Get(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status == "closed" {
+		t.Fatal("unsupported labeled close still closed the bead")
 	}
 }

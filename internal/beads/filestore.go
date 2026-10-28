@@ -654,6 +654,31 @@ func (fs *FileStore) CloseAll(ids []string, metadata map[string]string) (int, er
 	return closed, nil
 }
 
+// CloseAllWithLabels implements LabeledCloser: it appends labels, sets
+// metadata and closes the open beads among ids in one locked read-modify-write
+// and a single flush, where Update followed by CloseAll would rewrite the whole
+// file twice. A failed flush rolls the in-memory state back.
+func (fs *FileStore) CloseAllWithLabels(ids, labels []string, metadata map[string]string) (int, error) {
+	fs.fmu.Lock()
+	defer fs.fmu.Unlock()
+	if err := fs.locker.Lock(); err != nil {
+		return 0, err
+	}
+	defer fs.locker.Unlock() //nolint:errcheck // best-effort unlock
+	if err := fs.reloadFromDisk(); err != nil {
+		return 0, err
+	}
+	snap := fs.snapshotLocked()
+	closed := fs.MemStore.closeAllWithLabels(ids, labels, metadata)
+	if closed > 0 {
+		if err := fs.save(); err != nil {
+			fs.restoreFrom(snap.seq, snap.beads, snap.deps)
+			return 0, err
+		}
+	}
+	return closed, nil
+}
+
 // SetMetadata delegates to MemStore.SetMetadata and flushes to disk.
 // If the disk flush fails, the in-memory mutation is rolled back.
 func (fs *FileStore) SetMetadata(id, key, value string) error {

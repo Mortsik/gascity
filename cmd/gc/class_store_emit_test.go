@@ -1740,12 +1740,12 @@ func TestEmittingClassStoreOverClaimsArePinnedPerEngine(t *testing.T) {
 	want := map[reflect.Type][]string{
 		reflect.TypeOf(&beads.NativeDoltStore{}): {
 			"AdvanceSequenceFloor", "AtomicConditionalCloserHandle", "CachedReadExact",
-			"ConditionalWritesModeSource", "CreateWithStorage", "DepAddWithMetadata",
+			"CloseAllWithLabels", "ConditionalWritesModeSource", "CreateWithStorage", "DepAddWithMetadata",
 			"HasResidentOutside", "NamespaceCensusHandle", "ReadyContext",
 			"SequenceFloor", "SetSequenceFloor", "StoreHealthPath",
 		},
 		reflect.TypeOf(&beads.SQLiteStore{}): {
-			"ConditionalWritesModeSource", "Count", "DepListBatch",
+			"CloseAllWithLabels", "ConditionalWritesModeSource", "Count", "DepListBatch",
 			"EventsJournalActive", "NamespaceCensusHandle", "ReadEventsJournalPage",
 			"ReadOnly", "SawRows",
 			"SupportsEphemeralGraphApply", "TransferIfCurrent", "WaitForParentProjection",

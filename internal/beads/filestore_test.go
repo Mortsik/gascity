@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -2478,5 +2479,70 @@ func TestFileStoreDeleteBatchRollsBackWhenSaveFails(t *testing.T) {
 	}
 	if readsAfter != readsBefore {
 		t.Fatalf("rollback reads reloaded the file %d time(s); want answers from memory", readsAfter-readsBefore)
+	}
+}
+
+// A labeled close is the outcome-label Update and the CloseAll it replaces in
+// one flush: labels appended once, metadata and close reason recorded, and
+// beads already closed (or absent) left alone.
+func TestFileStoreCloseAllWithLabelsLabelsAndClosesInOneFlush(t *testing.T) {
+	f := fsys.NewFake()
+	path := "/city/.gc/beads.json"
+	s, err := beads.OpenFileStore(f, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	open1, err := s.Create(beads.Bead{Title: "run", Labels: []string{"order-run:x", "exec"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done, err := s.Create(beads.Bead{Title: "done"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(done.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	before := countTmpWrites(f, path)
+	n, err := s.CloseAllWithLabels([]string{open1.ID, done.ID, "gc-missing"}, []string{"exec", "exec-failed"}, map[string]string{"close_reason": "finished"})
+	if err != nil {
+		t.Fatalf("CloseAllWithLabels: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("closed = %d, want 1", n)
+	}
+	if writes := countTmpWrites(f, path) - before; writes != 1 {
+		t.Fatalf("CloseAllWithLabels flushed %d times, want exactly 1", writes)
+	}
+
+	reopened, err := beads.OpenFileStore(f, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := reopened.Get(open1.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "closed" || got.CloseReason != "finished" || got.Metadata["close_reason"] != "finished" {
+		t.Fatalf("closed bead = status %q reason %q metadata %v", got.Status, got.CloseReason, got.Metadata)
+	}
+	if want := []string{"order-run:x", "exec", "exec-failed"}; !slices.Equal(got.Labels, want) {
+		t.Fatalf("labels = %v, want %v", got.Labels, want)
+	}
+	untouched, err := reopened.Get(done.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(untouched.Labels) != 0 {
+		t.Fatalf("already-closed bead labeled: %v", untouched.Labels)
+	}
+
+	before = countTmpWrites(f, path)
+	if n, err := s.CloseAllWithLabels([]string{open1.ID}, []string{"exec"}, nil); err != nil || n != 0 {
+		t.Fatalf("re-close = %d, %v; want 0, nil", n, err)
+	}
+	if writes := countTmpWrites(f, path) - before; writes != 0 {
+		t.Fatalf("no-op labeled close flushed %d times, want 0", writes)
 	}
 }

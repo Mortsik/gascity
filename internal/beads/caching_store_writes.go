@@ -576,6 +576,27 @@ func (c *CachingStore) Reopen(id string) error {
 func (c *CachingStore) CloseAll(ids []string, metadata map[string]string) (int, error) {
 	startSeq := c.currentMutationSeq()
 	n, err := c.backing.CloseAll(ids, metadata)
+	return c.finishCloseAll(ids, startSeq, n, err)
+}
+
+// CloseAllWithLabels implements LabeledCloser by forwarding to a backing
+// store that supports it, then reconciling the cache exactly as CloseAll does:
+// the refreshed rows carry the appended labels, and each claimed close is
+// announced as bead.closed. A backing without the capability reports
+// ErrLabeledCloseUnsupported, the cue to fall back to Update then CloseAll.
+func (c *CachingStore) CloseAllWithLabels(ids, labels []string, metadata map[string]string) (int, error) {
+	closer, ok := c.backing.(LabeledCloser)
+	if !ok {
+		return 0, ErrLabeledCloseUnsupported
+	}
+	startSeq := c.currentMutationSeq()
+	n, err := closer.CloseAllWithLabels(ids, labels, metadata)
+	return c.finishCloseAll(ids, startSeq, n, err)
+}
+
+// finishCloseAll reconciles the cache after a backing close of ids that
+// started at startSeq and reported n closed and err.
+func (c *CachingStore) finishCloseAll(ids []string, startSeq uint64, n int, err error) (int, error) {
 	if err != nil && n == 0 {
 		return n, err
 	}
