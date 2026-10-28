@@ -3,10 +3,11 @@ package worktreeguard
 import (
 	"bytes"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gastownhall/gascity/internal/testutil"
 )
 
 // Real-git fixtures: a rig repo, a standalone clone of it holding an
@@ -15,14 +16,7 @@ import (
 
 func git(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	var out, errb bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errb
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("git -C %s %s: %v\nstderr: %s", dir, strings.Join(args, " "), err, errb.String())
-	}
-	return out.String()
+	return testutil.RunGit(t, dir, args...)
 }
 
 func initRepo(t *testing.T, dir string) {
@@ -58,10 +52,7 @@ func newStandaloneWithUnpushedBranch(t *testing.T) (string, string) {
 	initRepo(t, rig)
 	commitFile(t, rig, "base.txt")
 
-	cmd := exec.Command("git", "clone", "-q", rig, clone)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("clone: %v\n%s", err, out)
-	}
+	git(t, base, "clone", "-q", rig, clone)
 	git(t, clone, "config", "user.email", "test@example.com")
 	git(t, clone, "config", "user.name", "Test")
 	git(t, clone, "checkout", "-q", "-b", "work")
@@ -433,12 +424,81 @@ func TestGitProbeGuardRefusesWhenRigIsTheDoomedRepo(t *testing.T) {
 func TestGitProbeGuardRefusesWhenRigBorrowsObjectsFromDoomed(t *testing.T) {
 	_, clone := newStandaloneWithUnpushedBranch(t)
 	rig2 := filepath.Join(t.TempDir(), "shared-rig")
-	if out, err := exec.Command("git", "clone", "-q", "--shared", clone, rig2).CombinedOutput(); err != nil {
-		t.Fatalf("clone --shared: %v\n%s", err, out)
-	}
+	git(t, filepath.Dir(rig2), "clone", "-q", "--shared", clone, rig2)
 	var stderr bytes.Buffer
 	v := GuardRemoval(NewGitProbe(clone, rig2), clone, "sess-63", &stderr)
 	if v.Secured || v.Reason != "rig-inside-doomed-tree" {
 		t.Fatalf("verdict = %+v, want refuse rig-inside-doomed-tree", v)
+	}
+}
+
+// TestGitProbeGuardNeverReplacesExistingQuarantineRef: git fetch updates
+// refs outside refs/heads|tags even WITHOUT "+", so the copy must be a
+// create-only ref update: an existing quarantine ref holding other content
+// (a sha12 collision, an earlier rescue) is never replaced (web_sol round 2).
+func TestGitProbeGuardNeverReplacesExistingQuarantineRef(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	sha := git(t, clone, "rev-parse", "HEAD")
+	earlier := git(t, rig, "rev-parse", "HEAD")
+	ref := QuarantineRef("sess-64", "work", sha)
+	git(t, rig, "update-ref", ref, earlier)
+
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(clone, rig), clone, "sess-64", &stderr)
+	if v.Secured {
+		t.Fatalf("verdict = %+v, want refuse when the quarantine name is taken by other content", v)
+	}
+	if got := git(t, rig, "rev-parse", ref); got != earlier {
+		t.Fatalf("%s = %q, want the earlier rescue %q preserved", ref, got, earlier)
+	}
+}
+
+// TestGitProbeFetchIntoQuarantineIsIdempotent: a quarantine ref that
+// already holds exactly this commit is a completed copy, not a clash.
+func TestGitProbeFetchIntoQuarantineIsIdempotent(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	sha := git(t, clone, "rev-parse", "HEAD")
+	p := NewGitProbe(clone, rig)
+	for i := 0; i < 2; i++ {
+		if err := p.FetchIntoQuarantine("sess-65", "work", sha); err != nil {
+			t.Fatalf("FetchIntoQuarantine #%d: %v", i+1, err)
+		}
+	}
+	if got := git(t, rig, "rev-parse", QuarantineRef("sess-65", "work", sha)); got != sha {
+		t.Fatalf("quarantine ref = %q, want %q", got, sha)
+	}
+}
+
+// TestGitProbeGuardRefusesOnRemoteTrackingOnlyCommit: a stale
+// remote-tracking ref (the remote branch was deleted or force-pushed) can be
+// the last reference to a commit (web_sol round 2).
+func TestGitProbeGuardRefusesOnRemoteTrackingOnlyCommit(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	work := git(t, clone, "rev-parse", "work")
+	git(t, clone, "update-ref", "refs/remotes/origin/gone", work)
+	git(t, clone, "checkout", "-q", "main")
+	git(t, clone, "branch", "-D", "work")
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(clone, rig), clone, "sess-66", &stderr)
+	if v.Secured || v.Reason != "non-head-refs-unsecured: refs/remotes/origin/gone" {
+		t.Fatalf("verdict = %+v, want refuse non-head-refs-unsecured: refs/remotes/origin/gone", v)
+	}
+}
+
+// TestGitProbeGuardRefusesStandaloneWithOwnLinkedWorktree: a standalone
+// clone hosting its OWN linked worktrees keeps their HEADs and per-worktree
+// refs in <clone>/.git/worktrees/ — invisible to for-each-ref and deleted
+// with the clone (local_critic round 2).
+func TestGitProbeGuardRefusesStandaloneWithOwnLinkedWorktree(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	git(t, clone, "checkout", "-q", "main")
+	git(t, clone, "branch", "-D", "work")
+	inner := filepath.Join(t.TempDir(), "inner-wt")
+	git(t, clone, "worktree", "add", "-q", "--detach", inner)
+	commitFile(t, inner, "inner.txt")
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(clone, rig), clone, "sess-67", &stderr)
+	if v.Secured || !strings.Contains(v.Reason, "worktree:inner-wt") {
+		t.Fatalf("verdict = %+v, want refuse naming worktree:inner-wt", v)
 	}
 }

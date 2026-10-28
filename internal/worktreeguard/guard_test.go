@@ -27,6 +27,10 @@ type fakeProbe struct {
 	// (one per call, last one sticks) — a HEAD moving under the guard.
 	laterShas []string
 	headCalls int
+	// laterRefs, when set, is what UnsecuredRefs reports after its first
+	// call — a ref created under the guard.
+	laterRefs []string
+	refCalls  int
 }
 
 func (f *fakeProbe) IsRepo() bool { return f.isRepo }
@@ -61,6 +65,10 @@ func (f *fakeProbe) RigOutsideRepo() (bool, error) {
 }
 
 func (f *fakeProbe) UnsecuredRefs(string) ([]string, error) {
+	f.refCalls++
+	if f.refCalls > 1 && f.laterRefs != nil {
+		return f.laterRefs, nil
+	}
 	if f.siblingsErr != nil {
 		return nil, f.siblingsErr
 	}
@@ -331,5 +339,26 @@ func TestGuardRemovalRefusesWhenHeadMoves(t *testing.T) {
 		if v.Secured || v.Reason != "head-moved" {
 			t.Fatalf("reach=%v: verdict = %+v, want refuse head-moved (stderr %q)", reach, v, stderr.String())
 		}
+	}
+}
+
+// TestGuardRemovalRefusesWhenRefsMove: a ref created while the guard ran
+// (after the facts were read) refuses.
+func TestGuardRemovalRefusesWhenRefsMove(t *testing.T) {
+	p := &fakeProbe{isRepo: true, branch: "work", headSha: "abc123def4", reach: true, laterRefs: []string{"refs/tags/new"}}
+	var stderr bytes.Buffer
+	if v := GuardRemoval(p, "/wt/x", "sess-1", &stderr); v.Secured || v.Reason != "refs-moved" {
+		t.Fatalf("verdict = %+v, want refuse refs-moved", v)
+	}
+}
+
+// TestGuardRemovalNotifyLineStaysOneLine: git stderr folded into a reason
+// (fetch failures) must not break the one-structured-line contract.
+func TestGuardRemovalNotifyLineStaysOneLine(t *testing.T) {
+	p := &fakeProbe{isRepo: true, branch: "work", headSha: "abc123def4", fetchErr: errFake("fatal: one\nfatal: two\r\nthree")}
+	var stderr bytes.Buffer
+	GuardRemoval(p, "/wt/x\ny", "sess-1", &stderr)
+	if n := strings.Count(stderr.String(), "\n"); n != 1 {
+		t.Fatalf("stderr lines = %d, want exactly 1: %q", n, stderr.String())
 	}
 }

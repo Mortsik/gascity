@@ -5,13 +5,13 @@ import (
 	"errors"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/testutil"
 	"github.com/gastownhall/gascity/internal/worktreeguard"
 )
 
@@ -457,14 +457,7 @@ func TestPruneAgentHomeWorktreeIfSafe_NilConfig(t *testing.T) {
 // for the real-git fixtures below (the probe-fake tests never call it).
 func runPruneGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	var out, errb bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errb
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("git -C %s %s: %v\nstderr: %s", dir, strings.Join(args, " "), err, errb.String())
-	}
-	return out.String()
+	return testutil.RunGit(t, dir, args...)
 }
 
 // realPruneFixture builds a REAL rig repo plus a standalone clone of it under
@@ -500,10 +493,7 @@ func newRealPruneFixture(t *testing.T) *realPruneFixture {
 	if err := os.MkdirAll(filepath.Dir(workerDir), 0o755); err != nil {
 		t.Fatalf("mkdir worker parent: %v", err)
 	}
-	cmd := exec.Command("git", "clone", "-q", rigRoot, workerDir)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("clone: %v\n%s", err, out)
-	}
+	runPruneGit(t, cityPath, "clone", "-q", rigRoot, workerDir)
 	runPruneGit(t, workerDir, "config", "user.email", "test@example.com")
 	runPruneGit(t, workerDir, "config", "user.name", "Test")
 	runPruneGit(t, workerDir, "checkout", "-q", "-b", "work")

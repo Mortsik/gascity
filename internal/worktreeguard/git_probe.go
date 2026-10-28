@@ -176,14 +176,27 @@ func objectExists(dir, sha string) (bool, error) {
 }
 
 // FetchIntoQuarantine copies headSha into QuarantineRef(tag, branch,
-// headSha) in the rig repo — a fetch-shaped copy that never touches the rig
-// repo's refs/heads. The source is the exact sha (a branch that moved since
-// HeadInfo cannot substitute other content), and the refspec is NOT forced:
-// the destination is content-named, so an existing ref holding other content
-// is a collision that must fail, never an overwrite of an earlier rescue.
+// headSha) in the rig repo without touching its refs/heads: the exact sha's
+// objects are fetched (a branch that moved since HeadInfo cannot substitute
+// other content), then the ref is CREATED atomically (update-ref "create"
+// verifies it does not exist). An existing ref holding other content — a
+// sha12 collision, an earlier rescue — fails the copy; it is never replaced.
 func (g *GitProbe) FetchIntoQuarantine(tag, branch, headSha string) error {
-	refspec := headSha + ":" + QuarantineRef(tag, branch, headSha)
-	return gitRun(g.rigRoot, "fetch", "--", g.repoPath, refspec)
+	// Objects only: git fetch updates refs outside refs/heads|tags even
+	// without "+", so the fetch never names a destination.
+	if err := gitRun(g.rigRoot, "fetch", "--no-write-fetch-head", "--", g.repoPath, headSha); err != nil {
+		return err
+	}
+	ref := QuarantineRef(tag, branch, headSha)
+	createErr := gitRunStdin(g.rigRoot, "create "+ref+" "+headSha+"\n", "update-ref", "--stdin")
+	if createErr == nil {
+		return nil
+	}
+	// An existing ref holding exactly this commit is a completed copy.
+	if cur, err := gitOut(g.rigRoot, "rev-parse", "--verify", "-q", ref); err == nil && strings.TrimSpace(cur) == headSha {
+		return nil
+	}
+	return fmt.Errorf("quarantine ref %s not created (exists with other content?): %w", ref, createErr)
 }
 
 // VerifyQuarantied asks the reachability question again after the copy: a
@@ -202,23 +215,37 @@ func (g *GitProbe) VerifyQuarantied(headSha string) error {
 }
 
 // UnsecuredRefs lists every ref of the doomed repository — branches, local
-// tags, notes, any custom namespace, the stash — other than HEAD's own
-// branch and remote-tracking refs (copies of a remote's state by
-// definition) whose target is not secured in the rig repository
+// tags, notes, remote-tracking refs (a stale one can be the last reference
+// to a force-pushed commit), any custom namespace, the stash — other than
+// HEAD's own branch, whose target is not secured in the rig repository
 // (securedInRig: a secured tip carries its whole history; an annotated tag
-// object must itself exist there). A linked worktree (.git FILE) has none to
-// lose: its refs live in the shared repository and survive the directory's
-// removal. A broken rig or a failed listing is an ERROR, never an empty
-// list — the caller fails closed.
+// object must itself exist there). The clone's OWN linked worktrees
+// ("worktree:<name>") are reported unsecured outright: their HEADs and
+// per-worktree refs live in <gitdir>/worktrees/ and die with the clone.
+//
+// A linked worktree (.git FILE) has none to lose: its refs live in the
+// shared repository and survive the directory's removal. That premise holds
+// because callers remove .git-file trees only through the rig's `git
+// worktree remove` (which refuses unregistered paths) and reaper discovery
+// never adds unregistered .git files. A broken rig or a failed listing is an
+// ERROR, never an empty list — the caller fails closed.
 func (g *GitProbe) UnsecuredRefs(headBranch string) ([]string, error) {
-	if fi, err := os.Lstat(filepath.Join(g.repoPath, ".git")); err == nil && fi.Mode().IsRegular() {
+	gitDir := filepath.Join(g.repoPath, ".git")
+	if fi, err := os.Lstat(gitDir); err == nil && fi.Mode().IsRegular() {
 		return nil, nil
+	}
+	var unsecured []string
+	entries, err := os.ReadDir(filepath.Join(gitDir, "worktrees"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("linked worktree listing: %w", err)
+	}
+	for _, e := range entries {
+		unsecured = append(unsecured, "worktree:"+e.Name())
 	}
 	out, err := gitOut(g.repoPath, "for-each-ref", "--format=%(objectname) %(refname)")
 	if err != nil {
 		return nil, fmt.Errorf("ref listing: %w", err)
 	}
-	var unsecured []string
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		if line == "" {
 			continue
@@ -227,8 +254,8 @@ func (g *GitProbe) UnsecuredRefs(headBranch string) ([]string, error) {
 		if !ok {
 			return nil, fmt.Errorf("ref listing: malformed line %q", line)
 		}
-		if strings.HasPrefix(ref, "refs/remotes/") || (headBranch != "" && ref == "refs/heads/"+headBranch) {
-			continue // remote copies, and HEAD's branch (the head question)
+		if headBranch != "" && ref == "refs/heads/"+headBranch {
+			continue // HEAD's branch is the head question
 		}
 		secured, err := securedInRig(g.rigRoot, sha)
 		if err != nil {
@@ -253,6 +280,17 @@ func sha12(sha string) string {
 func gitRun(dir string, args ...string) error {
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
 	cmd.Env = gitutil.SanitizedEnv()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git -C %s %s: %w: %.200s", dir, strings.Join(args, " "), err, out)
+	}
+	return nil
+}
+
+// gitRunStdin is gitRun with input on stdin.
+func gitRunStdin(dir, stdin string, args ...string) error {
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = gitutil.SanitizedEnv()
+	cmd.Stdin = strings.NewReader(stdin)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git -C %s %s: %w: %.200s", dir, strings.Join(args, " "), err, out)
 	}

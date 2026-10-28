@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,20 +10,14 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/testutil"
 )
 
-// reapGitOut runs a real git command in dir and returns stdout, failing the
-// test on error.
+// reapGitOut runs a real git command in dir and returns its trimmed output,
+// failing the test on error.
 func reapGitOut(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	var out, errb bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errb
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("git -C %s %s: %v\nstderr: %s", dir, strings.Join(args, " "), err, errb.String())
-	}
-	return out.String()
+	return testutil.RunGit(t, dir, args...)
 }
 
 // addClosedStandaloneClone builds the 3zf46/ga0r1.1.1 incident shape: a
@@ -100,7 +93,7 @@ func TestReapClosedBeadWorktrees_SkipsOpenBeadStandaloneClone(t *testing.T) {
 }
 
 // TestReapClosedBeadWorktrees_ProtectsStandaloneCloneWhenCopyFails: guard ON,
-// rig repo unwritable — the guard cannot secure a copy of the unpushed
+// rig refs unwritable — the guard cannot secure a copy of the unpushed
 // branch, so the clone is PROTECTED with a reason naming branch-unsecured and
 // stays on disk (this is the literal copy-failure path, not a probe error).
 func TestReapClosedBeadWorktrees_ProtectsStandaloneCloneWhenCopyFails(t *testing.T) {
@@ -113,11 +106,14 @@ func TestReapClosedBeadWorktrees_ProtectsStandaloneCloneWhenCopyFails(t *testing
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores directory permissions: the read-only rig cannot block the copy")
 	}
-	gitDir := filepath.Join(rigRoot, ".git")
-	if err := os.Chmod(gitDir, 0o555); err != nil {
-		t.Fatalf("chmod .git read-only: %v", err)
+	// The quarantine ref cannot be created under a read-only refs/ (the
+	// objects may still transfer — a copy is only a copy once the ref
+	// that keeps it alive exists).
+	refsDir := filepath.Join(rigRoot, ".git", "refs")
+	if err := os.Chmod(refsDir, 0o555); err != nil {
+		t.Fatalf("chmod .git/refs read-only: %v", err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(gitDir, 0o755) })
+	t.Cleanup(func() { _ = os.Chmod(refsDir, 0o755) })
 
 	var stderr bytes.Buffer
 	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, nil, &stderr)

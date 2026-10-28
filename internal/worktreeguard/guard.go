@@ -50,9 +50,10 @@ type Probe interface {
 	// never authorize a removal.
 	VerifyQuarantied(headSha string) error
 	// UnsecuredRefs returns every ref of the doomed repository other than
-	// refs/heads/<headBranch> and remote-tracking refs whose target is NOT
-	// secured in the rig repository — refs whose only copy dies with the
-	// directory. An error is a fail-closed fact.
+	// refs/heads/<headBranch> (remote-tracking refs included) whose target
+	// is NOT secured in the rig repository, plus the repository's own linked
+	// worktrees — state whose only copy dies with the directory. An error
+	// is a fail-closed fact.
 	UnsecuredRefs(headBranch string) ([]string, error)
 }
 
@@ -181,15 +182,21 @@ func GuardRemoval(p Probe, repoPath, tag string, stderr io.Writer) Verdict {
 	if copied {
 		// The copy landed whatever the final verdict: name where it went.
 		fmt.Fprintf(stderr, "worktreeguard: %s repo=%s branch=%s sha=%s ref=%s\n",
-			ActionSecuredCopy, repoPath, displayOrDash(sanitizeRefSegment(branch)), headSha,
+			ActionSecuredCopy, oneLine(repoPath), displayOrDash(sanitizeRefSegment(branch)), headSha,
 			QuarantineRef(tag, branch, headSha)) //nolint:errcheck // notify line, best-effort
 	}
 	if !v.Secured {
 		fmt.Fprintf(stderr, "worktreeguard: %s repo=%s branch=%s sha=%s reason=%s\n",
-			v.Action, repoPath, displayOrDash(sanitizeRefSegment(branch)), displayOrDash(headSha),
-			v.Reason) //nolint:errcheck // notify line, best-effort
+			v.Action, oneLine(repoPath), displayOrDash(sanitizeRefSegment(branch)), displayOrDash(headSha),
+			oneLine(v.Reason)) //nolint:errcheck // notify line, best-effort
 	}
 	return v
+}
+
+// oneLine folds CR/LF (git stderr carried in a reason, an odd path) so a
+// notify line stays exactly one structured line.
+func oneLine(s string) string {
+	return strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(s)
 }
 
 func displayOrDash(s string) string {
