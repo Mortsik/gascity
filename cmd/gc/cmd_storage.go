@@ -792,6 +792,19 @@ var openStorageScopeStore = openStoreAtForCity
 // copy and invisible to the strand detector, so cutting over would route every
 // reader past it permanently and nothing would ever say so.
 //
+// One kind of rig row is let through: a CLOSED graph bead in a rig that keeps
+// its own ledger, whose id the city work store does not hold (rigInfraRow
+// history). Every graph reader that loses sight of a rig's ledger after the
+// cutover acts only on live state (active wisp steps, roots a close completes,
+// attachments a close still has to close), so a finished workflow step has no
+// reader to strand, and the rig's own store keeps it as history. An open or
+// in-progress one does, and is refused like any other row; so is a closed one
+// whose id the city work store holds, because the binding would then answer
+// by-id reads for that id with the city's row. The exemption does not survive a
+// reopen: a historical rig step reopened after the cutover is invisible to
+// those readers, so it neither gets step reminders nor autocloses its root —
+// re-run the work as a new workflow instead.
+//
 // So it is refused by name here, before the guard is doing any good, rather
 // than counted or repaired. Repairing it would mean importing rig rows into the
 // city work store, and this binary carries no such importer — naming one in the
@@ -826,6 +839,9 @@ func censusRigInfraResidue(cityPath string, cfg *config.City) error {
 		name := fmt.Sprintf("%s (rig %s)", row.bead.ID, row.rig)
 		city, ok := carried[row.bead.ID]
 		switch {
+		case !ok && row.history:
+			// Finished rig graph history: nothing the cutover moves or routes
+			// shadows it, and nothing live reads it.
 		case !ok:
 			absent = append(absent, name)
 		case censusRowDiffers(city, row.bead):
@@ -836,14 +852,17 @@ func censusRigInfraResidue(cityPath string, cfg *config.City) error {
 }
 
 // rigInfraRow is one infrastructure row a rig scope lists, with the rig that
-// listed it.
+// listed it. history marks a closed graph row in a rig that keeps its own graph
+// ledger: residue only if the city work store holds the same id.
 type rigInfraRow struct {
-	bead beads.Bead
-	rig  string
+	bead    beads.Bead
+	rig     string
+	history bool
 }
 
-// listRigInfraRows lists the infrastructure rows every bound rig scope holds.
-// A rig that cannot be opened, listed or closed fails the census.
+// listRigInfraRows lists the infrastructure rows every bound rig scope holds,
+// marking closed graph rows of a rig that keeps its own ledger as history. A rig
+// that cannot be opened, listed or closed fails the census.
 func listRigInfraRows(cityPath string, rigs []config.Rig) ([]rigInfraRow, error) {
 	var found []rigInfraRow
 	for _, rig := range rigs {
@@ -865,11 +884,23 @@ func listRigInfraRows(cityPath string, rigs []config.Rig) ([]rigInfraRow, error)
 		if closeErr != nil {
 			return nil, fmt.Errorf("closing rig %q after the census: %w", rig.Name, closeErr)
 		}
+		rigKeepsGraph := !controlScopeTakesGraphClass(cityPath, root)
 		for _, bead := range rows {
-			if coordclass.Classify(bead) == coordclass.ClassWork {
+			class := coordclass.Classify(bead)
+			if class == coordclass.ClassWork {
 				continue
 			}
-			found = append(found, rigInfraRow{bead: bead, rig: rig.Name})
+			// After a cutover new graph beads land in the city binding
+			// (resolveGraphStore), the rig dispatcher still reads the rig's own
+			// ledger as well (controlGraphExtraLeg), but the one-shot graph
+			// readers (cliGraphStore: wisp step injection, molecule and wisp
+			// autoclose) read the binding only. They act on live workflows, so
+			// an open rig step would lose them and stays refused; a closed one
+			// is history nothing re-reads. A production city carried 45k closed
+			// rig steps, and refusing them asked for a move this binary cannot
+			// make.
+			history := class == coordclass.ClassGraph && rigKeepsGraph && bead.Status == "closed"
+			found = append(found, rigInfraRow{bead: bead, rig: rig.Name, history: history})
 		}
 	}
 	return found, nil

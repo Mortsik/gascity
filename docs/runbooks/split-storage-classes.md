@@ -103,7 +103,7 @@ The checks that most often stop a real cutover, and what each wants from you:
 
 | Block | What it means | What to do |
 | --- | --- | --- |
-| `rig scopes` | An infrastructure bead lives in a rig's store, and the copy reads only the city work store. | Move the named beads into the city work store by hand. |
+| `rig scopes` | An infrastructure bead lives in a rig's store, and the copy reads only the city work store. Closed graph beads (finished workflow steps and wisps) are not counted: nothing acts on them after the cutover, and the rig's own store keeps them as history. | Move the named beads into the city work store by hand. An open workflow step in a rig can instead be let finish (or closed) before the window. |
 | `served binding` | This city already served its infrastructure classes from a different binding. | Verify or recover that binding first. Removing the note is your attestation that you have. |
 | `edge payloads` | The work store cannot be asked what its dependency edges carry — `waits_for` gates store a payload there. | Nothing in your data: this city's work store runs on an engine that cannot report edge payloads, so this binary cannot split it. The block is permanent until the work store is on an engine that can (SQLite or native Dolt). |
 | `destination` | The binding already holds beads this migration did not write. | Find out whose they are before letting a copy overwrite them. |
@@ -146,7 +146,14 @@ What the command does, in order:
 4. Censuses every rig's bead scope for infrastructure beads and **refuses by
    id and rig** if it finds any. The copy reads the city work store only, so a
    bead sitting in a rig scope would be left unreachable. Move those into the
-   city work store first.
+   city work store first. Closed graph-class beads in a rig are not counted:
+   after the cutover the one-shot graph readers (wisp step reminders, molecule
+   and wisp autoclose) read the binding only, but they act on live workflows,
+   so a finished step has nothing to lose. An open one does, and is refused,
+   and so is a closed one whose id the city work store also holds. Do not
+   reopen such a historical rig step after the cutover: those readers cannot
+   see it, so it gets no step reminders and never autocloses its root. Run the
+   work again as a new workflow instead.
 5. Copies every infrastructure bead with its id and within-class dependency
    topology preserved.
 6. Closes the destination, reopens it, and proves field-level equality against

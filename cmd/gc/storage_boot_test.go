@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/config"
@@ -1097,6 +1098,110 @@ func TestStorageMigrateAcceptsRigSharingTheCityStore(t *testing.T) {
 		if err := censusRigInfraResidue(request.CityPath, cfg); err != nil {
 			t.Errorf("%s: a rig sharing the city work store was refused as residue: %v", shape.name, err)
 		}
+	}
+}
+
+// TestStorageMigrateLeavesClosedRigGraphRowsOutOfTheCensus covers the graph
+// rows a rig keeps in its own ledger. After a cutover the one-shot graph
+// readers (wisp step injection, molecule and wisp autoclose) read the city
+// binding only, and they act on live workflows: a closed rig step has no
+// reader to strand, so the census must not refuse it (a production city
+// refused 45k of them), while an open rig step and a per-city class beside it
+// are still refused by name. A rig whose path resolves to the city scope takes
+// the graph binding like the city does, so even its closed graph rows stay in
+// the census.
+func TestStorageMigrateLeavesClosedRigGraphRowsOutOfTheCensus(t *testing.T) {
+	cfg := infraSplitConfig(filepath.Join(t.TempDir(), "store"))
+	request := storageTestRequest(t, cfg)
+	stubInfraMigrationSource(t)
+
+	rigPath := t.TempDir()
+	cfg.Rigs = []config.Rig{{Name: "alpha", Prefix: "ga", Path: rigPath}}
+	rig := beads.NewMemStore()
+	stubStorageScopeStore(t, rigPath, func() beads.Store { return rig })
+
+	mustCreateGraph := func(b beads.Bead) beads.Bead {
+		t.Helper()
+		created := mustCreateInfraBead(t, rig, b)
+		if got := coordclass.Classify(created); got != coordclass.ClassGraph {
+			t.Fatalf("precondition: %q classifies as %s, want graph", b.Title, got)
+		}
+		return created
+	}
+	doneStep := mustCreateGraph(beads.Bead{
+		Title:    "a finished workflow step",
+		Type:     "task",
+		Metadata: beads.StringMap{beadmeta.RootBeadIDMetadataKey: "ga-root"},
+	})
+	doneWisp := mustCreateGraph(beads.Bead{Title: "a finished wisp", Type: "task", Labels: []string{"gc:wisp"}})
+	for _, id := range []string{doneStep.ID, doneWisp.ID} {
+		if err := rig.Close(id); err != nil {
+			t.Fatalf("closing %s: %v", id, err)
+		}
+	}
+	closedIDs := []string{doneStep.ID, doneWisp.ID}
+
+	if err := censusRigInfraResidue(request.CityPath, cfg); err != nil {
+		t.Fatalf("a rig holding only closed graph rows was refused as residue: %v", err)
+	}
+
+	liveStep := mustCreateGraph(beads.Bead{
+		Title:    "a running workflow step",
+		Type:     "task",
+		Metadata: beads.StringMap{beadmeta.RootBeadIDMetadataKey: "ga-root"},
+	})
+	stray := mustCreateInfraBead(t, rig, beads.Bead{Title: "mail in a rig", Type: "message"})
+	err := censusRigInfraResidue(request.CityPath, cfg)
+	if err == nil {
+		t.Fatal("a rig holding an open graph step and a message was not refused")
+	}
+	for _, want := range []string{liveStep.ID, stray.ID} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not name %s: %v", want, err)
+		}
+	}
+	for _, id := range closedIDs {
+		if strings.Contains(err.Error(), id) {
+			t.Errorf("the refusal names closed graph row %s, which no reader needs after the cutover: %v", id, err)
+		}
+	}
+
+	cfg.Rigs = []config.Rig{{Name: "city-scoped", Prefix: "ga", Path: request.CityPath}}
+	stubStorageScopeStore(t, request.CityPath, func() beads.Store { return rig })
+	err = censusRigInfraResidue(request.CityPath, cfg)
+	if err == nil || !strings.Contains(err.Error(), doneStep.ID) {
+		t.Fatalf("a rig resolving to the city scope takes the graph binding, so its closed graph rows the copy lacks must still be refused: %v", err)
+	}
+}
+
+// TestStorageMigrateRefusesClosedRigGraphRowWhoseIDTheCityHolds covers the
+// limit of the closed-history exemption. Ids are unique per store, not across
+// stores, so a closed rig graph row can share its id with a different city
+// row. The copy moves the city's row into the binding, which then answers
+// by-id reads for that id, so the rig row is refused under the diverged remedy
+// rather than waved through as history.
+func TestStorageMigrateRefusesClosedRigGraphRowWhoseIDTheCityHolds(t *testing.T) {
+	cfg := infraSplitConfig(filepath.Join(t.TempDir(), "store"))
+	request := storageTestRequest(t, cfg)
+	city := stubInfraMigrationSource(t)
+
+	rigPath := t.TempDir()
+	cfg.Rigs = []config.Rig{{Name: "alpha", Prefix: "ga", Path: rigPath}}
+	rig := beads.NewMemStore()
+	stubStorageScopeStore(t, rigPath, func() beads.Store { return rig })
+
+	done := mustCreateInfraBead(t, rig, beads.Bead{Title: "a finished rig wisp", Type: "task", Labels: []string{"gc:wisp"}})
+	if err := rig.Close(done.ID); err != nil {
+		t.Fatalf("closing %s: %v", done.ID, err)
+	}
+	live := mustCreateInfraBead(t, city, beads.Bead{Title: "a live city wisp", Type: "task", Labels: []string{"gc:wisp"}})
+	if live.ID != done.ID {
+		t.Fatalf("precondition: the two stores minted %s and %s, want one shared id", done.ID, live.ID)
+	}
+
+	err := censusRigInfraResidue(request.CityPath, cfg)
+	if err == nil || !strings.Contains(err.Error(), done.ID) || !strings.Contains(err.Error(), "another state") {
+		t.Fatalf("a closed rig graph row whose id the city work store holds in another state was not refused as diverged: %v", err)
 	}
 }
 
