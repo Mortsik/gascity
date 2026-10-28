@@ -31,6 +31,10 @@ type fakeProbe struct {
 	// call — a ref created under the guard.
 	laterRefs []string
 	refCalls  int
+	// switchBranch, when set, makes HeadInfo calls after the first report
+	// laterBranch instead of branch — a checkout under the guard.
+	switchBranch bool
+	laterBranch  string
 }
 
 func (f *fakeProbe) IsRepo() bool { return f.isRepo }
@@ -40,14 +44,18 @@ func (f *fakeProbe) HeadInfo() (string, string, error) {
 	if f.headErr {
 		return "", "", errFake("head probe failed")
 	}
+	branch := f.branch
+	if f.headCalls > 1 && f.switchBranch {
+		branch = f.laterBranch
+	}
 	if f.headCalls > 1 && len(f.laterShas) > 0 {
 		i := f.headCalls - 2
 		if i >= len(f.laterShas) {
 			i = len(f.laterShas) - 1
 		}
-		return f.branch, f.laterShas[i], nil
+		return branch, f.laterShas[i], nil
 	}
-	return f.branch, f.headSha, nil
+	return branch, f.headSha, nil
 }
 
 func (f *fakeProbe) SecuredInRig(string) (bool, error) {
@@ -338,6 +346,23 @@ func TestGuardRemovalRefusesWhenHeadMoves(t *testing.T) {
 		v := GuardRemoval(p, "/wt/x", "sess-1", &stderr)
 		if v.Secured || v.Reason != "head-moved" {
 			t.Fatalf("reach=%v: verdict = %+v, want refuse head-moved (stderr %q)", reach, v, stderr.String())
+		}
+	}
+}
+
+// TestGuardRemovalRefusesWhenBranchSwitches: HEAD's sha unchanged but the
+// checkout switched branches (the original branch may have advanced and is
+// no longer the excluded head question) refuses (Web Sol REWORK 2026-10-28
+// round 4 (2)).
+func TestGuardRemovalRefusesWhenBranchSwitches(t *testing.T) {
+	for _, later := range []string{"main", ""} {
+		for _, reach := range []bool{false, true} {
+			p := &fakeProbe{isRepo: true, branch: "work", headSha: "aaaaaaaaaaaa1", reach: reach, switchBranch: true, laterBranch: later}
+			var stderr bytes.Buffer
+			v := GuardRemoval(p, "/wt/x", "sess-1", &stderr)
+			if v.Secured || v.Reason != "head-moved" {
+				t.Fatalf("later=%q reach=%v: verdict = %+v, want refuse head-moved", later, reach, v)
+			}
 		}
 	}
 }

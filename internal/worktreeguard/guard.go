@@ -52,8 +52,10 @@ type Probe interface {
 	// UnsecuredRefs returns every ref of the doomed repository other than
 	// refs/heads/<headBranch> (remote-tracking refs included) whose target
 	// is NOT secured in the rig repository, plus the repository's own linked
-	// worktrees — state whose only copy dies with the directory. An error
-	// is a fail-closed fact.
+	// worktrees — state whose only copy dies with the directory. For a
+	// linked worktree only its per-worktree refs (refs/worktree/,
+	// refs/bisect/, refs/rewritten/) die with it. An error is a fail-closed
+	// fact.
 	UnsecuredRefs(headBranch string) ([]string, error)
 }
 
@@ -170,10 +172,12 @@ func GuardRemoval(p Probe, repoPath, tag string, stderr io.Writer) Verdict {
 		}
 	}
 	if v.Secured {
-		// The tree must still be the one the verdict was about: a HEAD or
-		// ref that moved meanwhile (a live writer the caller's liveness
-		// gates missed) leaves new work no verdict covered.
-		if _, now, err := p.HeadInfo(); err != nil || now != headSha {
+		// The tree must still be the one the verdict was about: a HEAD, a
+		// checked-out branch or a ref that moved meanwhile (a live writer the
+		// caller's liveness gates missed) leaves new work no verdict covered.
+		// A branch switch at the same sha counts: the original branch is no
+		// longer the excluded head question and may have advanced.
+		if nowBranch, now, err := p.HeadInfo(); err != nil || now != headSha || nowBranch != branch {
 			v = Verdict{Action: ActionRefuse, Secured: false, Reason: "head-moved"}
 		} else if refs, err := p.UnsecuredRefs(branch); err != nil || len(refs) > 0 {
 			v = Verdict{Action: ActionRefuse, Secured: false, Reason: "refs-moved"}

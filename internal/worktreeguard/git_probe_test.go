@@ -525,3 +525,92 @@ func TestGitProbeGuardRefusesStandaloneWithNestedRepo(t *testing.T) {
 		t.Fatalf("verdict = %+v, want refuse naming nested-repo:vendor/lib", v)
 	}
 }
+
+// TestGitProbeGuardRefusesOnLinkedWorktreePrivateRefs: a linked worktree's
+// per-worktree refs (refs/worktree/*, refs/bisect/*, refs/rewritten/*) live
+// in its private admin dir and die with `git worktree remove` — a commit
+// only they reach must refuse even though HEAD's branch survives in the rig
+// (Web Sol REWORK 2026-10-28 round 4 (1)).
+func TestGitProbeGuardRefusesOnLinkedWorktreePrivateRefs(t *testing.T) {
+	rig := newRig(t)
+	wt := newLinkedWorktree(t, rig, "polecat/ga-lnk03", false)
+	commitFile(t, wt, "orphan.txt")
+	orphan := strings.TrimSpace(git(t, wt, "rev-parse", "HEAD"))
+	git(t, wt, "reset", "-q", "--hard", "HEAD~1")
+	git(t, wt, "update-ref", "refs/worktree/keep", orphan)
+	git(t, wt, "update-ref", "refs/bisect/bad", orphan)
+
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(wt, rig), wt, "ga-lnk03", &stderr)
+	if v.Secured || v.Reason != "non-head-refs-unsecured: refs/bisect/bad, refs/worktree/keep" {
+		t.Fatalf("verdict = %+v, want refuse non-head-refs-unsecured: refs/bisect/bad, refs/worktree/keep", v)
+	}
+}
+
+// TestGitProbeGuardLinkedPrivateRefToSecuredCommit: a per-worktree ref at a
+// commit the rig's own refs reach is no loss — no false refusal.
+func TestGitProbeGuardLinkedPrivateRefToSecuredCommit(t *testing.T) {
+	rig := newRig(t)
+	wt := newLinkedWorktree(t, rig, "polecat/ga-lnk04", false)
+	git(t, wt, "update-ref", "refs/worktree/mark", "refs/heads/main")
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(wt, rig), wt, "ga-lnk04", &stderr)
+	if !v.Secured || v.Action != ActionAlreadySecured {
+		t.Fatalf("verdict = %+v, want already-secured (stderr: %q)", v, stderr.String())
+	}
+}
+
+// TestGitProbeGuardRefusesOnAnnotatedTagObjectUnreferencedInRig: an
+// annotated tag's OBJECT (message, tagger, signature) present in the rig but
+// unreferenced there is not secured just because its target commit is —
+// the clone's tag ref is its only surviving reference (Web Sol REWORK
+// 2026-10-28 round 4 (3)).
+func TestGitProbeGuardRefusesOnAnnotatedTagObjectUnreferencedInRig(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	git(t, clone, "tag", "-a", "t1", "-m", "release notes", "main")
+	git(t, rig, "fetch", "-q", "--no-tags", clone, "refs/tags/t1:refs/tags/tmp")
+	git(t, rig, "update-ref", "-d", "refs/tags/tmp")
+	git(t, clone, "checkout", "-q", "main")
+	git(t, clone, "branch", "-D", "work")
+
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(clone, rig), clone, "sess-70", &stderr)
+	if v.Secured || v.Reason != "non-head-refs-unsecured: refs/tags/t1" {
+		t.Fatalf("verdict = %+v, want refuse non-head-refs-unsecured: refs/tags/t1", v)
+	}
+}
+
+// TestGitProbeGuardAnnotatedTagHeldByRigIsSecured: the same tag object
+// referenced by the rig's own refs/tags survives — no false refusal.
+func TestGitProbeGuardAnnotatedTagHeldByRigIsSecured(t *testing.T) {
+	base := t.TempDir()
+	rig := filepath.Join(base, "rig")
+	if err := os.MkdirAll(rig, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	initRepo(t, rig)
+	commitFile(t, rig, "base.txt")
+	git(t, rig, "tag", "-a", "v1", "-m", "release v1")
+	clone := filepath.Join(base, "doomed")
+	git(t, base, "clone", "-q", rig, clone)
+
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(clone, rig), clone, "sess-71", &stderr)
+	if !v.Secured || v.Action != ActionAlreadySecured {
+		t.Fatalf("verdict = %+v, want already-secured (stderr: %q)", v, stderr.String())
+	}
+}
+
+// TestGitProbeGuardTrailingSlashPathIsNotNested: a doomed path given with a
+// trailing slash must not report the clone's own .git as a nested repo
+// (local critic REVIEW-GATE 2026-10-28 round 3 observation).
+func TestGitProbeGuardTrailingSlashPathIsNotNested(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	git(t, clone, "checkout", "-q", "main")
+	git(t, clone, "branch", "-D", "work")
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(clone+"/", rig), clone, "sess-72", &stderr)
+	if !v.Secured || v.Action != ActionAlreadySecured {
+		t.Fatalf("verdict = %+v, want already-secured (stderr: %q)", v, stderr.String())
+	}
+}

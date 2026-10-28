@@ -28,7 +28,9 @@ type GitProbe struct {
 
 // NewGitProbe binds a probe to the removal candidate and its rig repo.
 func NewGitProbe(repoPath, rigRoot string) *GitProbe {
-	return &GitProbe{repoPath: repoPath, rigRoot: rigRoot}
+	// Clean: a trailing slash must not make the nested-repo walk mistake the
+	// clone's own .git for a nested repository.
+	return &GitProbe{repoPath: filepath.Clean(repoPath), rigRoot: rigRoot}
 }
 
 // IsRepo reports whether the candidate carries a .git file or directory.
@@ -152,8 +154,20 @@ func securedInRig(rigRoot, sha string) (bool, error) {
 	if err != nil || !exists {
 		return false, err
 	}
-	out, err := gitOut(rigRoot, "rev-list", "-n1", sha, "--not",
-		"--branches", "--tags", "--remotes", "--glob="+QuarantineRefPrefix+"*")
+	typ, err := gitOut(rigRoot, "cat-file", "-t", sha)
+	if err != nil {
+		return false, fmt.Errorf("rig repo cat-file -t: %w", err)
+	}
+	// A commit is secured when no commit of its history escapes the
+	// surviving refs. Any other object (an annotated tag: message, tagger,
+	// signature) must ITSELF be reached — rev-list peels a tag to its commit,
+	// so only --objects proves the tag object is referenced.
+	args := []string{"rev-list", "-n1", sha}
+	if strings.TrimSpace(typ) != "commit" {
+		args = []string{"rev-list", "--objects", sha}
+	}
+	args = append(args, "--not", "--branches", "--tags", "--remotes", "--glob="+QuarantineRefPrefix+"*")
+	out, err := gitOut(rigRoot, args...)
 	if err != nil {
 		return false, fmt.Errorf("rig repo reachability: %w", err)
 	}
@@ -234,7 +248,9 @@ func (g *GitProbe) VerifyQuarantied(headSha string) error {
 func (g *GitProbe) UnsecuredRefs(headBranch string) ([]string, error) {
 	gitDir := filepath.Join(g.repoPath, ".git")
 	if fi, err := os.Lstat(gitDir); err == nil && fi.Mode().IsRegular() {
-		return nil, nil
+		// Linked worktree: shared refs live in the rig's common dir and
+		// survive; only the per-worktree refs die with its admin dir.
+		return g.unsecuredAmong(headBranch, perWorktreeRefPrefixes...)
 	}
 	var unsecured []string
 	entries, err := os.ReadDir(filepath.Join(gitDir, "worktrees"))
@@ -249,7 +265,23 @@ func (g *GitProbe) UnsecuredRefs(headBranch string) ([]string, error) {
 		return nil, err
 	}
 	unsecured = append(unsecured, nested...)
-	out, err := gitOut(g.repoPath, "for-each-ref", "--format=%(objectname) %(refname)")
+	refs, err := g.unsecuredAmong(headBranch)
+	if err != nil {
+		return nil, err
+	}
+	return append(unsecured, refs...), nil
+}
+
+// perWorktreeRefPrefixes are the ref namespaces git keeps per worktree (in a
+// linked worktree's private admin dir, deleted by `git worktree remove`).
+var perWorktreeRefPrefixes = []string{"refs/worktree/", "refs/bisect/", "refs/rewritten/"}
+
+// unsecuredAmong lists the doomed repository's refs (restricted to patterns
+// when given) other than refs/heads/<headBranch> whose target is not
+// secured in the rig repository.
+func (g *GitProbe) unsecuredAmong(headBranch string, patterns ...string) ([]string, error) {
+	var unsecured []string
+	out, err := gitOut(g.repoPath, append([]string{"for-each-ref", "--format=%(objectname) %(refname)"}, patterns...)...)
 	if err != nil {
 		return nil, fmt.Errorf("ref listing: %w", err)
 	}
