@@ -703,3 +703,51 @@ func TestGitProbeGuardRefusesLinkedWorktreeWithSubmoduleStore(t *testing.T) {
 		t.Fatalf("verdict = %+v, want refuse non-head-refs-unsecured: submodule:sub", v)
 	}
 }
+
+// TestGitProbeGuardRefusesOnNestedGitDirWithoutMarker: repositories with no
+// .git marker — a bare repo, or the git dir of a --separate-git-dir repo —
+// inside an ignored directory hold commits only they reference; os.RemoveAll
+// would delete them (Web Sol REVIEW-GATE 2026-10-28 round 6). Detection is
+// git's own shape test (HEAD + objects/ + refs/), not the marker name.
+func TestGitProbeGuardRefusesOnNestedGitDirWithoutMarker(t *testing.T) {
+	for _, tc := range []struct{ name, rel string }{
+		{"bare", "vendor/cache.git"},
+		{"separate-git-dir", "vendor/sep.git"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig, clone := newStandaloneWithUnpushedBranch(t)
+			git(t, clone, "checkout", "-q", "main")
+			git(t, clone, "branch", "-D", "work")
+			if err := os.WriteFile(filepath.Join(clone, ".git", "info", "exclude"), []byte("vendor/\n"), 0o644); err != nil {
+				t.Fatalf("write exclude: %v", err)
+			}
+			src := filepath.Join(t.TempDir(), "src")
+			if err := os.MkdirAll(src, 0o755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			target := filepath.Join(clone, filepath.FromSlash(tc.rel))
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			if tc.name == "bare" {
+				initRepo(t, src)
+				commitFile(t, src, "unique.txt")
+				git(t, clone, "clone", "-q", "--bare", src, target)
+			} else {
+				git(t, src, "init", "-q", "--separate-git-dir", target)
+				git(t, src, "config", "user.email", "test@example.com")
+				git(t, src, "config", "user.name", "Test")
+				commitFile(t, src, "unique.txt")
+			}
+			if out := strings.TrimSpace(git(t, clone, "status", "--porcelain")); out != "" {
+				t.Fatalf("fixture: outer clone not clean: %q", out)
+			}
+
+			var stderr bytes.Buffer
+			v := GuardRemoval(NewGitProbe(clone, rig), clone, "sess-74", &stderr)
+			if v.Secured || v.Reason != "non-head-refs-unsecured: nested-repo:"+tc.rel {
+				t.Fatalf("verdict = %+v, want refuse non-head-refs-unsecured: nested-repo:%s", v, tc.rel)
+			}
+		})
+	}
+}

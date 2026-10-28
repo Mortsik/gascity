@@ -359,8 +359,11 @@ func (g *GitProbe) unsecuredAmong(headBranch string, patterns ...string) ([]stri
 const maxNestedReported = 11
 
 // nestedRepos walks root (skipping its own .git) and names every directory
-// below it that holds a .git file or directory. An unreadable subtree is an
-// ERROR: the walk cannot prove the tree holds no other repository.
+// below it that holds a .git file or directory, and every directory that IS
+// a git dir without such a marker (a bare repository, the git dir of a
+// --separate-git-dir repository) by git's own shape test. An unreadable
+// subtree is an ERROR: the walk cannot prove the tree holds no other
+// repository.
 func nestedRepos(root string) ([]string, error) {
 	var found []string
 	errStop := errors.New("stop")
@@ -369,7 +372,18 @@ func nestedRepos(root string) ([]string, error) {
 			return err
 		}
 		if d.Name() != ".git" {
-			return nil
+			if !d.IsDir() || path == root || !isGitDir(path) {
+				return nil
+			}
+			rel, relErr := filepath.Rel(root, path)
+			if relErr != nil {
+				return relErr
+			}
+			found = append(found, "nested-repo:"+filepath.ToSlash(rel))
+			if len(found) >= maxNestedReported {
+				return errStop
+			}
+			return fs.SkipDir
 		}
 		parent := filepath.Dir(path)
 		if parent == root {
@@ -395,6 +409,21 @@ func nestedRepos(root string) ([]string, error) {
 		return nil, fmt.Errorf("nested repo walk: %w", err)
 	}
 	return found, nil
+}
+
+// isGitDir is git's is_git_directory shape test: a HEAD file plus objects/
+// and refs/ directories — true for a bare repository or any git dir,
+// whatever its name.
+func isGitDir(dir string) bool {
+	if fi, err := os.Lstat(filepath.Join(dir, "HEAD")); err != nil || fi.IsDir() {
+		return false
+	}
+	for _, sub := range []string{"objects", "refs"} {
+		if fi, err := os.Stat(filepath.Join(dir, sub)); err != nil || !fi.IsDir() {
+			return false
+		}
+	}
+	return true
 }
 
 // sha12 clamps a short sha instead of panicking — FetchIntoQuarantine is an
