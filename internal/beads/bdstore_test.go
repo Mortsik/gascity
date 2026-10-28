@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2745,9 +2746,11 @@ func TestBdStoreReadyFiltersFutureDeferredRows(t *testing.T) {
 // dependency_count matches its inline blocking edges (which is what latches
 // the inline-projection witness), and the blocker lookup that follows answers
 // with the blocker row carrying blockerMetadata. Every "bd list" arg vector is
-// recorded so a test can pin that the lookup was closed-inclusive.
-func bdStoreWorkOutcomeReadyRunner(blockerMetadata string) (beads.CommandRunner, *[]string) {
+// recorded so a test can pin that the lookup was closed-inclusive; every
+// "bd query" arg vector (the wisp leg) is recorded alongside.
+func bdStoreWorkOutcomeReadyRunner(blockerMetadata string) (beads.CommandRunner, *[]string, *[]string) {
 	listArgs := &[]string{}
+	queryArgs := &[]string{}
 	readyRows := []byte(`[
 		{"id":"bd-dependent","title":"dependent","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z",
 		 "dependency_count":1,
@@ -2770,11 +2773,12 @@ func bdStoreWorkOutcomeReadyRunner(blockerMetadata string) (beads.CommandRunner,
 		case "query":
 			// The wisp leg of the TierBoth blocker lookup; the blocker is not
 			// ephemeral, so it has nothing to add.
+			*queryArgs = append(*queryArgs, strings.Join(args, " "))
 			return []byte(`[]`), nil
 		}
 		return nil, fmt.Errorf("unexpected command: %s %s", name, strings.Join(args, " "))
 	}
-	return runner, listArgs
+	return runner, listArgs, queryArgs
 }
 
 // TestBdStoreReadyExcludesDependentWhenBlockerClosedAsWorkOutcomeBlocked pins
@@ -2784,7 +2788,7 @@ func bdStoreWorkOutcomeReadyRunner(blockerMetadata string) (beads.CommandRunner,
 // the veto when the inline dependency projection is witnessed, which is why
 // the ready row carries a dependency_count matching its inline edges.
 func TestBdStoreReadyExcludesDependentWhenBlockerClosedAsWorkOutcomeBlocked(t *testing.T) {
-	runner, listArgs := bdStoreWorkOutcomeReadyRunner(`,"metadata":{"gc.work_outcome":"blocked"}`)
+	runner, listArgs, queryArgs := bdStoreWorkOutcomeReadyRunner(`,"metadata":{"gc.work_outcome":"blocked"}`)
 	s := beads.NewBdStore("/city", runner)
 	got, err := s.Ready()
 	if err != nil {
@@ -2803,6 +2807,19 @@ func TestBdStoreReadyExcludesDependentWhenBlockerClosedAsWorkOutcomeBlocked(t *t
 		if !strings.Contains(args, "--all") {
 			t.Fatalf("blocker lookup %q is not closed-inclusive: want --all", args)
 		}
+		// Closed-inclusive must not mean whole-ledger: without the IN-list
+		// pushed to bd, every Ready reads every closed bead in the store.
+		if !strings.Contains(args, "--id=bd-blocker") {
+			t.Fatalf("blocker lookup %q scans the closed ledger: want --id=bd-blocker", args)
+		}
+	}
+	if len(*queryArgs) == 0 {
+		t.Fatal("Ready() never issued the wisp leg of the blocker lookup")
+	}
+	for _, args := range *queryArgs {
+		if !strings.Contains(args, "AND id=bd-blocker") {
+			t.Fatalf("wisp leg of the blocker lookup %q does not carry the IN-list: want id=bd-blocker", args)
+		}
 	}
 }
 
@@ -2812,7 +2829,7 @@ func TestBdStoreReadyExcludesDependentWhenBlockerClosedAsWorkOutcomeBlocked(t *t
 // satisfy the dependency — the veto is narrow, not a re-block of every closed
 // blocker the lookup now returns.
 func TestBdStoreReadyKeepsDependentWhenBlockerClosedWithNoWorkOutcome(t *testing.T) {
-	runner, _ := bdStoreWorkOutcomeReadyRunner("")
+	runner, _, _ := bdStoreWorkOutcomeReadyRunner("")
 	s := beads.NewBdStore("/city", runner)
 	got, err := s.Ready()
 	if err != nil {
@@ -2830,7 +2847,7 @@ func TestBdStoreReadyKeepsDependentWhenBlockerClosedWithNoWorkOutcome(t *testing
 // changes). Vetoing the dependent here leaves the workflow waiting on work the
 // controller never counts as demand.
 func TestBdStoreReadyKeepsDependentWhenBlockerStepPassedDespiteWorkOutcomeBlocked(t *testing.T) {
-	runner, _ := bdStoreWorkOutcomeReadyRunner(`,"metadata":{"gc.step_ref":"review","gc.outcome":"pass","gc.work_outcome":"blocked"}`)
+	runner, _, _ := bdStoreWorkOutcomeReadyRunner(`,"metadata":{"gc.step_ref":"review","gc.outcome":"pass","gc.work_outcome":"blocked"}`)
 	s := beads.NewBdStore("/city", runner)
 	got, err := s.Ready()
 	if err != nil {
@@ -2846,7 +2863,7 @@ func TestBdStoreReadyKeepsDependentWhenBlockerStepPassedDespiteWorkOutcomeBlocke
 // work bead itself (no gc.step_ref) even when the work is blocked, so the pass
 // must not release the blocked work's dependents.
 func TestBdStoreReadyExcludesDependentWhenWorkBeadPassedWithWorkOutcomeBlocked(t *testing.T) {
-	runner, _ := bdStoreWorkOutcomeReadyRunner(`,"metadata":{"gc.outcome":"pass","gc.work_outcome":"blocked"}`)
+	runner, _, _ := bdStoreWorkOutcomeReadyRunner(`,"metadata":{"gc.outcome":"pass","gc.work_outcome":"blocked"}`)
 	s := beads.NewBdStore("/city", runner)
 	got, err := s.Ready()
 	if err != nil {
@@ -3372,15 +3389,15 @@ func TestBdStoreListPushesCallerLimitForIssuesTierDefaultSort(t *testing.T) {
 	}
 }
 
-// TestBdStoreListForcesUnboundedForIDs pins that ListQuery.IDs — a Go-side-
-// only residual filter bd list has no flag for — still forces --limit 0 so a
-// bd-side limit can never truncate before the ID match runs.
+// TestBdStoreListForcesUnboundedForIDs pins that ListQuery.IDs still forces
+// --limit 0 so a bd-side limit can never truncate before the Go-side ID match
+// runs, and that the IN-list is pushed to bd as --id.
 func TestBdStoreListForcesUnboundedForIDs(t *testing.T) {
 	runner := fakeRunner(map[string]struct {
 		out []byte
 		err error
 	}{
-		`bd list --json --label=bounded-caller --include-infra --include-gates --limit 0`: {
+		`bd list --json --label=bounded-caller --id=bd-b --include-infra --include-gates --limit 0`: {
 			out: []byte(`[
 				{"id":"bd-a","title":"a","status":"open","issue_type":"task","created_at":"2026-05-01T00:00:00Z","labels":["bounded-caller"]},
 				{"id":"bd-b","title":"b","status":"open","issue_type":"task","created_at":"2026-05-02T00:00:00Z","labels":["bounded-caller"]}
@@ -3394,6 +3411,334 @@ func TestBdStoreListForcesUnboundedForIDs(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].ID != "bd-b" {
 		t.Fatalf("got = %+v, want single bd-b matched Go-side after unbounded fetch", got)
+	}
+}
+
+// TestBdStoreListPushesClosedIDsInsteadOfScanningLedger pins the regression
+// behind a controller burning whole cores per city: a closed-inclusive IDs
+// lookup (the Ready work-outcome veto's blocker fetch) used to run
+// "bd list --status=closed --all --limit 0" with the IDs applied Go-side only,
+// so every Ready paid a read of every closed bead in the ledger (~10s and
+// ~900MB per call on a 30k-closed ledger). The IN-list must reach bd: --id on
+// the issues leg and an id OR-group on the wisps leg. IDs are sorted so the
+// argv is deterministic whatever order the caller built them in.
+func TestBdStoreListPushesClosedIDsInsteadOfScanningLedger(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd list --json --status=closed --all --id=bd-a,bd-b --include-infra --include-gates --include-templates --limit 0`: {
+			out: []byte(`[{"id":"bd-a","title":"a","status":"closed","issue_type":"task","created_at":"2026-05-01T00:00:00Z"}]`),
+		},
+		`bd query --json ephemeral=true AND status=closed AND (id=bd-a OR id=bd-b) --all --limit 0`: {
+			out: []byte(`[{"id":"bd-b","title":"b","status":"closed","issue_type":"task","created_at":"2026-05-02T00:00:00Z"}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{IDs: []string{"bd-b", "bd-a"}, Status: "closed", TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	gotIDs := make([]string, 0, len(got))
+	for _, b := range got {
+		gotIDs = append(gotIDs, b.ID)
+	}
+	sort.Strings(gotIDs)
+	if strings.Join(gotIDs, ",") != "bd-a,bd-b" {
+		t.Fatalf("got IDs %v, want [bd-a bd-b] merged from both tiers", gotIDs)
+	}
+}
+
+// TestBdStoreListSingleIDWispClauseHasNoOrGroup pins the one-ID shape of the
+// wisps-leg pushdown: a bare id= comparison keeps bd query on its filter-only
+// path instead of the predicate path an OR-group forces.
+func TestBdStoreListSingleIDWispClauseHasNoOrGroup(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd list --json --status=closed --all --id=bd-a --include-infra --include-gates --include-templates --limit 0`: {
+			out: []byte(`[]`),
+		},
+		`bd query --json ephemeral=true AND status=closed AND id=bd-a --all --limit 0`: {
+			out: []byte(`[{"id":"bd-a","title":"a","status":"closed","issue_type":"task","created_at":"2026-05-01T00:00:00Z"}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{IDs: []string{"bd-a"}, Status: "closed", TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "bd-a" {
+		t.Fatalf("got = %+v, want single bd-a", got)
+	}
+}
+
+// TestBdStoreListKeepsIDsGoSideWhenNotPushable pins the fallback: an ID that
+// cannot be passed through bd's comma-separated --id flag or a bare bd query
+// value leaves the read on its old unpushed shape, with the exact match still
+// done Go-side — the ListQuery.IDs contract lets a backend return a superset,
+// never a wrong subset.
+func TestBdStoreListKeepsIDsGoSideWhenNotPushable(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd list --json --label=bounded-caller --include-infra --include-gates --limit 0`: {
+			out: []byte(`[
+				{"id":"bd-a","title":"a","status":"open","issue_type":"task","created_at":"2026-05-01T00:00:00Z","labels":["bounded-caller"]},
+				{"id":"bd-b","title":"b","status":"open","issue_type":"task","created_at":"2026-05-02T00:00:00Z","labels":["bounded-caller"]}
+			]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{Label: "bounded-caller", IDs: []string{"bd-b", "bd-x,bd-a"}})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "bd-b" {
+		t.Fatalf("got = %+v, want single bd-b matched Go-side", got)
+	}
+}
+
+// TestBdStoreListWispLegLimitPushdownByIDShape pins when the wisps leg may
+// hand the caller's Limit to bd query. A single id= comparison is a store
+// filter, so the limit is safe. An OR-group is an in-memory predicate that bd
+// v1.0.4 runs over a limit-capped fetch with no id condition, and unpushed IDs
+// filter nothing server-side — both must fetch unbounded or matching IDs can be
+// cut before the Go-side match (ListQuery.IDs allows a superset, never a
+// subset).
+func TestBdStoreListWispLegLimitPushdownByIDShape(t *testing.T) {
+	row := func(id string) string {
+		return `{"id":"` + id + `","title":"t","status":"open","issue_type":"task","created_at":"2026-05-01T00:00:00Z","labels":["x"]}`
+	}
+	cases := []struct {
+		name      string
+		ids       []string
+		listArgv  string
+		queryArgv string
+		wantIDs   string
+	}{
+		{
+			name:      "single id keeps the bd-side limit",
+			ids:       []string{"bd-a"},
+			listArgv:  `bd list --json --label=x --id=bd-a --include-infra --include-gates --include-templates --limit 0`,
+			queryArgv: `bd query --json ephemeral=true AND label=x AND id=bd-a --limit 1`,
+			wantIDs:   "bd-a",
+		},
+		{
+			name:      "or-group fetches unbounded",
+			ids:       []string{"bd-b", "bd-a"},
+			listArgv:  `bd list --json --label=x --id=bd-a,bd-b --include-infra --include-gates --include-templates --limit 0`,
+			queryArgv: `bd query --json ephemeral=true AND label=x AND (id=bd-a OR id=bd-b) --limit 0`,
+			wantIDs:   "bd-a",
+		},
+		{
+			name:      "unpushable ids fetch unbounded",
+			ids:       []string{"bd-a", "bd-x,bd-y"},
+			listArgv:  `bd list --json --label=x --include-infra --include-gates --include-templates --limit 0`,
+			queryArgv: `bd query --json ephemeral=true AND label=x --limit 0`,
+			wantIDs:   "bd-a",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := fakeRunner(map[string]struct {
+				out []byte
+				err error
+			}{
+				tc.listArgv:  {out: []byte(`[]`)},
+				tc.queryArgv: {out: []byte(`[` + row("bd-a") + `]`)},
+			})
+			s := beads.NewBdStore("/city", runner)
+			got, err := s.List(beads.ListQuery{Label: "x", IDs: tc.ids, Limit: 1, TierMode: beads.TierWisps})
+			if err != nil {
+				t.Fatalf("List: %v", err)
+			}
+			if len(got) != 1 || got[0].ID != tc.wantIDs {
+				t.Fatalf("got = %+v, want single %s", got, tc.wantIDs)
+			}
+		})
+	}
+}
+
+// TestBdStoreListKeepsLexerHostileIDsOffWispClause pins that an ID bd's query
+// lexer cannot start a value with stays off the bd query leg (where a parse
+// error would fail the whole Ready through the work-outcome veto) while the
+// bd list leg still pushes it, since --id takes plain comma-separated strings.
+func TestBdStoreListKeepsLexerHostileIDsOffWispClause(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd list --json --status=closed --all --id=7d-x,bd-a --include-infra --include-gates --include-templates --limit 0`: {
+			out: []byte(`[{"id":"7d-x","title":"t","status":"closed","issue_type":"task","created_at":"2026-05-01T00:00:00Z"}]`),
+		},
+		`bd query --json ephemeral=true AND status=closed --all --limit 0`: {
+			out: []byte(`[]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{IDs: []string{"bd-a", "7d-x"}, Status: "closed", TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "7d-x" {
+		t.Fatalf("got = %+v, want single 7d-x", got)
+	}
+}
+
+// TestBdStoreListDedupesIDsAndSkipsEmpty pins the IN-list normalization: a
+// repeated ID is pushed once and an empty ID (which Matches can never match)
+// is dropped instead of cancelling the pushdown for the whole list.
+func TestBdStoreListDedupesIDsAndSkipsEmpty(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd list --json --label=x --id=bd-a,bd-b --include-infra --include-gates --limit 0`: {
+			out: []byte(`[{"id":"bd-b","title":"b","status":"open","issue_type":"task","created_at":"2026-05-01T00:00:00Z","labels":["x"]}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{Label: "x", IDs: []string{"bd-b", "", "bd-b", "bd-a"}})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "bd-b" {
+		t.Fatalf("got = %+v, want single bd-b", got)
+	}
+}
+
+// TestBdStoreListChunksLongIDLists pins that an IN-list longer than one argv
+// chunk is split into sorted chunks — one bd list round each — and the rows
+// are unioned, with the caller's sort and limit applied to the union rather
+// than per chunk. A Ready over a large city can carry more blockers than one
+// chunk; falling back to the whole-ledger read there would bring back the cost
+// the pushdown removes.
+func TestBdStoreListChunksLongIDLists(t *testing.T) {
+	ids := make([]string, 0, 300)
+	for i := 0; i < 300; i++ {
+		ids = append(ids, fmt.Sprintf("bd-%03d", i))
+	}
+	var calls []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		argv := strings.Join(args, " ")
+		calls = append(calls, argv)
+		if len(args) == 0 || args[0] != "list" {
+			return nil, fmt.Errorf("unexpected command: %s %s", name, argv)
+		}
+		for _, a := range args {
+			if !strings.HasPrefix(a, "--id=") {
+				continue
+			}
+			chunk := strings.Split(strings.TrimPrefix(a, "--id="), ",")
+			// Answer with the first and last ID of the chunk; created_at
+			// follows the ID so SortCreatedDesc orders the union by ID.
+			var rows []string
+			for _, id := range []string{chunk[0], chunk[len(chunk)-1]} {
+				n, _ := strconv.Atoi(strings.TrimPrefix(id, "bd-"))
+				rows = append(rows, fmt.Sprintf(`{"id":%q,"title":"t","status":"open","issue_type":"task","created_at":"2026-05-01T00:%02d:%02dZ","labels":["x"]}`, id, n/60, n%60))
+			}
+			return []byte("[" + strings.Join(rows, ",") + "]"), nil
+		}
+		return nil, fmt.Errorf("chunked read issued without --id: %s", argv)
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{Label: "x", IDs: ids, Limit: 3, Sort: beads.SortCreatedDesc})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("bd calls = %d (%v), want 2 chunks of <=256 IDs", len(calls), calls)
+	}
+	if !strings.Contains(calls[0], "--id=bd-000,") || !strings.Contains(calls[0], ",bd-255 ") {
+		t.Fatalf("first chunk = %q, want sorted bd-000..bd-255", calls[0])
+	}
+	if !strings.Contains(calls[1], "--id=bd-256,") || !strings.Contains(calls[1], ",bd-299 ") {
+		t.Fatalf("second chunk = %q, want sorted bd-256..bd-299", calls[1])
+	}
+	gotIDs := make([]string, 0, len(got))
+	for _, b := range got {
+		gotIDs = append(gotIDs, b.ID)
+	}
+	if strings.Join(gotIDs, ",") != "bd-299,bd-256,bd-255" {
+		t.Fatalf("got IDs %v, want union sorted newest-first and limited to 3", gotIDs)
+	}
+}
+
+// TestBdStoreListChunkedReadFailsOnAnyChunkError pins the chunked read's
+// error contract on the TierBoth shape the work-outcome veto uses: every chunk
+// pushes its IN-list on both legs (--id and an id OR-group), and a hard error
+// from a later chunk fails the whole read instead of returning the earlier
+// chunk's rows as if they were complete.
+func TestBdStoreListChunkedReadFailsOnAnyChunkError(t *testing.T) {
+	ids := make([]string, 0, 300)
+	for i := 0; i < 300; i++ {
+		ids = append(ids, fmt.Sprintf("bd-%03d", i))
+	}
+	var listCalls, queryCalls []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		argv := strings.Join(args, " ")
+		switch {
+		case len(args) > 0 && args[0] == "list":
+			listCalls = append(listCalls, argv)
+			if strings.Contains(argv, "--id=bd-256,") {
+				return nil, errors.New("dolt connection reset")
+			}
+			return []byte(`[{"id":"bd-000","title":"t","status":"closed","issue_type":"task","created_at":"2026-05-01T00:00:00Z"}]`), nil
+		case len(args) > 0 && args[0] == "query":
+			queryCalls = append(queryCalls, argv)
+			if strings.Contains(argv, "id=bd-256 OR") {
+				return nil, errors.New("dolt connection reset")
+			}
+			return []byte(`[]`), nil
+		}
+		return nil, fmt.Errorf("unexpected command: %s %s", name, argv)
+	}
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{IDs: ids, Status: "closed", TierMode: beads.TierBoth})
+	if err == nil {
+		t.Fatalf("List = %+v, nil error; want the failed chunk to fail the read", got)
+	}
+	var partial *beads.PartialResultError
+	if errors.As(err, &partial) {
+		t.Fatalf("err = %v, want a hard error, not a partial result", err)
+	}
+	if len(queryCalls) == 0 || !strings.Contains(queryCalls[0], "AND (id=bd-000 OR id=bd-001 OR") {
+		t.Fatalf("wisp leg calls = %v, want the first chunk's id OR-group", queryCalls)
+	}
+	for _, c := range listCalls {
+		if !strings.Contains(c, "--status=closed --all --id=") {
+			t.Fatalf("issues leg call %q, want a closed-inclusive --id read per chunk", c)
+		}
+	}
+}
+
+// TestBdStoreListFallsBackPastChunkBudget pins the other side of chunking: an
+// IN-list needing more than bdMaxPushedIDChunks rounds (the convoy ownership
+// probe sends 30000 IDs) is read in one unpushed bd list call instead of a
+// subprocess per chunk.
+func TestBdStoreListFallsBackPastChunkBudget(t *testing.T) {
+	ids := make([]string, 0, 1100)
+	for i := 0; i < 1100; i++ {
+		ids = append(ids, fmt.Sprintf("bd-%04d", i))
+	}
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd list --json --label=x --include-infra --include-gates --limit 0`: {
+			out: []byte(`[{"id":"bd-0007","title":"t","status":"open","issue_type":"task","created_at":"2026-05-01T00:00:00Z","labels":["x"]}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	got, err := s.List(beads.ListQuery{Label: "x", IDs: ids})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "bd-0007" {
+		t.Fatalf("got = %+v, want single bd-0007", got)
 	}
 }
 

@@ -3066,6 +3066,9 @@ func (s *BdStore) List(query ListQuery) ([]Bead, error) {
 // listByTier runs the query against bd. It is the body List wraps, so the
 // empty-result notice has exactly one place to sit across all three tier modes.
 func (s *BdStore) listByTier(query ListQuery) ([]Bead, error) {
+	if chunks := bdPushableIDChunks(query.IDs); len(chunks) > 1 {
+		return s.listByIDChunks(query, chunks)
+	}
 	switch query.TierMode {
 	case TierWisps:
 		return s.listWispsTier(query)
@@ -3096,6 +3099,9 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 	}
 	if serverQuery.IncludeClosed || serverQuery.Status == "closed" {
 		args = append(args, "--all")
+	}
+	if ids, ok := bdPushableIDs(serverQuery.IDs); ok {
+		args = append(args, "--id="+strings.Join(ids, ","))
 	}
 	if !serverQuery.CreatedBefore.IsZero() {
 		args = append(args, "--created-before", serverQuery.CreatedBefore.Format(time.RFC3339Nano))
@@ -3173,9 +3179,10 @@ func bdListRequiresClientLimit(query, serverQuery ListQuery, clientFilteredAssig
 	if serverQuery.SeekAfter != nil {
 		return true
 	}
-	// IDs is a Go-side-only residual filter (see ListQuery.Matches): bd list
-	// has no --id flag, so a bd-side limit could truncate before the
-	// matching IDs are even fetched.
+	// IDs stays a Go-side residual filter (see ListQuery.Matches) even when
+	// pushed as --id: an unpushable IN-list (bdPushableIDs) reaches bd as no
+	// filter at all, so a bd-side limit could truncate before the matching
+	// IDs are even fetched.
 	if len(serverQuery.IDs) > 0 {
 		return true
 	}
@@ -3229,6 +3236,20 @@ func (s *BdStore) listEphemeral(query ListQuery) ([]Bead, error) {
 	clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "type", serverQuery.Type)
 	clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "assignee", serverQuery.Assignee)
 	clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "parent", serverQuery.ParentID)
+	if len(serverQuery.IDs) > 0 {
+		ids, ok := bdPushableIDs(serverQuery.IDs)
+		if ok && bdQueryParsableIDs(ids) {
+			clauses = append(clauses, bdQueryIDClause(ids))
+		}
+		// Only a single id= comparison is filtered in the store. An OR-group
+		// runs as an in-memory predicate over rows the base clauses fetched,
+		// and bd caps that fetch by the requested limit BEFORE the predicate
+		// (bd v1.0.4: max(3N,100) rows with no id condition), so a bd-side
+		// limit could cut matching IDs. Unpushed IDs are the same case.
+		if !ok || !bdQueryParsableIDs(ids) || len(ids) > 1 {
+			serverFilteredOnly = false
+		}
+	}
 
 	args := []string{"query", "--json", strings.Join(clauses, " AND ")}
 	if serverQuery.IncludeClosed || serverQuery.Status == "closed" {
@@ -3338,6 +3359,163 @@ func canApplyWispsServerLimit(query ListQuery) bool {
 		query.UpdatedBefore.IsZero() &&
 		len(query.Metadata) == 0 &&
 		query.SeekAfter == nil
+}
+
+// bdMaxPushedIDs bounds the IN-list pushed into one bd argv; a longer list is
+// split into bdMaxPushedIDs-sized chunks, one bd round per chunk
+// (listByIDChunks).
+const bdMaxPushedIDs = 256
+
+// bdMaxPushedIDChunks bounds how many chunked bd rounds one List may spend on
+// an IN-list. Each round is a full bd subprocess (seconds of startup on a busy
+// host), so past this many a single whole-ledger read is the cheaper shape and
+// the IDs fall back to the Go-side match — the batched convoy ownership probe
+// (30000 IDs per call) is such a caller.
+const bdMaxPushedIDChunks = 4
+
+// bdPushableIDs reports whether ids can be pushed to bd as an IN-list through
+// the comma-separated `bd list --id` flag, and returns them deduplicated and
+// sorted so the argv is deterministic. Without the pushdown a closed-inclusive
+// IDs lookup reads every closed row of the issues ledger and matches Go-side:
+// on a 30k-closed city that is ~10s and ~900MB per call, paid on every Ready by
+// the work-outcome veto. Empty IDs are dropped (Matches can never match one).
+// An ID that is not a bare bd query value (commas, spaces, wildcards,
+// operators) or a list past bdMaxPushedIDs is not pushed; ListQuery.IDs lets a
+// backend return a superset, so the Go-side match keeps the result exact
+// either way.
+func bdPushableIDs(ids []string) ([]string, bool) {
+	seen := make(map[string]bool, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			continue
+		}
+		if !isBareBdQueryValue(id) {
+			return nil, false
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	if len(out) == 0 || len(out) > bdMaxPushedIDs {
+		return nil, false
+	}
+	sort.Strings(out)
+	return out, true
+}
+
+// bdPushableIDChunks splits a pushable IN-list longer than bdMaxPushedIDs into
+// sorted chunks of at most bdMaxPushedIDs, or returns nil when the list fits in
+// one round, is not pushable, or would need more than bdMaxPushedIDChunks
+// rounds. A Ready over a large city can hold more blockers than one argv
+// carries; falling back to the whole-ledger read there would bring back the
+// exact cost the pushdown exists to remove.
+func bdPushableIDChunks(ids []string) [][]string {
+	if len(ids) <= bdMaxPushedIDs {
+		return nil
+	}
+	seen := make(map[string]bool, len(ids))
+	uniq := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			continue
+		}
+		if !isBareBdQueryValue(id) {
+			return nil
+		}
+		seen[id] = true
+		uniq = append(uniq, id)
+	}
+	if len(uniq) <= bdMaxPushedIDs || len(uniq) > bdMaxPushedIDs*bdMaxPushedIDChunks {
+		return nil
+	}
+	sort.Strings(uniq)
+	chunks := make([][]string, 0, (len(uniq)+bdMaxPushedIDs-1)/bdMaxPushedIDs)
+	for start := 0; start < len(uniq); start += bdMaxPushedIDs {
+		chunks = append(chunks, uniq[start:min(start+bdMaxPushedIDs, len(uniq))])
+	}
+	return chunks
+}
+
+// listByIDChunks runs query once per ID chunk and unions the rows. Each chunk
+// already applied every filter; sort and limit are re-applied to the union
+// because a per-chunk limit only bounds that chunk. Under SortDefault the
+// union keeps chunk order (lowest IDs first), not bd's global default order,
+// so a Limit picks from the lowest chunks; no caller combines IDs with a
+// Limit today. A hard error from any chunk fails the read (a missing chunk
+// would silently drop rows); partial results are kept and reported as one
+// PartialResultError.
+func (s *BdStore) listByIDChunks(query ListQuery, chunks [][]string) ([]Bead, error) {
+	var merged []Bead
+	seen := make(map[string]int)
+	var partials []error
+	for _, chunk := range chunks {
+		chunkQ := query
+		chunkQ.IDs = chunk
+		rows, err := s.listByTier(chunkQ)
+		if err != nil {
+			var partial *PartialResultError
+			if !errors.As(err, &partial) {
+				return nil, err
+			}
+			partials = append(partials, err)
+		}
+		for _, b := range rows {
+			if idx, ok := seen[b.ID]; ok {
+				if b.Ephemeral && !merged[idx].Ephemeral {
+					merged[idx] = b
+				}
+				continue
+			}
+			seen[b.ID] = len(merged)
+			merged = append(merged, b)
+		}
+	}
+	sortBeadsForQuery(merged, query.Sort)
+	if query.Limit > 0 && len(merged) > query.Limit {
+		merged = merged[:query.Limit]
+	}
+	if len(partials) > 0 {
+		return merged, &PartialResultError{Op: "bd list id chunks", Err: errors.Join(partials...)}
+	}
+	return merged, nil
+}
+
+// bdQueryParsableIDs reports whether every id can stand as the value of a bd
+// query id= comparison. isBareBdQueryValue admits characters bd's lexer cannot
+// START a value with ("-x", ".x", ":x"), and bd v1.0.4 has no digit-led
+// identifier fallback ("123-a", "7d-x"); a clause bd cannot parse fails the
+// wisps leg, and the work-outcome veto fails the whole Ready on that error.
+// Such IDs stay unpushed on the bd query leg only — `bd list --id` takes them
+// as plain comma-separated strings.
+func bdQueryParsableIDs(ids []string) bool {
+	for _, id := range ids {
+		if id == "" {
+			return false
+		}
+		r := id[0]
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// bdQueryIDClause renders pushable ids as one bd query clause. A single ID
+// stays a bare comparison, which bd compiles into a store filter. An OR-group
+// does NOT narrow bd's store read: bd evaluates it as an in-memory predicate
+// over every row the other clauses select (for the work-outcome veto: every
+// closed wisp), so on the wisps leg it only trims the JSON returned. That is
+// still the cheaper shape — one bd subprocess per ID costs seconds of startup
+// each — and closed wisps are reaped (wisp_gc), unlike closed issues.
+func bdQueryIDClause(ids []string) string {
+	if len(ids) == 1 {
+		return "id=" + ids[0]
+	}
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = "id=" + id
+	}
+	return "(" + strings.Join(parts, " OR ") + ")"
 }
 
 func appendBdQueryClause(clauses []string, serverFilteredOnly bool, field, value string) ([]string, bool) {
