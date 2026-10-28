@@ -882,8 +882,8 @@ calls = 62
 [[count]]
 path = "cmd/gc/main_test.go"
 resource = "environment"
-calls = 6
-medium = 5
+calls = 8
+medium = 6
 
 [[count]]
 path = "cmd/gc/main_test.go"
