@@ -751,3 +751,29 @@ func TestGitProbeGuardRefusesOnNestedGitDirWithoutMarker(t *testing.T) {
 		})
 	}
 }
+
+// TestGitProbeGuardRefusesOnRepoInsideOwnGitDir: an independent bare
+// repository stored INSIDE the clone's own .git directory (not under
+// modules/) dies with os.RemoveAll — the inventory covers the whole tree,
+// the own git dir included (Web Sol REVIEW-GATE 2026-10-28 round 7).
+func TestGitProbeGuardRefusesOnRepoInsideOwnGitDir(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	git(t, clone, "checkout", "-q", "main")
+	git(t, clone, "branch", "-D", "work")
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	initRepo(t, src)
+	commitFile(t, src, "unique.txt")
+	git(t, clone, "clone", "-q", "--bare", src, filepath.Join(clone, ".git", "cache.git"))
+	if out := strings.TrimSpace(git(t, clone, "status", "--porcelain")); out != "" {
+		t.Fatalf("fixture: outer clone not clean: %q", out)
+	}
+
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(clone, rig), clone, "sess-75", &stderr)
+	if v.Secured || v.Reason != "non-head-refs-unsecured: nested-repo:.git/cache.git" {
+		t.Fatalf("verdict = %+v, want refuse non-head-refs-unsecured: nested-repo:.git/cache.git", v)
+	}
+}

@@ -358,8 +358,9 @@ func (g *GitProbe) unsecuredAmong(headBranch string, patterns ...string) ([]stri
 // maxNestedReported stops the nested-repo walk once a refusal is certain.
 const maxNestedReported = 11
 
-// nestedRepos walks root (skipping its own .git) and names every directory
-// below it that holds a .git file or directory, and every directory that IS
+// nestedRepos walks root — its own .git included, except modules/ and
+// worktrees/ (reported separately) — and names every directory below it
+// that holds a .git file or directory, and every directory that IS
 // a git dir without such a marker (a bare repository, the git dir of a
 // --separate-git-dir repository) by git's own shape test. An unreadable
 // subtree is an ERROR: the walk cannot prove the tree holds no other
@@ -367,40 +368,48 @@ const maxNestedReported = 11
 func nestedRepos(root string) ([]string, error) {
 	var found []string
 	errStop := errors.New("stop")
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	ownGit := filepath.Join(root, ".git")
+	report := func(dir string) error {
+		rel, err := filepath.Rel(root, dir)
 		if err != nil {
 			return err
-		}
-		if d.Name() != ".git" {
-			if !d.IsDir() || path == root || !isGitDir(path) {
-				return nil
-			}
-			rel, relErr := filepath.Rel(root, path)
-			if relErr != nil {
-				return relErr
-			}
-			found = append(found, "nested-repo:"+filepath.ToSlash(rel))
-			if len(found) >= maxNestedReported {
-				return errStop
-			}
-			return fs.SkipDir
-		}
-		parent := filepath.Dir(path)
-		if parent == root {
-			if d.IsDir() {
-				return fs.SkipDir // the clone's own git dir
-			}
-			return nil
-		}
-		rel, relErr := filepath.Rel(root, parent)
-		if relErr != nil {
-			return relErr
 		}
 		found = append(found, "nested-repo:"+filepath.ToSlash(rel))
 		if len(found) >= maxNestedReported {
 			return errStop
 		}
-		if d.IsDir() {
+		return nil
+	}
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			// A .git FILE below the root marks a linked or
+			// --separate-git-dir worktree.
+			if d.Name() == ".git" && path != ownGit {
+				return report(filepath.Dir(path))
+			}
+			return nil
+		}
+		switch path {
+		case root, ownGit:
+			// The clone itself and its own git dir: walked (a repository
+			// can hide inside .git too), never reported.
+			return nil
+		case filepath.Join(ownGit, "modules"), filepath.Join(ownGit, "worktrees"):
+			return fs.SkipDir // reported as submodule:* / worktree:*
+		}
+		switch {
+		case d.Name() == ".git":
+			if err := report(filepath.Dir(path)); err != nil {
+				return err
+			}
+			return fs.SkipDir
+		case isGitDir(path):
+			if err := report(path); err != nil {
+				return err
+			}
 			return fs.SkipDir
 		}
 		return nil
