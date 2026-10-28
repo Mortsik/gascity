@@ -60,10 +60,11 @@ var defaultWorkDirExportExcludes = []string{
 	".gc/mcp-locks/**",
 	".gc/dispatch-wake",
 
-	// Ledger copies: the file provider's store in every scope and the
-	// legacy JSONL archive.
+	// Ledger copies: the file provider's store (hot file and archive of old
+	// closed beads) in every scope and the legacy JSONL archive.
 	"**/.gc/beads.json",
 	"**/.gc/beads.json.bak",
+	"**/.gc/beads.archive.json*",
 	".gc/jsonl-archive/**",
 	".gc/jsonl-export-state.json",
 

@@ -153,6 +153,7 @@ go_test(
         "factory_library_backend_test.go",
         "factory_metadata_backend_test.go",
         "factory_test.go",
+        "filestore_archive_test.go",
         "filestore_atomic_close_test.go",
         "filestore_guarded_batch_test.go",
         "filestore_test.go",

@@ -786,7 +786,8 @@ func bdProviderMismatchHint(scopeRoot, resolvedProvider string) string {
 		return fmt.Sprintf(
 			"%s/.gc/beads.json exists, which marks this scope as file-backed. "+
 				"If it is a stale artifact from a previous city or pre-migration "+
-				"layout, move it aside (e.g., rename to .gc/beads.json.bak). To "+
+				"layout, move it aside (e.g., rename to .gc/beads.json.bak, and "+
+				"move .gc/beads.archive.json with it if present). To "+
 				"positively mark this scope as bd-backed, add "+
 				"%s/.beads/metadata.json (with backend=dolt and the dolt_database "+
 				"name).",

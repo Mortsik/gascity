@@ -42,6 +42,24 @@ type fileData struct {
 	// which is FAIL-SAFE — a stale guard sees a mismatch and refuses, never
 	// wrongly succeeds. Absent (legacy files) ≡ all zero.
 	Fences map[string]int64 `json:"fences,omitempty"`
+	// ArchiveTombstones (hot file only) lists archived copies that are no
+	// longer part of the store — beads deleted while archived, or an earlier
+	// incarnation of a reused ID — and may still be on disk until the archive
+	// is trimmed; the load merge drops them. See fileArchive.
+	ArchiveTombstones []string `json:"archive_tombstones,omitempty"`
+	// Archive (hot file only) declares that an archive accompanied this hot
+	// file when it was published, so a lock-free reader that then finds the
+	// archive trimmed or gone knows to recheck the hot file.
+	Archive bool `json:"archive,omitempty"`
+	// Order records creation-order keys for beads whose key the ID does not
+	// imply (see orderKey); the load merge interleaves hot and archive by it.
+	Order map[string][2]int64 `json:"order,omitempty"`
+	// ArchiveGen numbers archive rewrites. In the archive it is the file's
+	// own generation; in the hot file it is the generation the archive had
+	// when the hot file was published, which the trim that follows may bump
+	// by one. A cached archive outside those two is stale whatever its mtime
+	// and size say.
+	ArchiveGen int64 `json:"archive_gen,omitempty"`
 }
 
 // beadFences extracts the out-of-band ClaimFence map for persistence. Zero
@@ -148,6 +166,7 @@ type FileStore struct {
 	path      string
 	locker    Locker // cross-process file lock; nopLocker when unset
 	freshness fileFreshness
+	archive   *fileArchive // always set; see filestore_archive.go
 }
 
 var _ ConditionalAssignmentReleaser = (*FileStore)(nil)
@@ -224,9 +243,13 @@ func OpenFileStore(fs fsys.FS, path string, opts ...FileStoreOption) (*FileStore
 				path:      path,
 				locker:    locker,
 				freshness: fileFreshness{known: true},
+				archive:   newFileArchive(path),
 			}
 			for _, o := range opts {
 				o(store)
+			}
+			if err := store.mergeArchiveLocked(fileData{}); err != nil {
+				return nil, fmt.Errorf("opening file store: %w", err)
 			}
 			return store, nil
 		}
@@ -244,9 +267,13 @@ func OpenFileStore(fs fsys.FS, path string, opts ...FileStoreOption) (*FileStore
 		fs:       fs,
 		path:     path,
 		locker:   locker,
+		archive:  newFileArchive(path),
 	}
 	for _, o := range opts {
 		o(store)
+	}
+	if err := store.mergeArchiveLocked(fd); err != nil {
+		return nil, fmt.Errorf("opening file store: %w", err)
 	}
 	// The JSON we just loaded and the file's current freshness can diverge if
 	// another handle rewrites the store between ReadFile and a follow-up Stat.
@@ -269,6 +296,14 @@ func (fs *FileStore) reloadFromDisk() error {
 	data, err := fs.fs.ReadFile(fs.path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			// The archive is part of the store even before (or after) the
+			// hot file exists: it holds beads and the seq floor.
+			if err := fs.archive.load(fs.fs, fileData{}); err != nil {
+				return fmt.Errorf("reloading file store: %w", err)
+			}
+			if len(fs.archive.beads) > 0 {
+				return fs.mergeArchiveLocked(fileData{})
+			}
 			// File hasn't been created yet — keep current in-memory state.
 			return nil
 		}
@@ -280,8 +315,44 @@ func (fs *FileStore) reloadFromDisk() error {
 	}
 	applyBeadRevisionsSealed(&fd)
 	applyBeadFences(fd.Beads, fd.Fences)
-	fs.restoreFrom(fd.Seq, fd.Beads, fd.Deps)
+	return fs.mergeArchiveLocked(fd)
+}
+
+// mergeArchiveLocked replaces the in-memory state with the hot file content
+// fd unioned with the (refreshed) archive. Archived beads are deep-copied:
+// MemStore mutates beads in place and the archive cache must keep mirroring
+// the file.
+func (fs *FileStore) mergeArchiveLocked(fd fileData) error {
+	a := fs.archive
+	if err := a.load(fs.fs, fd); err != nil {
+		return fmt.Errorf("loading file store archive: %w", err)
+	}
+	archived := make([]Bead, len(a.beads))
+	for i, b := range a.beads {
+		archived[i] = cloneBead(b)
+	}
+	seq := fd.Seq
+	if a.seq > seq {
+		seq = a.seq
+	}
+	a.expected = fd.Archive
+	a.committedSeq = seq
+	merged, known := mergeArchive(fd.Beads, fd.Order, archived, a.order, fd.ArchiveTombstones)
+	a.known = known
+	fs.restoreFrom(seq, merged, fd.Deps)
 	return nil
+}
+
+// archiveExists reports whether an archive file is on disk (stat only).
+func (fs *FileStore) archiveExists() bool {
+	cur, err := fs.archive.currentFreshness(fs.fs)
+	return err != nil || cur.exists
+}
+
+// archiveFresh reports whether the cached archive still matches the file.
+func (fs *FileStore) archiveFresh() bool {
+	cur, err := fs.archive.currentFreshness(fs.fs)
+	return err == nil && fs.archive.freshness.same(cur)
 }
 
 func (fs *FileStore) currentFreshness() (fileFreshness, error) {
@@ -324,16 +395,62 @@ func (fs *FileStore) refreshReadStateLocked() error {
 		fs.freshness = fileFreshness{}
 		return nil
 	}
-	if fs.freshness.same(current) {
+	if fs.freshness.same(current) && fs.archiveFresh() {
 		return nil
 	}
-	if !current.exists {
+	if !current.exists && len(fs.archive.ids) == 0 && !fs.archiveExists() {
 		fs.restoreFrom(0, nil, nil)
 		fs.freshness = current
 		return nil
 	}
+	// Readers skip the writer lock, so with an archive a writer can publish
+	// the hot file and then trim (or remove) the archive between our two
+	// reads. Whenever an archive was or is in play — cached, found, or
+	// declared by the hot file just read — retry until the hot file is
+	// unchanged across the archive read.
+	for attempt := 0; ; attempt++ {
+		hadArchive := fs.archive.inPlay()
+		if !current.exists {
+			fs.restoreFrom(0, nil, nil)
+		}
+		if err := fs.reloadFromDisk(); err != nil {
+			return err
+		}
+		if !(hadArchive || fs.archive.inPlay()) {
+			break
+		}
+		after, err := fs.currentFreshness()
+		if err == nil && after.same(current) {
+			break
+		}
+		if err != nil || attempt >= 2 {
+			// Writers keep landing between our two reads: read once under
+			// the writer lock, where the pair cannot change.
+			return fs.reloadUnderWriterLockLocked()
+		}
+		current = after
+	}
+	fs.freshness = current
+	return nil
+}
+
+// reloadUnderWriterLockLocked reloads hot file and archive while holding the
+// cross-process writer lock, so no save can interleave. Must be called with
+// fmu held (the same order writers take the two locks in).
+func (fs *FileStore) reloadUnderWriterLockLocked() error {
+	if err := fs.locker.Lock(); err != nil {
+		return err
+	}
+	defer fs.locker.Unlock() //nolint:errcheck // best-effort unlock
+	current, statErr := fs.currentFreshness()
+	if statErr == nil && !current.exists {
+		fs.restoreFrom(0, nil, nil)
+	}
 	if err := fs.reloadFromDisk(); err != nil {
 		return err
+	}
+	if statErr != nil {
+		current = fileFreshness{}
 	}
 	fs.freshness = current
 	return nil
@@ -748,20 +865,16 @@ func (fs *FileStore) save() error {
 	seq, beads, deps := fs.snapshot()
 	fs.mu.Unlock()
 
-	fd := fileData{Seq: seq, Beads: beads, Deps: deps, Revisions: beadRevisions(beads), RevisionsSealed: true, Fences: beadFences(beads)}
-	// Compact, not indented: every mutation rewrites the whole file, so its
-	// size is the write volume (indentation was ~17% of a 90 MB city store).
-	data, err := json.Marshal(fd)
-	if err != nil {
-		return fmt.Errorf("saving file store: %w", err)
+	if fs.archive.mode == archiveOn || fs.archive.inPlay() {
+		err := fs.saveWithArchive(seq, beads, deps)
+		fs.refreshFreshnessCache()
+		return err
 	}
-
-	tmp := fs.path + ".tmp"
-	if err := fs.fs.WriteFile(tmp, data, 0o644); err != nil {
-		return fmt.Errorf("saving file store: %w", err)
-	}
-	if err := fs.fs.Rename(tmp, fs.path); err != nil {
-		return fmt.Errorf("saving file store: %w", err)
+	// ArchiveGen survives archive-less stretches: a later archive must not
+	// reuse a generation some other handle still has cached.
+	fd := fileData{Seq: seq, Beads: beads, Deps: deps, Revisions: beadRevisions(beads), RevisionsSealed: true, Fences: beadFences(beads), ArchiveGen: fs.archive.gen}
+	if err := writeStoreFile(fs.fs, fs.path, fd); err != nil {
+		return err
 	}
 	fs.refreshFreshnessCache()
 	return nil

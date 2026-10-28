@@ -736,3 +736,64 @@ prefix = "oe"
 		})
 	}
 }
+
+// An invalid file_archive_after must fail the file store open rather than be
+// silently ignored (say, a mistyped "off" before a rollback) — also when the
+// rest of the config does not load, where the store otherwise still opens
+// with defaults (gc doctor --fix and config-less commands rely on that).
+func TestOpenScopeLocalFileStoreRejectsInvalidFileArchiveAfter(t *testing.T) {
+	configureIsolatedRuntimeEnv(t)
+	t.Setenv("GC_BEADS", "file")
+
+	cityDir := t.TempDir()
+	if err := ensureScopedFileStoreLayout(cityDir); err != nil {
+		t.Fatal(err)
+	}
+	writeProviderAwareTestCity(t, cityDir, "[workspace]\nname = \"demo\"\n\n[beads]\nfile_archive_after = \"10m\"\n")
+	if err := ensurePersistedScopeLocalFileStore(cityDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openScopeLocalFileStoreForCity(cityDir, cityDir); err == nil || !strings.Contains(err.Error(), "file_archive_after") {
+		t.Fatalf("open with invalid file_archive_after = %v, want a file_archive_after error", err)
+	}
+
+	writeProviderAwareTestCity(t, cityDir, "[workspace]\nname = \"demo\"\n\n[beads]\nfile_archive_after = \"24h\"\n")
+	if _, err := openScopeLocalFileStoreForCity(cityDir, cityDir); err != nil {
+		t.Fatalf("open with valid file_archive_after: %v", err)
+	}
+
+	// A config that fails to load for another reason (a missing include)
+	// still opens — but not past an invalid archive setting.
+	legacy := "include = [\"missing.toml\"]\n\n[workspace]\nname = \"demo\"\n\n[beads]\nfile_archive_after = "
+	writeProviderAwareTestCity(t, cityDir, legacy+"\"24h\"\n")
+	if _, _, err := config.LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityDir, "city.toml")); err == nil {
+		t.Fatalf("precondition: the city config must fail to load")
+	}
+	writeProviderAwareTestCity(t, cityDir, legacy+"\"24h\"\n")
+	if _, err := openScopeLocalFileStoreForCity(cityDir, cityDir); err != nil {
+		t.Fatalf("open with a non-loading config and a valid file_archive_after: %v", err)
+	}
+	// From the root file alone archiving never starts (an include could say
+	// "off"); only "off" is honored.
+	for value, wantOpts := range map[string]int{"\"24h\"": 0, "\"off\"": 1} {
+		writeProviderAwareTestCity(t, cityDir, legacy+value+"\n")
+		opts, err := fileStoreOpts(cityDir, cityDir)
+		if err != nil || len(opts) != wantOpts {
+			t.Fatalf("fileStoreOpts with a non-loading config and file_archive_after = %s: %d opts, %v; want %d", value, len(opts), err, wantOpts)
+		}
+	}
+	for _, bad := range []string{"\"10m\"", "24"} { // too short; not a string
+		writeProviderAwareTestCity(t, cityDir, legacy+bad+"\n")
+		if _, err := openScopeLocalFileStoreForCity(cityDir, cityDir); err == nil || !strings.Contains(err.Error(), "file_archive_after") {
+			t.Fatalf("open with a non-loading config and file_archive_after = %s: %v, want a file_archive_after error", bad, err)
+		}
+	}
+
+	bare := t.TempDir()
+	if err := ensurePersistedScopeLocalFileStore(bare); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openScopeLocalFileStoreForCity(bare, bare); err != nil {
+		t.Fatalf("open without a city.toml: %v", err)
+	}
+}

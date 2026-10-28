@@ -1573,7 +1573,11 @@ func openScopeLocalFileStore(scopeRoot string) (*beads.FileStore, error) {
 // blank cityPath falls back to ambient city resolution.
 func openScopeLocalFileStoreForCity(scopeRoot, cityPath string) (*beads.FileStore, error) {
 	beadsPath := filepath.Join(scopeRoot, ".gc", "beads.json")
-	store, err := beads.OpenFileStore(fsys.OSFS{}, beadsPath, fileStoreIDPrefixOpts(scopeRoot, cityPath)...)
+	opts, err := fileStoreOpts(scopeRoot, cityPath)
+	if err != nil {
+		return nil, err
+	}
+	store, err := beads.OpenFileStore(fsys.OSFS{}, beadsPath, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1581,35 +1585,63 @@ func openScopeLocalFileStoreForCity(scopeRoot, cityPath string) (*beads.FileStor
 	return store, nil
 }
 
-// fileStoreIDPrefixOpts resolves the bead-ID prefix a file store at scopeRoot
-// should mint under, so a multi-rig file-backed city does not collide on gc-N
-// across stores (bd/dolt/exec stores already carry their scope's prefix; the
-// file store was the only path that didn't). Returns no option — leaving the
-// default "gc" — when the city config can't be resolved, matching prior
-// behavior for single-scope callers and tests.
-func fileStoreIDPrefixOpts(scopeRoot, cityPath string) []beads.FileStoreOption {
-	if prefix := effectiveFileStorePrefix(scopeRoot, cityPath); prefix != "" {
-		return []beads.FileStoreOption{beads.WithFileStoreIDPrefix(prefix)}
-	}
-	return nil
-}
-
-// effectiveFileStorePrefix maps a store scope root to its configured prefix:
-// the owning rig's EffectivePrefix, or the city HQ prefix for the city store.
-// cityPath names the city that owns the scope; a blank one is resolved from
-// ambient context. Empty when config is unavailable (e.g. tests that open a
-// bare dir).
-func effectiveFileStorePrefix(scopeRoot, cityPath string) string {
+// fileStoreOpts resolves the options a file store at scopeRoot opens with,
+// from one read of the owning city's config:
+//
+//   - the bead-ID prefix, so a multi-rig file-backed city does not collide on
+//     gc-N across stores (bd/dolt/exec stores already carry their scope's
+//     prefix; the file store was the only path that didn't);
+//   - [beads] file_archive_after, which moves long-closed beads out of the hot
+//     beads.json that every mutation rewrites (see beads.WithFileStoreArchive).
+//
+// Returns no options — the default "gc" prefix, archive left as it is — when
+// there is no city to read (no city resolves, or it has no city.toml),
+// matching prior behavior for single-scope callers and tests. That cannot
+// hide beads (a file store always reads an existing archive) and does not
+// churn it: only an explicit "off" folds it back. A city.toml that does not
+// fully load still opens its stores with the default prefix, as before
+// (gc doctor --fix and config-less commands depend on that), honoring an
+// "off" in the root file; an invalid file_archive_after is an error either
+// way, so a mistyped "off" before a rollback cannot go unnoticed.
+func fileStoreOpts(scopeRoot, cityPath string) ([]beads.FileStoreOption, error) {
 	if strings.TrimSpace(cityPath) == "" {
 		var err error
 		if cityPath, err = resolveCity(); err != nil {
-			return ""
+			return nil, nil
 		}
 	}
-	cfg, _, err := config.LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"))
-	if err != nil {
-		return ""
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	if _, err := os.Stat(tomlPath); os.IsNotExist(err) {
+		return nil, nil
 	}
+	var opts []beads.FileStoreOption
+	beadsCfg := config.BeadsConfig{}
+	fullConfig := false
+	if cfg, _, err := config.LoadWithIncludes(fsys.OSFS{}, tomlPath); err == nil {
+		if prefix := fileStorePrefixFromConfig(cfg, scopeRoot, cityPath); prefix != "" {
+			opts = append(opts, beads.WithFileStoreIDPrefix(prefix))
+		}
+		beadsCfg, fullConfig = cfg.Beads, true
+	} else if beadsCfg, err = config.ReadRootFileArchiveAfter(fsys.OSFS{}, tomlPath); err != nil {
+		return nil, fmt.Errorf("opening file store at %s: %w", scopeRoot, err)
+	}
+	after, set, err := beadsCfg.FileArchiveAfterDuration()
+	if err != nil {
+		return nil, fmt.Errorf("opening file store at %s: %w", scopeRoot, err)
+	}
+	// From the root file alone only "off" is honored: an include could
+	// override a root duration with "off", so archiving never starts from a
+	// config that did not fully load (the archive is kept as it is instead).
+	if set && (fullConfig || after <= 0) {
+		opts = append(opts, beads.WithFileStoreArchive(after))
+	}
+	return opts, nil
+}
+
+// fileStorePrefixFromConfig maps a store scope root to its configured prefix:
+// the owning rig's EffectivePrefix, or the city HQ prefix for the city store.
+// Empty when scopeRoot belongs to neither.
+func fileStorePrefixFromConfig(cfg *config.City, scopeRoot, cityPath string) string {
 	for i := range cfg.Rigs {
 		rig := cfg.Rigs[i]
 		if strings.TrimSpace(rig.Path) == "" {

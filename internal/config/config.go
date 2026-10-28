@@ -1478,6 +1478,19 @@ type BeadsConfig struct {
 	// GC_BEADS_FORCE_FALLBACK remains a deprecated process-wide alias for
 	// "off" that overrides every city's value for one release.
 	NativeTransport string `toml:"native_transport,omitempty" jsonschema:"default=auto,enum=auto,enum=off"`
+	// FileArchiveAfter, for file-backed stores (provider = "file"), moves
+	// closed beads not updated for this long out of the hot .gc/beads.json —
+	// which is rewritten whole on every mutation — into .gc/beads.archive.json,
+	// rewritten only when the archived set changes. Queries still see every
+	// bead. Go duration, at least 1h. Unset (the default) archives nothing new
+	// and leaves an existing archive as it is; "off" (or "0") folds archived
+	// beads back into beads.json on the next write and removes the archive.
+	// gc binaries older than this setting read only beads.json: before
+	// rolling back to one, set "off", restart long-running gc processes
+	// (supervisor, API — they keep the value they started with), let a write
+	// happen, and check that .gc/beads.archive.json is gone (a failed removal
+	// is only logged and retried by later writes).
+	FileArchiveAfter string `toml:"file_archive_after,omitempty"`
 	// Policies defines per-bead-use storage and garbage-collection defaults.
 	// Policy names are interpreted by higher-level systems; unknown names are
 	// preserved so packs can stage future policy classes without breaking load.
@@ -5032,7 +5045,7 @@ func Parse(data []byte) (*City, error) {
 }
 
 // validateBeadsModes rejects an out-of-enum value in any [beads] mode field
-// (conditional_writes, guarded_release, native_transport). Parse runs it on
+// (conditional_writes, guarded_release, native_transport, file_archive_after). Parse runs it on
 // its single layer and LoadWithIncludesOptions runs it again on the composed
 // root, because a fragment may supply any of these fields; one shared list
 // keeps the two load paths from drifting when a field is added.
@@ -5041,6 +5054,9 @@ func validateBeadsModes(b BeadsConfig) error {
 		return err
 	}
 	if err := validateGuardedRelease(b.GuardedRelease); err != nil {
+		return err
+	}
+	if err := validateFileArchiveAfter(b); err != nil {
 		return err
 	}
 	return validateNativeTransport(b.NativeTransport)

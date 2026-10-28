@@ -1158,7 +1158,11 @@ func mergeFragment(base, fragment *City, fragMeta toml.MetaData, fragPath string
 		allowSchemaBehindMigrate := base.Beads.AllowSchemaBehindMigrate
 		proxiedIdleTimeout := base.Beads.ProxiedIdleTimeout
 		nativeTransport := base.Beads.NativeTransport
+		fileArchiveAfter := base.Beads.FileArchiveAfter
 		base.Beads = fragment.Beads
+		if !fragMeta.IsDefined("beads", "file_archive_after") {
+			base.Beads.FileArchiveAfter = fileArchiveAfter
+		}
 		if !fragMeta.IsDefined("beads", "conditional_writes") {
 			base.Beads.ConditionalWrites = conditionalWrites
 		}

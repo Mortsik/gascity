@@ -114,3 +114,21 @@ func (m *MemStore) WriteRowForTest(id string, mutate func(*Bead)) {
 	}
 	panic("WriteRowForTest: no row " + id)
 }
+
+// AgeFileStoreBeadsForTest moves every bead's UpdatedAt d into the past and
+// saves, so archive tests age beads out without sleeping (MemStore stamps the
+// wall clock). Beads updated afterwards stay recent; CreatedAt — part of a
+// bead's identity — is left alone.
+func AgeFileStoreBeadsForTest(s *FileStore, d time.Duration) error {
+	s.fmu.Lock()
+	defer s.fmu.Unlock()
+	if err := s.reloadFromDisk(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	for i := range s.beads {
+		s.beads[i].UpdatedAt = s.beads[i].UpdatedAt.Add(-d)
+	}
+	s.mu.Unlock()
+	return s.save()
+}
