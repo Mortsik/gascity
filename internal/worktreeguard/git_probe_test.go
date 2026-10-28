@@ -502,3 +502,26 @@ func TestGitProbeGuardRefusesStandaloneWithOwnLinkedWorktree(t *testing.T) {
 		t.Fatalf("verdict = %+v, want refuse naming worktree:inner-wt", v)
 	}
 }
+
+// TestGitProbeGuardRefusesStandaloneWithNestedRepo: a gitignored repository
+// nested inside a standalone clone is invisible to status and to the
+// clone's refs, and os.RemoveAll takes it along (local_critic round 2).
+func TestGitProbeGuardRefusesStandaloneWithNestedRepo(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	git(t, clone, "checkout", "-q", "main")
+	git(t, clone, "branch", "-D", "work")
+	nested := filepath.Join(clone, "vendor", "lib")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("mkdir nested: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(clone, ".git", "info", "exclude"), []byte("vendor/\n"), 0o644); err != nil {
+		t.Fatalf("exclude: %v", err)
+	}
+	initRepo(t, nested)
+	commitFile(t, nested, "only-copy.txt")
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(clone, rig), clone, "sess-68", &stderr)
+	if v.Secured || !strings.Contains(v.Reason, "nested-repo:vendor/lib") {
+		t.Fatalf("verdict = %+v, want refuse naming nested-repo:vendor/lib", v)
+	}
+}

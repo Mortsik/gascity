@@ -10,6 +10,7 @@ package worktreeguard
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -220,8 +221,9 @@ func (g *GitProbe) VerifyQuarantied(headSha string) error {
 // HEAD's own branch, whose target is not secured in the rig repository
 // (securedInRig: a secured tip carries its whole history; an annotated tag
 // object must itself exist there). The clone's OWN linked worktrees
-// ("worktree:<name>") are reported unsecured outright: their HEADs and
-// per-worktree refs live in <gitdir>/worktrees/ and die with the clone.
+// ("worktree:<name>") and any repository nested inside its tree
+// ("nested-repo:<relpath>" — typically gitignored, so invisible to status)
+// are reported unsecured outright: their HEADs and refs die with the clone.
 //
 // A linked worktree (.git FILE) has none to lose: its refs live in the
 // shared repository and survive the directory's removal. That premise holds
@@ -242,6 +244,11 @@ func (g *GitProbe) UnsecuredRefs(headBranch string) ([]string, error) {
 	for _, e := range entries {
 		unsecured = append(unsecured, "worktree:"+e.Name())
 	}
+	nested, err := nestedRepos(g.repoPath)
+	if err != nil {
+		return nil, err
+	}
+	unsecured = append(unsecured, nested...)
 	out, err := gitOut(g.repoPath, "for-each-ref", "--format=%(objectname) %(refname)")
 	if err != nil {
 		return nil, fmt.Errorf("ref listing: %w", err)
@@ -266,6 +273,48 @@ func (g *GitProbe) UnsecuredRefs(headBranch string) ([]string, error) {
 		}
 	}
 	return unsecured, nil
+}
+
+// maxNestedReported stops the nested-repo walk once a refusal is certain.
+const maxNestedReported = 11
+
+// nestedRepos walks root (skipping its own .git) and names every directory
+// below it that holds a .git file or directory. An unreadable subtree is an
+// ERROR: the walk cannot prove the tree holds no other repository.
+func nestedRepos(root string) ([]string, error) {
+	var found []string
+	errStop := errors.New("stop")
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Name() != ".git" {
+			return nil
+		}
+		parent := filepath.Dir(path)
+		if parent == root {
+			if d.IsDir() {
+				return fs.SkipDir // the clone's own git dir
+			}
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, parent)
+		if relErr != nil {
+			return relErr
+		}
+		found = append(found, "nested-repo:"+filepath.ToSlash(rel))
+		if len(found) >= maxNestedReported {
+			return errStop
+		}
+		if d.IsDir() {
+			return fs.SkipDir
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errStop) {
+		return nil, fmt.Errorf("nested repo walk: %w", err)
+	}
+	return found, nil
 }
 
 // sha12 clamps a short sha instead of panicking — FetchIntoQuarantine is an
