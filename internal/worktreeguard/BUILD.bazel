@@ -16,9 +16,13 @@ go_test(
     srcs = [
         "git_probe_test.go",
         "guard_test.go",
+        "testenv_import_test.go",
     ],
     embed = [":worktreeguard"],
-    deps = ["//internal/testutil"],
+    deps = [
+        "//internal/testenv",
+        "//internal/testutil",
+    ],
 )
 
 # --- bazel_repo_srcs (managed by tools/bazel/repo_tree.py) ---
