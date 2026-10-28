@@ -8684,3 +8684,33 @@ func TestDefaultDoltReadTimeoutMillisPreservesOuterDeadlineHeadroom(t *testing.T
 			DefaultDoltReadTimeoutMillis, DefaultDoltWriteTimeoutMillis)
 	}
 }
+
+func TestDaemonWorktreeRemovalGuardDefault(t *testing.T) {
+	d := DaemonConfig{}
+	if !d.WorktreeRemovalGuardEnabled() {
+		t.Errorf("WorktreeRemovalGuardEnabled() = false, want true (default)")
+	}
+}
+
+func TestDaemonWorktreeRemovalGuardExplicitFalse(t *testing.T) {
+	v := false
+	d := DaemonConfig{WorktreeRemovalGuard: &v}
+	if d.WorktreeRemovalGuardEnabled() {
+		t.Errorf("WorktreeRemovalGuardEnabled() = true, want false (kill switch)")
+	}
+}
+
+func TestDaemonWorktreeRemovalGuardExplicitTrue(t *testing.T) {
+	v := true
+	d := DaemonConfig{WorktreeRemovalGuard: &v}
+	if !d.WorktreeRemovalGuardEnabled() {
+		t.Errorf("WorktreeRemovalGuardEnabled() = false, want true")
+	}
+}
+
+func TestDaemonWorktreeRemovalGuardNilReceiver(t *testing.T) {
+	var d *DaemonConfig
+	if !d.WorktreeRemovalGuardEnabled() {
+		t.Errorf("nil WorktreeRemovalGuardEnabled() = false, want true (nil-safe default)")
+	}
+}

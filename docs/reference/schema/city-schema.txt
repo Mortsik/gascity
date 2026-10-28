@@ -1491,7 +1491,7 @@
         },
         "auto_reap_closed_bead_worktrees": {
           "type": "boolean",
-          "description": "AutoReapClosedBeadWorktrees controls whether the reconciler patrol\nautomatically removes per-bead git worktrees once their associated\nwork bead reaches closed status. Only worktrees with a clean working\ntree, no stashes, and no commits that removal would orphan — commits\nreachable from no branch, tag, or remote-tracking ref — are removed;\npush state is deliberately not the test, since `git worktree remove`\ndeletes the checkout and not refs/heads. Unsafe worktrees are logged\nas warnings and left in place for operator review. Session\nhome directories (agent template directories) are never touched.\nDefaults to false. Set to true to enable automated worktree cleanup.",
+          "description": "AutoReapClosedBeadWorktrees controls whether the reconciler patrol\nautomatically removes per-bead git worktrees once their associated\nwork bead reaches closed status. Only worktrees with a clean working\ntree, no stashes, and no commits that removal would orphan — commits\nreachable from no branch, tag, or remote-tracking ref — are removed;\npush state is deliberately not the test, since `git worktree remove`\ndeletes the checkout and not refs/heads. Unsafe worktrees are logged\nas warnings and left in place for operator review. Session\nhome directories (agent template directories) are never touched.\nWith WorktreeRemovalGuard on (the default) the orphan-commit test is\nreplaced by the worktreeguard gate, and standalone clones under the\nrig's worktree tree become reap candidates too.\nDefaults to false. Set to true to enable automated worktree cleanup.",
           "default": false
         },
         "auto_reap_closed_bead_worktrees_dry_run": {
@@ -1515,7 +1515,12 @@
         },
         "auto_prune_worker_dir": {
           "type": "boolean",
-          "description": "AutoPruneWorkerDir controls whether the reconciler removes a\npool-managed session's worker_dir (agent worktree) after the session\nbead is closed. Removal is gated on: path lives under the city's\n.gc/worktrees/ tree, clean working tree, no unpushed commits, no\nstashed work. Nil (unset) defaults to true so pool worktrees do not\naccumulate without bound across pool recycles. Set to false to\nretain worktrees for post-session diagnostics.",
+          "description": "AutoPruneWorkerDir controls whether the reconciler removes a\npool-managed session's worker_dir (agent worktree) after the session\nbead is closed. Removal is gated on: path lives under the city's\n.gc/worktrees/ tree, clean working tree, no unpushed commits, no\nstashed work. With WorktreeRemovalGuard on (the default) the\nunpushed-commits test is replaced by the worktreeguard gate. Nil\n(unset) defaults to true so pool worktrees do not accumulate without\nbound across pool recycles. Set to false to retain worktrees for\npost-session diagnostics.",
+          "default": true
+        },
+        "worktree_removal_guard": {
+          "type": "boolean",
+          "description": "WorktreeRemovalGuard controls whether the two legacy worktree-removal\nsurfaces (session worker_dir prune and the closed-bead worktree\nreaper) run the worktreeguard reachability gate before removing a\ndirectory under .gc/worktrees/: a copy of the doomed HEAD must exist\nOUTSIDE the directory (already in the rig repo, or fetched into\nrefs/gc-quarantine/\u003cid\u003e/\u003cbranch\u003e-\u003csha12\u003e) before removal may proceed;\notherwise the tree is kept and the refusal is logged. Every copy logs\none \"worktreeguard: secured-copy … ref=…\" line. Quarantine refs are\nnever pruned automatically: list them with `git for-each-ref\nrefs/gc-quarantine/` in the rig repo, restore one with `git branch\n\u003cname\u003e \u003cref\u003e`, drop one with `git update-ref -d \u003cref\u003e`. Default true — the incident class it\nprevents (agent-forge 3zf46 / ga0r1.1.1, 2026-10-14: a standalone\nexecutor clone holding the ONLY copy of an unpushed branch was deleted\nby pool cleanup) loses work silently. Set to false to restore the\nlegacy probes verbatim (rollback lever).",
           "default": true
         }
       },

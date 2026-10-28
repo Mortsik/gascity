@@ -151,6 +151,9 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_HasUncommitted(t *testing.T) {
 
 func TestPruneAgentHomeWorktreeIfSafeInfo_HasUnpushed(t *testing.T) {
 	fx := newPruneFixture(t)
+	// Pins the LEGACY gate (guard off): the unpushed probe drives the refusal.
+	off := false
+	fx.cfg.Daemon.WorktreeRemovalGuard = &off
 	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, hasUnpushed: true, currentBranch: "builder/ga-def456"})
 
 	var stderr bytes.Buffer
@@ -163,6 +166,9 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_HasUnpushed(t *testing.T) {
 
 func TestPruneAgentHomeWorktreeIfSafeInfo_UnpushedProbeError(t *testing.T) {
 	fx := newPruneFixture(t)
+	// Pins the LEGACY gate (guard off): probe error fails closed.
+	off := false
+	fx.cfg.Daemon.WorktreeRemovalGuard = &off
 	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, unpushedErr: errors.New("boom")})
 
 	var stderr bytes.Buffer
@@ -199,6 +205,9 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_StashProbeError(t *testing.T) {
 
 func TestPruneAgentHomeWorktreeIfSafeInfo_RigPathUnresolved(t *testing.T) {
 	fx := newPruneFixture(t)
+	// Pins the LEGACY shape (guard off): unresolved rig, no stale marker.
+	off := false
+	fx.cfg.Daemon.WorktreeRemovalGuard = &off
 	fx.cfg.Rigs = nil
 	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true})
 
@@ -257,6 +266,49 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_NilConfig(t *testing.T) {
 	fx := newPruneFixture(t)
 	var stderr bytes.Buffer
 	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, nil, &stderr)
+}
+
+func (fx *realPruneFixture) sessionInfo() sessionpkg.Info {
+	return sessionpkg.Info{
+		ID:                  "session-1",
+		WorkerDir:           fx.workerDir,
+		Template:            "demo/polecat",
+		SessionNameMetadata: "demo/polecat-7",
+	}
+}
+
+// Guard ON (default) through the session.Info form: an unpushed standalone
+// clone is secured into the rig repo's quarantine namespace and removed.
+func TestPruneAgentHomeWorktreeIfSafeInfo_GuardSecuresStandaloneClone(t *testing.T) {
+	fx := newRealPruneFixture(t)
+
+	var stderr bytes.Buffer
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, &stderr)
+	if _, err := os.Stat(fx.workerDir); !os.IsNotExist(err) {
+		t.Fatalf("worker dir still present after secured prune: %v", err)
+	}
+	refs := runPruneGit(t, fx.rigRoot, "for-each-ref", "--format=%(refname)", "refs/gc-quarantine/")
+	if !strings.Contains(refs, "refs/gc-quarantine/session-1/work") {
+		t.Fatalf("quarantine refs = %q, want refs/gc-quarantine/session-1/work", refs)
+	}
+}
+
+// Guard ON, unusable rig through the Info form: refusal leaves the dir intact
+// and writes the branch-unsecured stale marker.
+func TestPruneAgentHomeWorktreeIfSafeInfo_GuardRefuseMarksBranchUnsecured(t *testing.T) {
+	fx := newRealPruneFixture(t)
+	notRig := filepath.Join(t.TempDir(), "not-a-repo")
+	if err := os.MkdirAll(notRig, 0o755); err != nil {
+		t.Fatalf("mkdir notRig: %v", err)
+	}
+	fx.cfg.Rigs[0].Path = notRig
+
+	var stderr bytes.Buffer
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, &stderr)
+	if _, err := os.Stat(fx.workerDir); err != nil {
+		t.Fatalf("worker dir must stay intact after refusal: %v", err)
+	}
+	assertWorktreeStaleMarker(t, fx.workerDir, "work", "branch-unsecured")
 }
 
 func TestLookupRigRootForSessionInfo(t *testing.T) {

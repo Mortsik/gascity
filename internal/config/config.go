@@ -2826,6 +2826,9 @@ type DaemonConfig struct {
 	// deletes the checkout and not refs/heads. Unsafe worktrees are logged
 	// as warnings and left in place for operator review. Session
 	// home directories (agent template directories) are never touched.
+	// With WorktreeRemovalGuard on (the default) the orphan-commit test is
+	// replaced by the worktreeguard gate, and standalone clones under the
+	// rig's worktree tree become reap candidates too.
 	// Defaults to false. Set to true to enable automated worktree cleanup.
 	AutoReapClosedBeadWorktrees *bool `toml:"auto_reap_closed_bead_worktrees,omitempty" jsonschema:"default=false"`
 	// AutoReapClosedBeadWorktreesDryRun makes the reconciler patrol run the
@@ -2879,10 +2882,38 @@ type DaemonConfig struct {
 	// pool-managed session's worker_dir (agent worktree) after the session
 	// bead is closed. Removal is gated on: path lives under the city's
 	// .gc/worktrees/ tree, clean working tree, no unpushed commits, no
-	// stashed work. Nil (unset) defaults to true so pool worktrees do not
-	// accumulate without bound across pool recycles. Set to false to
-	// retain worktrees for post-session diagnostics.
+	// stashed work. With WorktreeRemovalGuard on (the default) the
+	// unpushed-commits test is replaced by the worktreeguard gate. Nil
+	// (unset) defaults to true so pool worktrees do not accumulate without
+	// bound across pool recycles. Set to false to retain worktrees for
+	// post-session diagnostics.
 	AutoPruneWorkerDir *bool `toml:"auto_prune_worker_dir,omitempty" jsonschema:"default=true"`
+	// WorktreeRemovalGuard controls whether the two legacy worktree-removal
+	// surfaces (session worker_dir prune and the closed-bead worktree
+	// reaper) run the worktreeguard reachability gate before removing a
+	// directory under .gc/worktrees/: a copy of the doomed HEAD must exist
+	// OUTSIDE the directory (already in the rig repo, or fetched into
+	// refs/gc-quarantine/<id>/<branch>-<sha12>) before removal may proceed;
+	// otherwise the tree is kept and the refusal is logged. Every copy logs
+	// one "worktreeguard: secured-copy … ref=…" line. Quarantine refs are
+	// never pruned automatically: list them with `git for-each-ref
+	// refs/gc-quarantine/` in the rig repo, restore one with `git branch
+	// <name> <ref>`, drop one with `git update-ref -d <ref>`. Default true — the incident class it
+	// prevents (agent-forge 3zf46 / ga0r1.1.1, 2026-10-14: a standalone
+	// executor clone holding the ONLY copy of an unpushed branch was deleted
+	// by pool cleanup) loses work silently. Set to false to restore the
+	// legacy probes verbatim (rollback lever).
+	WorktreeRemovalGuard *bool `toml:"worktree_removal_guard,omitempty" jsonschema:"default=true"`
+}
+
+// WorktreeRemovalGuardEnabled reports whether the worktreeguard reachability
+// gate is active for legacy removal surfaces. Nil (unset) defaults to true;
+// a nil receiver also reports true — the guard must fail ON, not off.
+func (d *DaemonConfig) WorktreeRemovalGuardEnabled() bool {
+	if d == nil || d.WorktreeRemovalGuard == nil {
+		return true
+	}
+	return *d.WorktreeRemovalGuard
 }
 
 // AutoRestartOnDriftEnabled reports whether the supervisor should be

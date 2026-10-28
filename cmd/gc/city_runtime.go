@@ -663,6 +663,7 @@ func (cr *CityRuntime) run(ctx context.Context) {
 
 	// Enforce restrictive permissions on .gc/ and its subdirectories.
 	enforceGCPermissions(cr.cityPath, cr.stderr)
+	warnWorktreeGuardDisabled(cr.cfg, cr.stderr)
 
 	// Open standalone city bead store when controllerState is unavailable.
 	// When controllerState is present, it manages the cached city store.

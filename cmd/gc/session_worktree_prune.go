@@ -13,6 +13,7 @@ import (
 	"github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/pathutil"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/worktreeguard"
 )
 
 // gitProbe is the slice of internal/git.Git used by the worker-dir
@@ -30,6 +31,50 @@ type gitProbe interface {
 // newGitProbe returns a gitProbe scoped to the given directory. Indirected
 // through a package-level var so tests can stub the git invocations.
 var newGitProbe = func(workDir string) gitProbe { return git.New(workDir) }
+
+// worktreeGuard is the removal-guard seam (the newGitProbe precedent):
+// production wiring is worktreeguard.GuardRemoval over a real GitProbe, tests
+// stub it to keep probe-fake fixtures off the subprocess surface.
+var worktreeGuard = worktreeguard.GuardRemoval
+
+// worktreeAssess is the side-effect-free twin of worktreeGuard for dry-run
+// surfaces: the same verdict, no copy, no notify line.
+var worktreeAssess = worktreeguard.Assess
+
+// warnWorktreeGuardDisabled announces, once per controller start, that the
+// worktree removal guard is off: the kill switch is a rollback lever, and a
+// city running the legacy probes (which cannot see standalone clones) must
+// not do so silently.
+func warnWorktreeGuardDisabled(cfg *config.City, stderr io.Writer) {
+	if cfg == nil || cfg.Daemon.WorktreeRemovalGuardEnabled() {
+		return
+	}
+	fmt.Fprintln(stderr, "worktreeguard: disabled ([daemon] worktree_removal_guard = false): worker_dir prune and closed-bead reap use the legacy probes, no quarantine copy") //nolint:errcheck
+}
+
+// standaloneCloneDir reports whether dir holds a full .git DIRECTORY (a
+// standalone clone) rather than a linked worktree's .git FILE. Standalone
+// clones are not registered in the rig repo's worktree list, so
+// `git worktree remove` cannot remove them.
+func standaloneCloneDir(dir string) bool {
+	fi, err := os.Stat(filepath.Join(dir, ".git"))
+	return err == nil && fi.IsDir()
+}
+
+// removeWorkerDir tears the worker dir down by its shape: a linked worktree
+// (.git file) goes through `git worktree remove` from the rig root (the
+// legacy method), while a standalone clone (.git directory) is removed as a
+// plain directory — only ever done under the guard, which has by then
+// secured a copy of HEAD in the rig repo. Guard off keeps the legacy method
+// verbatim, including its failure on standalone clones. wtForce is the
+// force flag for the WorktreeRemove call (the prune path forces; the reaper
+// does not, keeping its dirty-tree defense in depth).
+func removeWorkerDir(rigRoot, workerDir string, guardOn, wtForce bool) error {
+	if guardOn && standaloneCloneDir(workerDir) {
+		return os.RemoveAll(workerDir)
+	}
+	return newGitProbe(rigRoot).WorktreeRemove(workerDir, wtForce)
+}
 
 // writeWorktreeStaleMarker records why workerDir was left in place instead of
 // pruned, so cleanupClosedBeadAgentHomeWorktrees (agent_home_worktree_cleanup.go)
@@ -99,16 +144,41 @@ func pruneAgentHomeWorktreeIfSafe(session beads.Bead, cityPath string, cfg *conf
 		writeWorktreeStaleMarker(gp, workerDir, "uncommitted-work", stderr)
 		return false
 	}
-	hasUnpushed, err := gp.HasUnpushedCommitsResult()
-	if err != nil {
-		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: unpushed probe failed: %v\n", workerDir, err) //nolint:errcheck
-		return false
+
+	// Guard ON: the unpushed-commits gate is replaced by the removal guard —
+	// before removing, secure a copy of HEAD into the rig repo (quarantine
+	// ref) unless one already exists there. A secured verdict subsumes the
+	// old refusal: the copy provably lives outside the doomed directory, so
+	// removal loses nothing. A refused verdict (probe error, broken rig,
+	// failed copy) leaves the dir with a branch-unsecured marker.
+	guardOn := cfg.Daemon.WorktreeRemovalGuardEnabled()
+	rigRoot := ""
+	if guardOn {
+		// The guard copies into the rig repo, so the rig root must resolve
+		// up front; an unresolved rig means no copy is possible → refuse.
+		rigRoot = lookupRigRootForSession(session, cfg)
+		if rigRoot == "" {
+			fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: rig path unresolved\n", workerDir) //nolint:errcheck
+			writeWorktreeStaleMarker(gp, workerDir, "branch-unsecured", stderr)
+			return false
+		}
+		if v := worktreeGuard(worktreeguard.NewGitProbe(workerDir, rigRoot), workerDir, session.ID, stderr); !v.Secured {
+			writeWorktreeStaleMarker(gp, workerDir, "branch-unsecured", stderr)
+			return false
+		}
+	} else {
+		hasUnpushed, err := gp.HasUnpushedCommitsResult()
+		if err != nil {
+			fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: unpushed probe failed: %v\n", workerDir, err) //nolint:errcheck
+			return false
+		}
+		if hasUnpushed {
+			fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: has unpushed commits\n", workerDir) //nolint:errcheck
+			writeWorktreeStaleMarker(gp, workerDir, "unpushed-commits", stderr)
+			return false
+		}
 	}
-	if hasUnpushed {
-		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: has unpushed commits\n", workerDir) //nolint:errcheck
-		writeWorktreeStaleMarker(gp, workerDir, "unpushed-commits", stderr)
-		return false
-	}
+
 	hasStashes, err := gp.HasStashesResult()
 	if err != nil {
 		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: stash probe failed: %v\n", workerDir, err) //nolint:errcheck
@@ -120,16 +190,18 @@ func pruneAgentHomeWorktreeIfSafe(session beads.Bead, cityPath string, cfg *conf
 		return false
 	}
 
-	// Run `git worktree remove` from the rig root rather than from the
-	// worktree being removed: git refuses to remove a worktree whose path
-	// equals cwd in some configurations, and operating from cwd of a
-	// directory we are about to delete is fragile in general.
-	rigRoot := lookupRigRootForSession(session, cfg)
+	// Run the removal from the rig root rather than from the worktree being
+	// removed: git refuses to remove a worktree whose path equals cwd in
+	// some configurations, and operating from cwd of a directory we are
+	// about to delete is fragile in general.
+	if rigRoot == "" {
+		rigRoot = lookupRigRootForSession(session, cfg)
+	}
 	if rigRoot == "" {
 		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: rig path unresolved\n", workerDir) //nolint:errcheck
 		return false
 	}
-	if err := newGitProbe(rigRoot).WorktreeRemove(workerDir, true); err != nil {
+	if err := removeWorkerDir(rigRoot, workerDir, guardOn, true); err != nil {
 		fmt.Fprintf(stderr, "session reconciler: pruning worker_dir %s: %v\n", workerDir, err) //nolint:errcheck
 		return false
 	}
@@ -174,16 +246,37 @@ func pruneAgentHomeWorktreeIfSafeInfo(info sessionpkg.Info, cityPath string, cfg
 		writeWorktreeStaleMarker(gp, workerDir, "uncommitted-work", stderr)
 		return
 	}
-	hasUnpushed, err := gp.HasUnpushedCommitsResult()
-	if err != nil {
-		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: unpushed probe failed: %v\n", workerDir, err) //nolint:errcheck
-		return
+
+	// Guard ON mirrors the raw form: the unpushed gate yields to the removal
+	// guard, which secures a copy of HEAD into the rig repo before removal
+	// (secured subsumes the refusal; refused leaves a branch-unsecured
+	// marker). Guard off runs the legacy unpushed gate verbatim.
+	guardOn := cfg.Daemon.WorktreeRemovalGuardEnabled()
+	rigRoot := ""
+	if guardOn {
+		rigRoot = lookupRigRootForSessionInfo(info, cfg)
+		if rigRoot == "" {
+			fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: rig path unresolved\n", workerDir) //nolint:errcheck
+			writeWorktreeStaleMarker(gp, workerDir, "branch-unsecured", stderr)
+			return
+		}
+		if v := worktreeGuard(worktreeguard.NewGitProbe(workerDir, rigRoot), workerDir, info.ID, stderr); !v.Secured {
+			writeWorktreeStaleMarker(gp, workerDir, "branch-unsecured", stderr)
+			return
+		}
+	} else {
+		hasUnpushed, err := gp.HasUnpushedCommitsResult()
+		if err != nil {
+			fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: unpushed probe failed: %v\n", workerDir, err) //nolint:errcheck
+			return
+		}
+		if hasUnpushed {
+			fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: has unpushed commits\n", workerDir) //nolint:errcheck
+			writeWorktreeStaleMarker(gp, workerDir, "unpushed-commits", stderr)
+			return
+		}
 	}
-	if hasUnpushed {
-		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: has unpushed commits\n", workerDir) //nolint:errcheck
-		writeWorktreeStaleMarker(gp, workerDir, "unpushed-commits", stderr)
-		return
-	}
+
 	hasStashes, err := gp.HasStashesResult()
 	if err != nil {
 		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: stash probe failed: %v\n", workerDir, err) //nolint:errcheck
@@ -195,12 +288,14 @@ func pruneAgentHomeWorktreeIfSafeInfo(info sessionpkg.Info, cityPath string, cfg
 		return
 	}
 
-	rigRoot := lookupRigRootForSessionInfo(info, cfg)
+	if rigRoot == "" {
+		rigRoot = lookupRigRootForSessionInfo(info, cfg)
+	}
 	if rigRoot == "" {
 		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: rig path unresolved\n", workerDir) //nolint:errcheck
 		return
 	}
-	if err := newGitProbe(rigRoot).WorktreeRemove(workerDir, true); err != nil {
+	if err := removeWorkerDir(rigRoot, workerDir, guardOn, true); err != nil {
 		fmt.Fprintf(stderr, "session reconciler: pruning worker_dir %s: %v\n", workerDir, err) //nolint:errcheck
 		return
 	}

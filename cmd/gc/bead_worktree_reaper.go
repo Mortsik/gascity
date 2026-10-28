@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/sling"
+	"github.com/gastownhall/gascity/internal/worktreeguard"
 )
 
 // reapDecision records one worktree the reaper acted on or declined to act on,
@@ -142,6 +144,11 @@ func reapClosedBeadWorktrees(
 
 	wtRoot := filepath.Join(cityPath, ".gc", "worktrees")
 
+	// The removal guard (default on) replaces the unreachable-commits gate
+	// for every candidate and widens discovery to standalone clones; false
+	// restores porcelain-only discovery plus the legacy git gate verbatim.
+	guardOn := cfg.Daemon.WorktreeRemovalGuardEnabled()
+
 	for rigName, store := range rigStores {
 		if store == nil {
 			continue
@@ -169,6 +176,23 @@ func reapClosedBeadWorktrees(
 		livenessByPath := make(map[string]worktreeLiveness, len(worktreeLivenessResults))
 		for _, wl := range worktreeLivenessResults {
 			livenessByPath[wl.Path] = wl
+		}
+
+		// Guard ON ends the standalone-clone blindness: `git worktree list`
+		// never reports repos that were cloned (not linked) under the rig
+		// worktree tree, so the guard regime also scans the tree itself and
+		// unions the findings with porcelain. Guard OFF keeps porcelain-only
+		// discovery byte-identical to today.
+		if guardOn {
+			seen := make(map[string]bool, len(worktreeLivenessResults))
+			for _, wl := range worktreeLivenessResults {
+				seen[pathutil.NormalizePathForCompare(wl.Path)] = true
+			}
+			worktreeLivenessResults = append(worktreeLivenessResults,
+				discoverUnlinkedRepos(rigWorktreeDir, live, liveSessionDirs, seen)...)
+			for _, wl := range worktreeLivenessResults {
+				livenessByPath[wl.Path] = wl
+			}
 		}
 
 		// Pass 1: discover reap-eligible candidates — closed bead, and old
@@ -306,15 +330,39 @@ func reapClosedBeadWorktrees(
 			if reason == "" {
 				wg := git.New(worktreePath)
 				hasUncommitted := wg.HasUncommittedWork()
-				hasUnreachable, unreachableErr := wg.HasUnreachableCommitsResult()
 				hasStashes, stashErr := wg.HasStashesResult()
-				switch {
-				case unreachableErr != nil:
-					reason = fmt.Sprintf("git probe failed (failing closed): %v", unreachableErr)
-				case stashErr != nil:
-					reason = fmt.Sprintf("git probe failed (failing closed): %v", stashErr)
-				case hasUncommitted || hasUnreachable || hasStashes:
-					reason = fmt.Sprintf("unsafe git state: uncommitted=%v unreachable=%v stashes=%v", hasUncommitted, hasUnreachable, hasStashes)
+				if guardOn {
+					// The removal guard replaces the unreachable-commits gate:
+					// before a clean tree may be removed, HEAD is secured into
+					// the rig repo (quarantine ref) unless a copy already
+					// exists there. Refused ⇒ protect, naming branch-unsecured.
+					switch {
+					case stashErr != nil:
+						reason = fmt.Sprintf("git probe failed (failing closed): %v", stashErr)
+					case hasUncommitted || hasStashes:
+						reason = fmt.Sprintf("unsafe git state: uncommitted=%v stashes=%v", hasUncommitted, hasStashes)
+					case dryRun:
+						// Dry-run asks the same question without executing the
+						// copy: a secured-copy verdict is a "would secure, then
+						// reap", so only a refusal protects here.
+						if v := worktreeAssess(worktreeguard.NewGitProbe(worktreePath, rigRoot)); !v.Secured && v.Action != worktreeguard.ActionSecuredCopy {
+							reason = fmt.Sprintf("branch-unsecured: %s: %s", v.Action, v.Reason)
+						}
+					default:
+						if v := worktreeGuard(worktreeguard.NewGitProbe(worktreePath, rigRoot), worktreePath, beadID, stderr); !v.Secured {
+							reason = fmt.Sprintf("branch-unsecured: %s: %s", v.Action, v.Reason)
+						}
+					}
+				} else {
+					hasUnreachable, unreachableErr := wg.HasUnreachableCommitsResult()
+					switch {
+					case unreachableErr != nil:
+						reason = fmt.Sprintf("git probe failed (failing closed): %v", unreachableErr)
+					case stashErr != nil:
+						reason = fmt.Sprintf("git probe failed (failing closed): %v", stashErr)
+					case hasUncommitted || hasUnreachable || hasStashes:
+						reason = fmt.Sprintf("unsafe git state: uncommitted=%v unreachable=%v stashes=%v", hasUncommitted, hasUnreachable, hasStashes)
+					}
 				}
 			}
 
@@ -351,8 +399,11 @@ func reapClosedBeadWorktrees(
 
 			// Remove the worktree from the OWNING rig repository. git worktree
 			// remove must be run from the main repo root, not from within the
-			// worktree being removed.
-			if err := git.New(rigRoot).WorktreeRemove(worktreePath, false); err != nil {
+			// worktree being removed; a standalone clone (guard regime) is
+			// torn down as a plain directory instead — removeWorkerDir picks
+			// by .git shape, and only ever RemoveAll's after the guard secured
+			// a copy.
+			if err := removeWorkerDir(rigRoot, worktreePath, guardOn, false); err != nil {
 				fmt.Fprintf(stderr, "reapClosedBeadWorktrees: removing %s: %v\n", worktreePath, err) //nolint:errcheck
 				continue
 			}
@@ -387,6 +438,43 @@ func reapClosedBeadWorktrees(
 type reapCandidate struct {
 	beadID       string
 	worktreePath string
+}
+
+// discoverUnlinkedRepos walks the rig's worktree tree and returns every
+// STANDALONE clone (a .git DIRECTORY) that `git worktree list` never
+// reported — standalone clones are invisible to porcelain, which is exactly
+// how the ga0r1.1.1 incident clone leaked past every gate. A .git FILE is a
+// linked worktree: the rig's own are already in porcelain, and one porcelain
+// did not report belongs to some other repository — never the rig's to copy
+// from or remove. It never descends into a found repo, never reports
+// anything outside the tree, and never fails the pass (an unreadable subtree
+// is skipped, and every pass-1 gate still applies to what it finds). seen
+// (normalized porcelain paths) dedupes; liveness uses the same per-path
+// check porcelain results get.
+func discoverUnlinkedRepos(root string, live liveWorktreeState, sessionDirs []string, seen map[string]bool) []worktreeLiveness {
+	var out []worktreeLiveness
+	//nolint:errcheck // best-effort scan: an unreadable tree yields no candidates, never a failed pass
+	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		marker, statErr := os.Lstat(filepath.Join(path, ".git"))
+		if statErr != nil {
+			return nil // not a repo marker: keep descending
+		}
+		if marker.IsDir() && !seen[pathutil.NormalizePathForCompare(path)] {
+			wl := worktreeLiveness{Path: path}
+			if branch, branchErr := git.New(path).CurrentBranch(); branchErr == nil {
+				wl.Branch = branch
+			}
+			if live.scanned {
+				wl.Live, wl.Reason = worktreeIsLive(path, live, sessionDirs)
+			}
+			out = append(out, wl)
+		}
+		return fs.SkipDir // never descend into a repo's working tree
+	})
+	return out
 }
 
 // reapSkipTracker makes the reaper's skip reporting edge-triggered, so a
