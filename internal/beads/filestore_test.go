@@ -611,6 +611,62 @@ func TestFileStorePersistence(t *testing.T) {
 	}
 }
 
+// Every mutation rewrites the whole file, so its size is the write volume:
+// on a 65k-bead city (~90 MB, ~8 saves/min) indentation alone was ~17% of
+// the bytes hitting disk. Saves must be compact; previously indented files
+// must still load.
+func TestFileStoreSavesCompactJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "beads.json")
+
+	legacy, err := beads.OpenFileStore(fsys.OSFS{}, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := legacy.Create(beads.Bead{Title: "legacy", Description: "multi\nline"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Rewrite the file the way older builds did (two-space indentation).
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	indented, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, indented, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := beads.OpenFileStore(fsys.OSFS{}, path)
+	if err != nil {
+		t.Fatalf("open indented legacy file: %v", err)
+	}
+	got, err := s.Get(old.ID)
+	if err != nil || got.Description != "multi\nline" {
+		t.Fatalf("Get(%q) on indented file = %+v, %v", old.ID, got, err)
+	}
+	if _, err := s.Create(beads.Bead{Title: "new"}); err != nil {
+		t.Fatal(err)
+	}
+
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsAny(string(saved), "\n\t") || strings.Contains(string(saved), ": ") {
+		t.Fatalf("saved file is not compact JSON (%d bytes):\n%.200s", len(saved), saved)
+	}
+	if !json.Valid(saved) {
+		t.Fatalf("saved file is not valid JSON")
+	}
+}
+
 func TestFileStoreDepPersistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "beads.json")
 

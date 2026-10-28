@@ -749,7 +749,9 @@ func (fs *FileStore) save() error {
 	fs.mu.Unlock()
 
 	fd := fileData{Seq: seq, Beads: beads, Deps: deps, Revisions: beadRevisions(beads), RevisionsSealed: true, Fences: beadFences(beads)}
-	data, err := json.MarshalIndent(fd, "", "  ")
+	// Compact, not indented: every mutation rewrites the whole file, so its
+	// size is the write volume (indentation was ~17% of a 90 MB city store).
+	data, err := json.Marshal(fd)
 	if err != nil {
 		return fmt.Errorf("saving file store: %w", err)
 	}
