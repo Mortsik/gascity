@@ -335,6 +335,34 @@ func TestFileStoreArchiveDeleteArchivedBead(t *testing.T) {
 	}
 }
 
+// A batch delete spanning hot and archived beads commits in one save, and
+// that save tombstones and trims the archived ones like a single Delete.
+func TestFileStoreArchiveDeleteBatchAcrossHotAndArchive(t *testing.T) {
+	e := newArchiveEnv(t)
+	ids := e.seed(4, 0, 1) // archive: ids[0], ids[1]; hot: ids[2], ids[3]
+	s := e.archived()
+	if err := s.DeleteBatch([]string{ids[0], ids[2], "missing-id"}); err != nil {
+		t.Fatal(err)
+	}
+	fresh := e.archived()
+	for _, id := range []string{ids[0], ids[2]} {
+		if _, err := fresh.Get(id); err == nil {
+			t.Fatalf("batch-deleted bead %s still readable", id)
+		}
+	}
+	for _, id := range []string{ids[1], ids[3]} {
+		if _, err := fresh.Get(id); err != nil {
+			t.Fatalf("surviving bead %s lost: %v", id, err)
+		}
+	}
+	if e.archive()[ids[0]] {
+		t.Fatalf("batch-deleted bead left in the archive")
+	}
+	if !e.archive()[ids[1]] {
+		t.Fatalf("surviving archived bead dropped from the archive")
+	}
+}
+
 // failFS fails writes whose path ends with failSuffix while armed — a
 // disk-full or I/O error in the middle of a multi-file save.
 type failFS struct {
