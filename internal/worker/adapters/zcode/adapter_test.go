@@ -230,7 +230,51 @@ func newHarness(t *testing.T, stubEnv map[string]string) *harness {
 	for k, v := range stubEnv {
 		h.env[k] = v
 	}
+	if _, ok := stubEnv["BASH_ENV"]; ok {
+		requireBashHonorsBashEnv(t, h.env["PATH"])
+	}
 	return h
+}
+
+var (
+	bashEnvProbeOnce sync.Once
+	bashEnvProbeErr  error
+)
+
+// requireBashHonorsBashEnv fails fast when the bash the adapter's
+// "#!/usr/bin/env bash" resolves to on path drops a caller's BASH_ENV. The
+// shim tests inject their read() overrides through BASH_ENV; a bash wrapper
+// that re-exports it (a host ~/bin/bash that set BASH_ENV="$HOME/.bash_env"
+// before exec'ing /bin/bash, reached through the login PATH of
+// scripts/test-local-parallel's `bash -lc`) silently loads no shim, and the
+// tests then fail as 20s timeouts that read like load flakes (gd-8f3).
+func requireBashHonorsBashEnv(t *testing.T, path string) {
+	t.Helper()
+	bashEnvProbeOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "zcode-bash-env-probe-*")
+		if err != nil {
+			bashEnvProbeErr = err
+			return
+		}
+		defer os.RemoveAll(dir) //nolint:errcheck // best-effort probe cleanup
+		probe := filepath.Join(dir, "probe.bash")
+		if err := os.WriteFile(probe, []byte("bash_env_probe=honored\n"), 0o644); err != nil {
+			bashEnvProbeErr = err
+			return
+		}
+		cmd := exec.Command("/usr/bin/env", "bash", "-c", `printf '%s' "${bash_env_probe-}"`)
+		cmd.Env = []string{"PATH=" + path, "HOME=" + dir, "BASH_ENV=" + probe}
+		out, err := cmd.Output()
+		switch {
+		case err != nil:
+			bashEnvProbeErr = fmt.Errorf("probe bash: %w", err)
+		case string(out) != "honored":
+			bashEnvProbeErr = errors.New("the bash on PATH does not load the caller's BASH_ENV (a wrapper re-exporting it?); the read() shims would never load")
+		}
+	})
+	if bashEnvProbeErr != nil {
+		t.Fatalf("BASH_ENV shim precondition: %v", bashEnvProbeErr)
+	}
 }
 
 func (h *harness) envList() []string {
