@@ -614,3 +614,62 @@ func TestGitProbeGuardTrailingSlashPathIsNotNested(t *testing.T) {
 		t.Fatalf("verdict = %+v, want already-secured (stderr: %q)", v, stderr.String())
 	}
 }
+
+// TestGitProbeGuardRefusesLinkedWorktreeWithNestedRepo: a linked worktree's
+// tree holds a gitignored nested repository with a commit only it has —
+// `git worktree remove` deletes it with the tree, so the guard must refuse
+// exactly as it does for a standalone clone (local critic REVIEW-GATE
+// 2026-10-28 round 4 B1).
+func TestGitProbeGuardRefusesLinkedWorktreeWithNestedRepo(t *testing.T) {
+	rig := newRig(t)
+	wt := newLinkedWorktree(t, rig, "polecat/ga-lnk05", false)
+	if err := os.WriteFile(filepath.Join(wt, ".gitignore"), []byte("vendor/\n"), 0o644); err != nil {
+		t.Fatalf("write .gitignore: %v", err)
+	}
+	git(t, wt, "add", ".gitignore")
+	git(t, wt, "commit", "-q", "-m", "ignore vendor")
+	nested := filepath.Join(wt, "vendor", "lib")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	initRepo(t, nested)
+	commitFile(t, nested, "lib.txt")
+
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(wt, rig), wt, "ga-lnk05", &stderr)
+	if v.Secured || v.Reason != "non-head-refs-unsecured: nested-repo:vendor/lib" {
+		t.Fatalf("verdict = %+v, want refuse non-head-refs-unsecured: nested-repo:vendor/lib", v)
+	}
+}
+
+// TestGitProbeGuardRefusesStandaloneWithSubmoduleStore: a deinitialized
+// submodule leaves its repository (and an unpushed local branch) under the
+// clone's .git/modules/ while its worktree marker is gone and the clone's
+// status is clean — os.RemoveAll would delete the only copy (Web Sol
+// REVIEW-GATE 2026-10-28 round 5).
+func TestGitProbeGuardRefusesStandaloneWithSubmoduleStore(t *testing.T) {
+	rig, clone := newStandaloneWithUnpushedBranch(t)
+	git(t, clone, "checkout", "-q", "main")
+	git(t, clone, "branch", "-D", "work")
+	subSrc := filepath.Join(t.TempDir(), "subsrc")
+	if err := os.MkdirAll(subSrc, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	initRepo(t, subSrc)
+	commitFile(t, subSrc, "s.txt")
+	git(t, clone, "-c", "protocol.file.allow=always", "submodule", "add", "-q", subSrc, "sub")
+	git(t, clone, "commit", "-q", "-m", "add sub")
+	sub := filepath.Join(clone, "sub")
+	git(t, sub, "config", "user.email", "test@example.com")
+	git(t, sub, "config", "user.name", "Test")
+	git(t, sub, "checkout", "-q", "-b", "local-only")
+	commitFile(t, sub, "local.txt")
+	git(t, clone, "submodule", "deinit", "-q", "-f", "sub")
+	git(t, rig, "fetch", "-q", clone, "main:refs/heads/carry")
+
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(clone, rig), clone, "sess-73", &stderr)
+	if v.Secured || v.Reason != "non-head-refs-unsecured: submodule:sub" {
+		t.Fatalf("verdict = %+v, want refuse non-head-refs-unsecured: submodule:sub", v)
+	}
+}

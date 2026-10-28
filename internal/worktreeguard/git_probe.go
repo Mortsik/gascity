@@ -239,18 +239,35 @@ func (g *GitProbe) VerifyQuarantied(headSha string) error {
 // ("nested-repo:<relpath>" — typically gitignored, so invisible to status)
 // are reported unsecured outright: their HEADs and refs die with the clone.
 //
-// A linked worktree (.git FILE) has none to lose: its refs live in the
-// shared repository and survive the directory's removal. That premise holds
-// because callers remove .git-file trees only through the rig's `git
-// worktree remove` (which refuses unregistered paths) and reaper discovery
-// never adds unregistered .git files. A broken rig or a failed listing is an
-// ERROR, never an empty list — the caller fails closed.
+// Submodule repositories stored under the clone's .git/modules/ (still
+// there after `git submodule deinit`, with no worktree marker left) are
+// reported as "submodule:<name>": their refs die with the clone.
+//
+// A linked worktree (.git FILE) keeps its shared refs in the rig's common
+// dir, where they survive; only its per-worktree refs (refs/worktree/,
+// refs/bisect/, refs/rewritten/) and repositories nested in its tree die
+// with the directory, so only those are checked. That premise holds because
+// callers remove .git-file trees only through the rig's `git worktree
+// remove` (which refuses unregistered paths) and reaper discovery never adds
+// unregistered .git files.
+//
+// Out of scope: reflogs and per-worktree pseudorefs (ORIG_HEAD, MERGE_HEAD,
+// rebase state) — they are not refs and are not secured. A broken rig or a
+// failed listing is an ERROR, never an empty list — the caller fails closed.
 func (g *GitProbe) UnsecuredRefs(headBranch string) ([]string, error) {
 	gitDir := filepath.Join(g.repoPath, ".git")
 	if fi, err := os.Lstat(gitDir); err == nil && fi.Mode().IsRegular() {
 		// Linked worktree: shared refs live in the rig's common dir and
-		// survive; only the per-worktree refs die with its admin dir.
-		return g.unsecuredAmong(headBranch, perWorktreeRefPrefixes...)
+		// survive; per-worktree refs and nested repositories die with it.
+		nested, err := nestedRepos(g.repoPath)
+		if err != nil {
+			return nil, err
+		}
+		refs, err := g.unsecuredAmong(headBranch, perWorktreeRefPrefixes...)
+		if err != nil {
+			return nil, err
+		}
+		return append(nested, refs...), nil
 	}
 	var unsecured []string
 	entries, err := os.ReadDir(filepath.Join(gitDir, "worktrees"))
@@ -259,6 +276,13 @@ func (g *GitProbe) UnsecuredRefs(headBranch string) ([]string, error) {
 	}
 	for _, e := range entries {
 		unsecured = append(unsecured, "worktree:"+e.Name())
+	}
+	modules, err := os.ReadDir(filepath.Join(gitDir, "modules"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("submodule store listing: %w", err)
+	}
+	for _, e := range modules {
+		unsecured = append(unsecured, "submodule:"+e.Name())
 	}
 	nested, err := nestedRepos(g.repoPath)
 	if err != nil {
