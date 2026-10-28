@@ -1068,14 +1068,14 @@ func (m *memoryOrderDispatcher) fireCandidate(ctx context.Context, cand *orderDi
 // once after dispatchOne returns — i.e. after this goroutine's final store
 // call — so the caller can hold per-tick store handles open until the
 // goroutine releases them (gascity#3157). A nil onDone is treated as a no-op.
-func (m *memoryOrderDispatcher) launchDispatchOne(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string, vars, execEnv map[string]string, onDone func()) {
+func (m *memoryOrderDispatcher) launchDispatchOne(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string, preCursor *orders.EventCursor, vars, execEnv map[string]string, onDone func()) {
 	if onDone == nil {
 		onDone = func() {}
 	}
 	if m.dispatchCtx == nil {
 		go func() {
 			defer onDone()
-			m.runDispatchGuarded(ctx, store, target, a, cityPath, trackingID, vars, execEnv)
+			m.runDispatchGuarded(ctx, store, target, a, cityPath, trackingID, preCursor, vars, execEnv)
 		}()
 		return
 	}
@@ -1088,7 +1088,7 @@ func (m *memoryOrderDispatcher) launchDispatchOne(ctx context.Context, store bea
 		defer onDone()
 		defer stopAfter()
 		defer cancelMerged()
-		m.runDispatchGuarded(mergedCtx, store, target, a, cityPath, trackingID, vars, execEnv)
+		m.runDispatchGuarded(mergedCtx, store, target, a, cityPath, trackingID, preCursor, vars, execEnv)
 	}()
 }
 
@@ -1099,13 +1099,13 @@ func (m *memoryOrderDispatcher) launchDispatchOne(ctx context.Context, store bea
 // webhook-derived args) would otherwise crash the whole supervisor. dispatchOne's
 // own defers close the tracking bead as the stack unwinds before recovery here;
 // this boundary logs the panic and contains it to the single dispatch.
-func (m *memoryOrderDispatcher) runDispatchGuarded(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string, vars, execEnv map[string]string) {
+func (m *memoryOrderDispatcher) runDispatchGuarded(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string, preCursor *orders.EventCursor, vars, execEnv map[string]string) {
 	defer func() {
 		if p := recover(); p != nil {
 			logDispatchError(m.stderr, "gc: order %s: dispatch goroutine panic (tracking %s): %v", a.ScopedName(), trackingID, p)
 		}
 	}()
-	m.dispatchOne(ctx, store, target, a, cityPath, trackingID, vars, execEnv)
+	m.dispatchOneRun(ctx, store, target, a, cityPath, trackingID, preCursor, vars, execEnv)
 }
 
 // launchResolvedDispatch is the single fire path shared by the controller tick
@@ -1119,12 +1119,32 @@ func (m *memoryOrderDispatcher) runDispatchGuarded(ctx context.Context, store be
 // A caller tracking its own WaitGroup must register it before calling and
 // release it in onDone (and, on a returned error, itself — nothing launched).
 func (m *memoryOrderDispatcher) launchResolvedDispatch(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath string, vars, execEnv map[string]string, onDone func()) (orders.OrderRun, error) {
-	trackingRun, err := m.orderFrontDoorFor(store).CreateRun(a.ScopedName(), orders.RunOpts{})
+	// An event-triggered exec persists its cursor before its command runs so a
+	// crash after the side effect cannot replay the event. Reading the head
+	// here and stamping it on the tracking bead as it is created makes that
+	// one write instead of two; a failed read leaves the cursor to dispatchExec,
+	// which reports it as before.
+	//
+	// Not for orders that consume the dispatcher's own order.* events: their
+	// run records order.fired after this point, and a cursor read before it
+	// would leave the run's own event pending and re-fire the order forever.
+	// Not for runs that will fail required-param validation either, so their
+	// events stay pending as they did when the cursor was written after it.
+	// The read is synchronous on the tick, like checkEvent's event List.
+	var preCursor *orders.EventCursor
+	if a.IsExec() && a.Trigger == "event" && m.ep != nil &&
+		!strings.HasPrefix(a.On, "order.") && orders.ValidateRequiredParams(a, vars) == nil {
+		if headSeq, seqErr := m.ep.LatestSeq(); seqErr == nil {
+			cursor := orders.EventCursor(headSeq)
+			preCursor = &cursor
+		}
+	}
+	trackingRun, err := m.orderFrontDoorFor(store).CreateRun(a.ScopedName(), orders.RunOpts{Cursor: preCursor})
 	if err != nil {
 		return orders.OrderRun{}, err
 	}
 	m.addInflight()
-	m.launchDispatchOne(ctx, store, target, a, cityPath, trackingRun.ID, vars, execEnv, onDone)
+	m.launchDispatchOne(ctx, store, target, a, cityPath, trackingRun.ID, preCursor, vars, execEnv, onDone)
 	return trackingRun, nil
 }
 
@@ -1790,10 +1810,22 @@ func orderTriggerUsesLastRun(a orders.Order) bool {
 // a controller-owned or static [order.env] key (R4); the tick loop and CLI pass
 // nil (raw overlay), preserving existing semantics.
 func (m *memoryOrderDispatcher) dispatchOne(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string, vars, execEnv map[string]string) {
+	m.dispatchOneRun(ctx, store, target, a, cityPath, trackingID, nil, vars, execEnv)
+}
+
+// dispatchOneRun is dispatchOne for a tracking bead that may already carry
+// its event cursor (preCursor, stamped at creation).
+func (m *memoryOrderDispatcher) dispatchOneRun(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string, preCursor *orders.EventCursor, vars, execEnv map[string]string) {
 	// Defer order matters: doneInflight runs last, after Close makes the
 	// tracking bead outcome observable to a waiting drain.
 	defer m.doneInflight()
+	// An exec dispatch closes its tracking bead together with its outcome
+	// label in one write; the deferred close below then has nothing to do.
+	trackingClosed := false
 	defer func() {
+		if trackingClosed {
+			return
+		}
 		// The tracking bead was born in the orders store, so its close has to
 		// address that store: closing through the target scope on a split city
 		// finds nothing, and the marker that suppresses re-dispatch stays open
@@ -1841,7 +1873,7 @@ func (m *memoryOrderDispatcher) dispatchOne(ctx context.Context, store beads.Sto
 		if execOverlay == nil {
 			execOverlay = vars
 		}
-		m.dispatchExec(childCtx, front, target, a, cityPath, trackingID, execOverlay)
+		trackingClosed = m.dispatchExecRun(childCtx, front, target, a, cityPath, trackingID, preCursor, execOverlay)
 	} else {
 		m.dispatchWisp(childCtx, store, target, a, cityPath, trackingID, vars)
 	}
@@ -1960,19 +1992,49 @@ func openOrderTrackingIDs(store beads.Store, ids []string) ([]string, error) {
 
 // dispatchExec runs an exec order's shell command.
 func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string, vars map[string]string) {
+	m.dispatchExecRun(ctx, front, target, a, cityPath, trackingID, nil, vars)
+}
+
+// dispatchExecRun runs an exec order's shell command and records its outcome
+// by closing the tracking bead with the outcome label in one write. It reports
+// whether that close succeeded; when it did not, the caller's deferred close
+// still closes the bead. preCursor is the event cursor already stamped on the
+// tracking bead at creation, if any.
+func (m *memoryOrderDispatcher) dispatchExecRun(ctx context.Context, front *orders.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string, preCursor *orders.EventCursor, vars map[string]string) bool {
 	scoped := a.ScopedName()
 	outcome := orders.RunOutcomeExec
+	// The close must land even when the exec deadline (ctx) has passed.
+	closeCtx := context.WithoutCancel(ctx)
+	// closeWithOutcome stamps the outcome and closes the bead. It returns the
+	// error to report as a failure to record the outcome (nil once the label
+	// landed) and whether the close is confirmed; an unconfirmed close is only
+	// logged and left to the caller's deferred close.
+	closeWithOutcome := func(outcome orders.RunOutcome) (labelErr error, closed bool) {
+		labeled, err := front.CloseRunWithOutcome(closeCtx, trackingID, outcome, completedOrderTrackingCloseReason)
+		if !labeled {
+			return err, false
+		}
+		if err != nil {
+			logDispatchError(m.stderr, "gc: order %s: closing tracking bead %s: %v", scoped, trackingID, err)
+			return nil, false
+		}
+		return nil, true
+	}
 	var headSeq uint64
 	var hasEventCursor bool
-	if a.Trigger == "event" && m.ep != nil {
+	if a.Trigger == "event" && m.ep != nil && preCursor != nil {
+		headSeq = uint64(*preCursor)
+		hasEventCursor = true
+	} else if a.Trigger == "event" && m.ep != nil {
 		var err error
 		headSeq, err = m.ep.LatestSeq()
 		if err != nil {
 			errMsg := fmt.Sprintf("reading event cursor: %v", err)
 			outcome = orders.RunOutcomeExecFailed
 			logDispatchError(m.stderr, "gc: order dispatch: reading event cursor for %s: %v", scoped, err)
-			if updateErr := front.SetOutcome(trackingID, outcome); updateErr != nil {
-				logDispatchError(m.stderr, "gc: order %s: failed to label exec tracking bead %s: %v", scoped, trackingID, updateErr)
+			labelErr, closed := closeWithOutcome(outcome)
+			if labelErr != nil {
+				logDispatchError(m.stderr, "gc: order %s: failed to label exec tracking bead %s: %v", scoped, trackingID, labelErr)
 			}
 			m.rec.Record(events.Event{
 				Type:    events.OrderFailed,
@@ -1980,7 +2042,7 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 				Subject: scoped,
 				Message: errMsg,
 			})
-			return
+			return closed
 		}
 		hasEventCursor = true
 		// Event-triggered exec orders persist the cursor before the command
@@ -1988,8 +2050,9 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 		if err := front.SetCursor(trackingID, scoped, orders.EventCursor(headSeq)); err != nil {
 			logDispatchError(m.stderr, "gc: order %s: failed to label exec event cursor on tracking bead %s: %v", scoped, trackingID, err)
 			outcome = orders.RunOutcomeExecFailed
-			if updateErr := front.SetOutcome(trackingID, outcome); updateErr != nil {
-				logDispatchError(m.stderr, "gc: order %s: failed to label exec tracking bead %s: %v", scoped, trackingID, updateErr)
+			labelErr, closed := closeWithOutcome(outcome)
+			if labelErr != nil {
+				logDispatchError(m.stderr, "gc: order %s: failed to label exec tracking bead %s: %v", scoped, trackingID, labelErr)
 			}
 			m.rec.Record(events.Event{
 				Type:    events.OrderFailed,
@@ -1997,7 +2060,7 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 				Subject: scoped,
 				Message: fmt.Sprintf("exec tracking bead %s event cursor label failed for seq=%d: %v", trackingID, headSeq, err),
 			})
-			return
+			return closed
 		}
 	}
 
@@ -2045,9 +2108,11 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 		}
 	}
 
-	// Label tracking bead with outcome via store (not CLI). For event execs,
-	// cursor labels were already persisted before the command ran.
-	if err := front.SetOutcome(trackingID, outcome); err != nil {
+	// Label tracking bead with outcome via store (not CLI) and close it in the
+	// same write. For event execs, cursor labels were already persisted before
+	// the command ran.
+	labelErr, closed := closeWithOutcome(outcome)
+	if err := labelErr; err != nil {
 		logDispatchError(m.stderr, "gc: order %s: failed to label exec tracking bead %s: %v", scoped, trackingID, err)
 		msg := fmt.Sprintf("exec tracking bead %s label failed: %v", trackingID, err)
 		if hasEventCursor {
@@ -2059,7 +2124,7 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 			Subject: scoped,
 			Message: msg,
 		})
-		return
+		return false
 	}
 	if execErrMsg != "" {
 		if hasEventCursor {
@@ -2071,7 +2136,7 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 			Subject: scoped,
 			Message: execErrMsg,
 		})
-		return
+		return closed
 	}
 	m.rec.Record(events.Event{
 		Type:    events.OrderCompleted,
@@ -2081,6 +2146,7 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 	if declared != nil {
 		recordOrderOutcome(m.rec, m.stderr, scoped, declared)
 	}
+	return closed
 }
 
 // prepareOrderWispRecipe compiles an order's formula into a recipe and returns

@@ -2,6 +2,7 @@ package orders
 
 import (
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -473,5 +474,126 @@ func TestLatestOpenRunIgnoresClosedRuns(t *testing.T) {
 	}}, nil)
 	if _, found, err := NewStore(beads.OrdersStore{Store: allClosed}).LatestOpenRun("rig/agent"); err != nil || found {
 		t.Fatalf("all-closed LatestOpenRun = (found=%v, err=%v), want (false, nil)", found, err)
+	}
+}
+
+// labeledCloserStore is a RecordingStore that also offers the one-write
+// labeled close, recording it and applying it as Update then CloseAll on the
+// delegate (MemStore keeps its own labeled close unexported).
+type labeledCloserStore struct {
+	*beadstest.RecordingStore
+	labeled [][]string
+}
+
+func (s *labeledCloserStore) CloseAllWithLabels(ids, labels []string, metadata map[string]string) (int, error) {
+	s.labeled = append(s.labeled, append([]string(nil), labels...))
+	open := 0
+	for _, id := range ids {
+		b, err := s.Get(id)
+		if err != nil || b.Status == "closed" {
+			continue
+		}
+		if err := s.RecordingStore.Update(id, beads.UpdateOpts{Labels: labels}); err != nil {
+			return 0, err
+		}
+		open++
+	}
+	if open == 0 {
+		return 0, nil
+	}
+	return s.RecordingStore.CloseAll(ids, metadata)
+}
+
+// TestCreateRunStampsCursorAtCreation proves an event cursor passed to
+// CreateRun rides the single Create as the (order:<scoped>, seq:<N>) pair
+// SetCursor would have written, with no follow-up Update.
+func TestCreateRunStampsCursorAtCreation(t *testing.T) {
+	st, rec := recordingOrdersStore()
+	cursor := EventCursor(42)
+	run, err := st.CreateRun("rig/agent", RunOpts{Cursor: &cursor})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	if run.Cursor != cursor {
+		t.Errorf("run.Cursor = %d, want 42", run.Cursor)
+	}
+	creates := rec.CallsForOp("Create")
+	if len(creates) != 1 {
+		t.Fatalf("want 1 Create, got %d", len(creates))
+	}
+	want := []string{"order-run:rig/agent", "order-tracking", "order:rig/agent", "seq:42"}
+	if !reflect.DeepEqual(creates[0].Bead.Labels, want) {
+		t.Errorf("labels = %v, want %v", creates[0].Bead.Labels, want)
+	}
+	if n := len(rec.CallsForOp("Update")); n != 0 {
+		t.Errorf("Update calls = %d, want 0", n)
+	}
+}
+
+// TestCloseRunWithOutcomeUsesLabeledCloser proves a store offering the
+// labeled close gets the outcome and the close as that one call.
+func TestCloseRunWithOutcomeUsesLabeledCloser(t *testing.T) {
+	store := &labeledCloserStore{RecordingStore: beadstest.NewRecordingStore(beads.NewMemStore())}
+	st := NewStore(beads.OrdersStore{Store: store})
+	run, err := st.CreateRun("rig/agent", RunOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if labeled, err := st.CloseRunWithOutcome(t.Context(), run.ID, RunOutcomeExecFailed, "done"); err != nil || !labeled {
+		t.Fatalf("CloseRunWithOutcome: labeled=%v err=%v", labeled, err)
+	}
+	if len(store.labeled) != 1 || !reflect.DeepEqual(store.labeled[0], []string{"exec-failed"}) {
+		t.Fatalf("labeled closes = %v, want one with [exec-failed]", store.labeled)
+	}
+	got, err := store.Get(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "closed" || got.Metadata["close_reason"] != "done" {
+		t.Fatalf("run = status %q metadata %v", got.Status, got.Metadata)
+	}
+}
+
+// TestCloseRunWithOutcomeFallsBackToTwoWrites proves a plain store gets the
+// SetOutcome Update followed by the verified close it always did.
+func TestCloseRunWithOutcomeFallsBackToTwoWrites(t *testing.T) {
+	st, rec := recordingOrdersStore()
+	run, err := st.CreateRun("rig/agent", RunOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if labeled, err := st.CloseRunWithOutcome(t.Context(), run.ID, RunOutcomeExec, "done"); err != nil || !labeled {
+		t.Fatalf("CloseRunWithOutcome: labeled=%v err=%v", labeled, err)
+	}
+	updates := rec.CallsForOp("Update")
+	if len(updates) != 1 || !reflect.DeepEqual(updates[0].Opts.Labels, []string{"exec"}) {
+		t.Fatalf("updates = %+v, want one outcome Update", updates)
+	}
+	if n := len(rec.CallsForOp("CloseAll")); n != 1 {
+		t.Fatalf("CloseAll calls = %d, want 1", n)
+	}
+}
+
+// TestCloseRunWithOutcomeStampsAlreadyClosedRun proves a run another writer
+// (the stale sweep) closed first still gets its outcome label.
+func TestCloseRunWithOutcomeStampsAlreadyClosedRun(t *testing.T) {
+	store := &labeledCloserStore{RecordingStore: beadstest.NewRecordingStore(beads.NewMemStore())}
+	st := NewStore(beads.OrdersStore{Store: store})
+	run, err := st.CreateRun("rig/agent", RunOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if labeled, err := st.CloseRunWithOutcome(t.Context(), run.ID, RunOutcomeExec, "done"); err != nil || !labeled {
+		t.Fatalf("CloseRunWithOutcome: labeled=%v err=%v", labeled, err)
+	}
+	got, err := store.Get(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(got.Labels, "exec") {
+		t.Fatalf("labels = %v, want exec stamped on the already-closed run", got.Labels)
 	}
 }

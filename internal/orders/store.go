@@ -179,6 +179,10 @@ type RunOpts struct {
 	// the trigger-env-failed pre-dispatch path which creates an already-labeled
 	// open bead so the open-work gate suppresses repeat ticks.
 	Outcome RunOutcome
+	// Cursor, when set, is stamped on the created bead as the (order:<scoped>,
+	// seq:<N>) pair SetCursor writes, so an event-triggered run persists its
+	// cursor before its command runs without a second write.
+	Cursor *EventCursor
 }
 
 // Store is the order-class domain wrapper. It holds the strongly-typed
@@ -304,21 +308,38 @@ func baseLabels(scoped string, outcome RunOutcome) []string {
 // {order-run, order-tracking[, outcome]}, NoHistory:true}) sites in
 // order_dispatch.go.
 func (s *Store) CreateRun(scoped string, opts RunOpts) (OrderRun, error) {
+	labels := baseLabels(scoped, opts.Outcome)
+	if opts.Cursor != nil {
+		labels = append(labels, cursorLabels(scoped, *opts.Cursor)...)
+	}
 	created, err := s.store.Create(beads.Bead{
 		Title:     trackingTitle(scoped),
-		Labels:    baseLabels(scoped, opts.Outcome),
+		Labels:    labels,
 		NoHistory: true,
 	})
 	if err != nil {
 		return OrderRun{}, fmt.Errorf("creating order run for %q: %w", scoped, err)
 	}
-	return OrderRun{
+	run := OrderRun{
 		ID:        created.ID,
 		Scoped:    scoped,
 		Outcome:   opts.Outcome,
 		CreatedAt: created.CreatedAt,
 		Open:      true,
-	}, nil
+	}
+	if opts.Cursor != nil {
+		run.Cursor = *opts.Cursor
+	}
+	return run, nil
+}
+
+// cursorLabels is the (order:<scoped>, seq:<N>) label pair that persists an
+// event cursor on a run.
+func cursorLabels(scoped string, cursor EventCursor) []string {
+	return []string{
+		labelOrderTitlePrefix + scoped,
+		fmt.Sprintf("%s%d", labelSeqPrefix, uint64(cursor)),
+	}
 }
 
 // SetOutcome stamps the outcome label set on an existing tracking bead. It is
@@ -335,11 +356,7 @@ func (s *Store) SetOutcome(runID string, outcome RunOutcome) error {
 // seq:<N>) on an existing tracking bead. Replaces the cursor-persist Update
 // sites in order_dispatch.go.
 func (s *Store) SetCursor(runID, scoped string, cursor EventCursor) error {
-	labels := []string{
-		labelOrderTitlePrefix + scoped,
-		fmt.Sprintf("%s%d", labelSeqPrefix, uint64(cursor)),
-	}
-	if err := s.store.Update(runID, beads.UpdateOpts{Labels: labels}); err != nil {
+	if err := s.store.Update(runID, beads.UpdateOpts{Labels: cursorLabels(scoped, cursor)}); err != nil {
 		return fmt.Errorf("setting order run cursor on %q: %w", runID, err)
 	}
 	return nil

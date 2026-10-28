@@ -232,18 +232,71 @@ func (s *Store) CloseRuns(ctx context.Context, ids []string, reason string) (int
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	if s.store.Store == nil {
 		return 0, fmt.Errorf("order-tracking close: nil store")
 	}
 	metadata := map[string]string{"close_reason": reason}
+	return s.closeRunsVerified(ctx, ids, func() (int, error) { return s.store.CloseAll(ids, metadata) })
+}
 
+// CloseRunWithOutcome stamps outcome's labels on the run and closes it with
+// reason. On a store that implements beads.LabeledCloser that is one write;
+// otherwise it is SetOutcome followed by CloseRuns, the two writes it replaces.
+// Either way the close is verified like CloseRuns. RunOutcomeNone closes
+// without labels.
+//
+// labeled reports whether the outcome is on the run. A non-nil error with
+// labeled true means only the close is unconfirmed (the outcome landed), which
+// a caller must not report as a failure to record the outcome.
+func (s *Store) CloseRunWithOutcome(ctx context.Context, runID string, outcome RunOutcome, reason string) (labeled bool, err error) {
+	labels := outcome.Labels()
+	if len(labels) > 0 && strings.TrimSpace(runID) != "" && s.store.Store != nil {
+		if closer, ok := s.store.Store.(beads.LabeledCloser); ok {
+			metadata := map[string]string{"close_reason": reason}
+			ids := []string{runID}
+			n, err := s.closeRunsVerified(ctx, ids, func() (int, error) {
+				return closer.CloseAllWithLabels(ids, labels, metadata)
+			})
+			switch {
+			case err == nil && n == 0:
+				// Someone else (the stale sweep) closed the run first, so the
+				// labeled close skipped it; stamp the outcome as before.
+				if err := s.SetOutcome(runID, outcome); err != nil {
+					return false, err
+				}
+				return true, nil
+			case n > 0:
+				// The labeled close committed; at most its verify failed.
+				return true, err
+			case !errors.Is(err, beads.ErrLabeledCloseUnsupported):
+				return false, err
+			}
+		}
+	}
+	if len(labels) > 0 {
+		if err := s.SetOutcome(runID, outcome); err != nil {
+			return false, err
+		}
+	}
+	_, err = s.CloseRuns(ctx, []string{runID}, reason)
+	return true, err
+}
+
+// closeRunsVerified runs closeAll and verifies every id closed, retrying both
+// up to closeVerifyAttempts times. A closeAll that reports
+// beads.ErrLabeledCloseUnsupported before closing anything ends the loop at
+// once so the caller can fall back.
+func (s *Store) closeRunsVerified(ctx context.Context, ids []string, closeAll func() (int, error)) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	closed := 0
 	var lastErr error
 	for attempt := 1; attempt <= closeVerifyAttempts; attempt++ {
-		n, err := s.store.CloseAll(ids, metadata)
+		n, err := closeAll()
+		if n == 0 && errors.Is(err, beads.ErrLabeledCloseUnsupported) {
+			return 0, err
+		}
 		closed += n
 		if closed > len(ids) {
 			closed = len(ids)

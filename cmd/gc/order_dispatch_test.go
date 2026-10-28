@@ -906,9 +906,18 @@ func TestOrderDispatchEventExecCursorLabelFailureMarksExecFailed(t *testing.T) {
 	mad := ad.(*memoryOrderDispatcher)
 	mad.stderr = &stderr
 
+	// The tick path stamps the cursor as the tracking bead is created, so the
+	// separate cursor write (and its failure) only remains for a tracking bead
+	// created without one: drive dispatchExec on such a bead directly.
+	tracking, err := store.Create(beads.Bead{
+		Title:  "order:release-exec",
+		Labels: []string{"order-run:release-exec", labelOrderTracking},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	logs := captureCmdOrderLogs(t, func() {
-		ad.dispatch(context.Background(), t.TempDir(), time.Now())
-		ad.drain(context.Background())
+		mad.dispatchExec(context.Background(), orders.NewStore(beads.OrdersStore{Store: eventCursorUpdateFailStore{Store: store}}), execStoreTarget{ScopeRoot: t.TempDir()}, mad.aa[0], t.TempDir(), tracking.ID, nil)
 	})
 
 	if calls != 0 {
@@ -10574,7 +10583,7 @@ func TestRunDispatchGuardedRecoversPanic(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		m.runDispatchGuarded(context.Background(), beads.NewMemStore(), execStoreTarget{}, order, "/city", "track-x", nil, nil)
+		m.runDispatchGuarded(context.Background(), beads.NewMemStore(), execStoreTarget{}, order, "/city", "track-x", nil, nil, nil)
 	}()
 
 	select {
@@ -11147,5 +11156,218 @@ func TestDeleteClearedOrderTrackingFallsBackWhenSetGuardFails(t *testing.T) {
 	}
 	if _, err := store.Get("alpha-01"); !errors.Is(err, beads.ErrNotFound) {
 		t.Fatalf("alpha-01 must still prune: err = %v", err)
+	}
+}
+
+// orderRunWriteSpy counts the writes an order run makes against a FileStore,
+// which rewrites its whole file per write.
+type orderRunWriteSpy struct {
+	*beads.FileStore
+	creates []beads.Bead
+	updates []beads.UpdateOpts
+	labeled [][]string
+}
+
+func (s *orderRunWriteSpy) Create(b beads.Bead) (beads.Bead, error) {
+	s.creates = append(s.creates, b)
+	return s.FileStore.Create(b)
+}
+
+func (s *orderRunWriteSpy) Update(id string, opts beads.UpdateOpts) error {
+	s.updates = append(s.updates, opts)
+	return s.FileStore.Update(id, opts)
+}
+
+func (s *orderRunWriteSpy) CloseAllWithLabels(ids, labels []string, metadata map[string]string) (int, error) {
+	s.labeled = append(s.labeled, append([]string(nil), labels...))
+	return s.FileStore.CloseAllWithLabels(ids, labels, metadata)
+}
+
+// TestOrderDispatchEventExecRunIsTwoWrites pins the write cost of an
+// event-triggered exec run on a file store: the tracking bead is created with
+// its event cursor already on it, and closed together with its outcome label —
+// two whole-file rewrites instead of four.
+func TestOrderDispatchEventExecRunIsTwoWrites(t *testing.T) {
+	fs, err := beads.OpenFileStore(fsys.NewFake(), "/city/.gc/beads.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &orderRunWriteSpy{FileStore: fs}
+	eventLog := events.NewFake()
+	eventLog.Record(events.Event{Type: events.BeadClosed, Actor: "test"})
+	var calls int
+	execRun := func(context.Context, string, string, []string) ([]byte, error) {
+		calls++
+		return []byte("ok"), nil
+	}
+	var rec memRecorder
+	ad := buildOrderDispatcherFromListExec([]orders.Order{{
+		Name:    "release-exec",
+		Trigger: "event",
+		On:      events.BeadClosed,
+		Exec:    "scripts/release.sh",
+	}}, store, eventLog, execRun, &rec)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	ad.dispatch(context.Background(), t.TempDir(), time.Now())
+	ad.drain(context.Background())
+
+	if calls != 1 {
+		t.Fatalf("exec calls = %d, want 1", calls)
+	}
+	if !rec.hasType(events.OrderCompleted) {
+		t.Fatal("missing order.completed event")
+	}
+	var trackingCreates []beads.Bead
+	for _, b := range store.creates {
+		if slicesContain(b.Labels, "order-run:release-exec") {
+			trackingCreates = append(trackingCreates, b)
+		}
+	}
+	if len(trackingCreates) != 1 {
+		t.Fatalf("tracking creates = %d, want 1", len(trackingCreates))
+	}
+	head, err := eventLog.LatestSeq()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := fmt.Sprintf("seq:%d", head); !slicesContain(trackingCreates[0].Labels, want) || !slicesContain(trackingCreates[0].Labels, "order:release-exec") {
+		t.Fatalf("tracking created with labels %v, want the cursor pair order:release-exec + %s", trackingCreates[0].Labels, want)
+	}
+	if len(store.updates) != 0 {
+		t.Fatalf("updates = %+v, want none (cursor at create, outcome at close)", store.updates)
+	}
+	if len(store.labeled) != 1 || !slicesContain(store.labeled[0], "exec") {
+		t.Fatalf("labeled closes = %v, want one carrying exec", store.labeled)
+	}
+	all := trackingBeads(t, store, "order-run:release-exec")
+	if len(all) != 1 || all[0].Status != "closed" || !slicesContain(all[0].Labels, "exec") {
+		t.Fatalf("tracking beads = %+v, want one closed with exec", all)
+	}
+}
+
+// verifyFailingLabeledCloser commits the labeled close but reports every call
+// as failed, so the close never verifies while the outcome label has landed.
+type verifyFailingLabeledCloser struct {
+	*beads.FileStore
+}
+
+func (s verifyFailingLabeledCloser) CloseAllWithLabels(ids, labels []string, metadata map[string]string) (int, error) {
+	n, _ := s.FileStore.CloseAllWithLabels(ids, labels, metadata)
+	return n, fmt.Errorf("close verify boom")
+}
+
+// TestOrderDispatchExecUnconfirmedCloseKeepsCompletion pins that a close
+// whose outcome label landed but whose close did not confirm is logged, not
+// reported as a failed order: the run still completes.
+func TestOrderDispatchExecUnconfirmedCloseKeepsCompletion(t *testing.T) {
+	fs, err := beads.OpenFileStore(fsys.NewFake(), "/city/.gc/beads.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := verifyFailingLabeledCloser{FileStore: fs}
+	execRun := func(context.Context, string, string, []string) ([]byte, error) {
+		return []byte("ok"), nil
+	}
+	var rec memRecorder
+	var stderr bytes.Buffer
+	ad := buildOrderDispatcherFromListExec([]orders.Order{{
+		Name:     "tidy",
+		Trigger:  "cooldown",
+		Interval: "1m",
+		Exec:     "scripts/tidy.sh",
+	}}, store, events.NewFake(), execRun, &rec)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	ad.(*memoryOrderDispatcher).stderr = &stderr
+	logs := captureCmdOrderLogs(t, func() {
+		ad.dispatch(context.Background(), t.TempDir(), time.Now())
+		ad.drain(context.Background())
+	})
+
+	if !rec.hasType(events.OrderCompleted) {
+		t.Fatal("missing order.completed event")
+	}
+	if rec.hasType(events.OrderFailed) {
+		t.Fatal("unconfirmed close reported as a failed order")
+	}
+	combined := logs + "\n" + stderr.String()
+	if !strings.Contains(combined, "closing tracking bead") {
+		t.Fatalf("logs = %q, want the unconfirmed close logged", combined)
+	}
+	all := trackingBeads(t, fs, "order-run:tidy")
+	if len(all) != 1 || all[0].Status != "closed" || !slicesContain(all[0].Labels, "exec") {
+		t.Fatalf("tracking beads = %+v, want one closed with exec", all)
+	}
+}
+
+// TestOrderDispatchOrderFiredEventExecDoesNotRefireOnItself pins that an
+// event exec order consuming order.fired does not take its own run's
+// order.fired as new work. The recorder and the event provider are one log, as
+// in production.
+func TestOrderDispatchOrderFiredEventExecDoesNotRefireOnItself(t *testing.T) {
+	store := beads.NewMemStore()
+	eventLog := events.NewFake()
+	eventLog.Record(events.Event{Type: events.OrderFired, Actor: "controller", Subject: "other"})
+	var calls int
+	execRun := func(context.Context, string, string, []string) ([]byte, error) {
+		calls++
+		return []byte("ok"), nil
+	}
+	ad := buildOrderDispatcherFromListExec([]orders.Order{{
+		Name:    "audit-fires",
+		Trigger: "event",
+		On:      events.OrderFired,
+		Exec:    "scripts/audit.sh",
+	}}, store, eventLog, execRun, eventLog)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	for i := 0; i < 3; i++ {
+		ad.dispatch(context.Background(), t.TempDir(), time.Now())
+		ad.drain(context.Background())
+	}
+	if calls != 1 {
+		t.Fatalf("exec calls over three ticks = %d, want 1 (its own order.fired must not re-fire it)", calls)
+	}
+}
+
+// TestOrderDispatchEventExecMissingParamLeavesEventsPending pins that a tick
+// run refused for a missing required param does not advance the event cursor:
+// its tracking bead carries no cursor, so the events stay pending.
+func TestOrderDispatchEventExecMissingParamLeavesEventsPending(t *testing.T) {
+	store := beads.NewMemStore()
+	eventLog := events.NewFake()
+	eventLog.Record(events.Event{Type: events.BeadClosed, Actor: "test"})
+	var calls int
+	execRun := func(context.Context, string, string, []string) ([]byte, error) {
+		calls++
+		return []byte("ok"), nil
+	}
+	var rec memRecorder
+	ad := buildOrderDispatcherFromListExec([]orders.Order{{
+		Name:    "needs-arg",
+		Trigger: "event",
+		On:      events.BeadClosed,
+		Exec:    "scripts/needs-arg.sh",
+		Params:  map[string]orders.OrderParam{"target": {Required: true}},
+	}}, store, eventLog, execRun, &rec)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	ad.dispatch(context.Background(), t.TempDir(), time.Now())
+	ad.drain(context.Background())
+
+	if calls != 0 {
+		t.Fatalf("exec calls = %d, want 0", calls)
+	}
+	for _, b := range trackingBeads(t, store, "order-run:needs-arg") {
+		for _, l := range b.Labels {
+			if strings.HasPrefix(l, "seq:") {
+				t.Fatalf("refused run stamped cursor label %q; its events must stay pending", l)
+			}
+		}
 	}
 }
