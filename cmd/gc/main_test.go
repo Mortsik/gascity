@@ -205,6 +205,42 @@ func (m noCityGuardTestingM) Run() int {
 	return sessionpkg.FailOnNoCityRefusals(m.m.Run, os.Stderr)
 }
 
+// testscriptBinTempDirFor returns the directory holding the test binary exe
+// when that directory is go test's own work dir (<tmp>/go-build<N>/b<N>),
+// else "". testscript.Main copies the binary into a fresh
+// os.MkdirTemp("", "testscript-main") dir once per registered command (gc and
+// bd here), and the copy is only a hardlink when that dir shares the binary's
+// filesystem. TestMain points TMPDIR at the per-run root, so a go work dir on
+// another filesystem (GOTMPDIR on tmpfs) turned every package run into two
+// full copies of a ~300 MB binary written to disk. Creating the dir inside
+// go's work dir keeps the hardlink, and go test removes that dir even when
+// the run is killed before testscript's own cleanup.
+func testscriptBinTempDirFor(exe string) string {
+	if exe == "" {
+		return ""
+	}
+	dir := filepath.Dir(exe)
+	if !strings.HasPrefix(filepath.Base(dir), "b") || !strings.HasPrefix(filepath.Base(filepath.Dir(dir)), "go-build") {
+		return ""
+	}
+	return dir
+}
+
+// binTempDirTestingM restores TMPDIR before running the tests. TestMain points
+// TMPDIR at the binary's filesystem only for the span in which testscript.Main
+// creates its command dir, so the per-run root stays every test's temp dir.
+type binTempDirTestingM struct {
+	m      testscript.TestingM
+	tmpdir string
+}
+
+func (m binTempDirTestingM) Run() int {
+	if err := os.Setenv("TMPDIR", m.tmpdir); err != nil {
+		panic(err)
+	}
+	return m.m.Run()
+}
+
 func (m cleanupTestingM) Run() int {
 	code := sessionpkg.FailOnKeyViolations(m.m.Run(), os.Stderr) // a guard panic a recover() swallowed still fails
 	for _, path := range m.paths {
@@ -339,10 +375,34 @@ func TestMain(m *testing.M) {
 	if tmuxSocketCleanupRoot != "" {
 		testRunner = cleanupTestingM{m: testRunner, paths: []string{tmuxSocketCleanupRoot}}
 	}
+	if exe, exeErr := os.Executable(); exeErr == nil {
+		if binTmp := testscriptBinTempDirFor(exe); binTmp != "" {
+			testRunner = binTempDirTestingM{m: testRunner, tmpdir: os.Getenv("TMPDIR")}
+			if err := os.Setenv("TMPDIR", binTmp); err != nil {
+				panic(err)
+			}
+		}
+	}
 	testscript.Main(testRunner, map[string]func(){
 		"gc": testscriptGC,
 		"bd": bdTestCmd,
 	})
+}
+
+func TestTestscriptBinTempDirFor(t *testing.T) {
+	work := filepath.Join(t.TempDir(), "go-build123", "b001")
+	for _, tc := range []struct {
+		name, exe, want string
+	}{
+		{"go test work dir", filepath.Join(work, "gc.test"), work},
+		{"no executable", "", ""},
+		{"go test -c binary in a repo", filepath.Join(t.TempDir(), "cmd", "gc", "gc.test"), ""},
+		{"b dir outside go-build", filepath.Join(t.TempDir(), "other", "b001", "gc.test"), ""},
+	} {
+		if got := testscriptBinTempDirFor(tc.exe); got != tc.want {
+			t.Errorf("%s: testscriptBinTempDirFor(%q) = %q, want %q", tc.name, tc.exe, got, tc.want)
+		}
+	}
 }
 
 func TestTutorial01(t *testing.T) {
