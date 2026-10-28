@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+
+	"github.com/gastownhall/gascity/internal/fsys"
 )
 
 // batchBackingSpy is a MemStore that also advertises BatchDeleter, recording the
@@ -277,3 +279,83 @@ func batchContainsAll(haystack []string, needles ...string) bool {
 }
 
 var _ BatchDeleter = (*CachingStore)(nil)
+
+// The cache holds active beads only, so the closed beads a retention sweep or
+// the wisp GC batch-deletes are usually absent from it. Their bead.deleted
+// events must still fire: they are read through the backing's exact batch read
+// (FileStore answers from memory) instead of being silently dropped.
+func TestCachingStoreDeleteBatchEmitsEventsForUncachedBeads(t *testing.T) {
+	fs, err := OpenFileStore(fsys.NewFake(), "/city/.gc/beads.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deletedEvents []string
+	cs := NewCachingStoreForTest(fs, func(evtType, beadID string, _ json.RawMessage) {
+		if evtType == "bead.deleted" {
+			deletedEvents = append(deletedEvents, beadID)
+		}
+	})
+	// Written straight to the backing: the cache never saw these beads.
+	var ids []string
+	for i := 0; i < 3; i++ {
+		b, err := fs.Create(Bead{Type: "task", Title: "closed run"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := fs.Close(b.ID); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, b.ID)
+	}
+
+	if err := cs.DeleteBatch(append(ids, "gc-missing")); err != nil {
+		t.Fatalf("DeleteBatch: %v", err)
+	}
+	if len(deletedEvents) != len(ids) || !batchContainsAll(deletedEvents, ids...) {
+		t.Fatalf("deleted events = %v, want one per deleted id %v", deletedEvents, ids)
+	}
+	for _, id := range ids {
+		if _, err := fs.Get(id); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("backing Get(%s) = %v, want ErrNotFound", id, err)
+		}
+	}
+}
+
+type failingDeleteMemStore struct {
+	*MemStore
+	failID string
+}
+
+func (s *failingDeleteMemStore) Delete(id string) error {
+	if id == s.failID {
+		return errors.New("delete boom")
+	}
+	return s.MemStore.Delete(id)
+}
+
+// Without a batch-capable backing the fallback deletes per bead. One failing id
+// must not stop the rest, and the error must report what was removed so a
+// caller's deleted count stays exact.
+func TestCachingStoreDeleteBatchFallbackContinuesAndReportsCommitted(t *testing.T) {
+	backing := &failingDeleteMemStore{MemStore: NewMemStore()}
+	cs := NewCachingStoreForTest(backing, nil)
+	a := mustBatchCreate(t, cs, Bead{Type: "task", Status: "closed"})
+	b := mustBatchCreate(t, cs, Bead{Type: "task", Status: "closed"})
+	c := mustBatchCreate(t, cs, Bead{Type: "task", Status: "closed"})
+	backing.failID = b.ID
+
+	err := cs.DeleteBatch([]string{a.ID, b.ID, c.ID})
+	var partial *BatchDeleteError
+	if !errors.As(err, &partial) {
+		t.Fatalf("DeleteBatch err = %v, want *BatchDeleteError", err)
+	}
+	if len(partial.Committed) != 2 || !batchContainsAll(partial.Committed, a.ID, c.ID) {
+		t.Fatalf("committed = %v, want %s and %s", partial.Committed, a.ID, c.ID)
+	}
+	if _, err := cs.Get(c.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get(%s) = %v, want deleted after an earlier id failed", c.ID, err)
+	}
+	if _, err := cs.Get(b.ID); err != nil {
+		t.Fatalf("Get(%s) = %v, want the failed id kept", b.ID, err)
+	}
+}

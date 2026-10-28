@@ -2295,3 +2295,188 @@ func TestFileStoreGuardedBatchConformance(t *testing.T) {
 		return s
 	})
 }
+
+var (
+	_ beads.BatchDeleter     = (*beads.FileStore)(nil)
+	_ beads.ExactBatchGetter = (*beads.FileStore)(nil)
+)
+
+func TestFileStoreGetExactBatch(t *testing.T) {
+	s, err := beads.OpenFileStore(fsys.NewFake(), "/city/.gc/beads.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.Create(beads.Bead{Title: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.Create(beads.Bead{Title: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found, unresolved, err := s.GetExactBatch([]string{b.ID, "gc-404", a.ID})
+	if err != nil {
+		t.Fatalf("GetExactBatch: %v", err)
+	}
+	if len(found) != 2 || found[a.ID].Title != "a" || found[b.ID].Title != "b" {
+		t.Fatalf("found = %+v, want a and b", found)
+	}
+	if len(unresolved) != 1 || unresolved[0] != "gc-404" {
+		t.Fatalf("unresolved = %v, want [gc-404]", unresolved)
+	}
+}
+
+func countTmpWrites(f *fsys.Fake, path string) int {
+	n := 0
+	for _, c := range f.Calls {
+		if c.Method == "WriteFile" && c.Path == path+".tmp" {
+			n++
+		}
+	}
+	return n
+}
+
+func TestFileStoreDeleteBatchRemovesIDsAndTouchingDepsInOneFlush(t *testing.T) {
+	f := fsys.NewFake()
+	path := "/city/.gc/beads.json"
+	s1, err := beads.OpenFileStore(f, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := beads.OpenFileStore(f, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for i := 0; i < 4; i++ {
+		b, err := s1.Create(beads.Bead{Title: fmt.Sprintf("b%d", i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, b.ID)
+	}
+	keep, gone1, gone2, other := ids[0], ids[1], ids[2], ids[3]
+	// keep depends on gone1 (external dependent — orphaned, not deleted);
+	// gone2 depends on other (deleted bead's own edge); keep→other survives.
+	for _, d := range [][2]string{{keep, gone1}, {gone2, other}, {keep, other}} {
+		if err := s1.DepAdd(d[0], d[1], "blocks"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	before := countTmpWrites(f, path)
+	if err := s1.DeleteBatch([]string{gone1, gone2, "gc-missing"}); err != nil {
+		t.Fatalf("DeleteBatch: %v", err)
+	}
+	if writes := countTmpWrites(f, path) - before; writes != 1 {
+		t.Fatalf("DeleteBatch flushed %d times, want exactly 1", writes)
+	}
+
+	for _, id := range []string{gone1, gone2} {
+		if _, err := s2.Get(id); !errors.Is(err, beads.ErrNotFound) {
+			t.Fatalf("Get(%q) after DeleteBatch err = %v, want ErrNotFound", id, err)
+		}
+	}
+	for _, id := range []string{keep, other} {
+		if _, err := s2.Get(id); err != nil {
+			t.Fatalf("Get(%q) survivor: %v", id, err)
+		}
+	}
+	down, err := s2.DepList(keep, "down")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(down) != 1 || down[0].DependsOnID != other {
+		t.Fatalf("DepList(%s, down) = %+v, want only edge to %s", keep, down, other)
+	}
+	up, err := s2.DepList(other, "up")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(up) != 1 || up[0].IssueID != keep {
+		t.Fatalf("DepList(%s, up) = %+v, want only edge from %s", other, up, keep)
+	}
+}
+
+func TestFileStoreDeleteBatchSkipsFlushWhenNothingMatches(t *testing.T) {
+	f := fsys.NewFake()
+	path := "/city/.gc/beads.json"
+	s, err := beads.OpenFileStore(f, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(beads.Bead{Title: "stay"}); err != nil {
+		t.Fatal(err)
+	}
+	before := countTmpWrites(f, path)
+	if err := s.DeleteBatch([]string{"gc-404", ""}); err != nil {
+		t.Fatalf("DeleteBatch(missing): %v", err)
+	}
+	if err := s.DeleteBatch(nil); err != nil {
+		t.Fatalf("DeleteBatch(nil): %v", err)
+	}
+	if writes := countTmpWrites(f, path) - before; writes != 0 {
+		t.Fatalf("DeleteBatch of absent ids flushed %d times, want 0", writes)
+	}
+}
+
+func TestFileStoreDeleteBatchRollsBackWhenSaveFails(t *testing.T) {
+	f := fsys.NewFake()
+	path := "/city/.gc/beads.json"
+	s1, err := beads.OpenFileStore(f, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := s1.Create(beads.Bead{Title: "a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s1.Create(beads.Bead{Title: "b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.DepAdd(a.ID, b.ID, "blocks"); err != nil {
+		t.Fatal(err)
+	}
+
+	f.Errors[path+".tmp"] = fmt.Errorf("disk full")
+	err = s1.DeleteBatch([]string{a.ID, b.ID})
+	if err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("DeleteBatch err = %v, want disk full", err)
+	}
+	var partial *beads.BatchDeleteError
+	if errors.As(err, &partial) && len(partial.Committed) > 0 {
+		t.Fatalf("failed flush reported committed ids %v, want none", partial.Committed)
+	}
+	delete(f.Errors, path+".tmp")
+
+	// The disk file is unchanged, so these reads answer from memory without a
+	// reload: they prove the in-memory rollback, not just the file on disk.
+	readsBefore := 0
+	for _, c := range f.Calls {
+		if c.Method == "ReadFile" && c.Path == path {
+			readsBefore++
+		}
+	}
+	for _, id := range []string{a.ID, b.ID} {
+		if _, err := s1.Get(id); err != nil {
+			t.Fatalf("Get(%q) after rollback: %v", id, err)
+		}
+	}
+	deps, err := s1.DepList(a.ID, "down")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deps) != 1 {
+		t.Fatalf("deps after rollback = %+v, want the a->b edge restored", deps)
+	}
+	readsAfter := 0
+	for _, c := range f.Calls {
+		if c.Method == "ReadFile" && c.Path == path {
+			readsAfter++
+		}
+	}
+	if readsAfter != readsBefore {
+		t.Fatalf("rollback reads reloaded the file %d time(s); want answers from memory", readsAfter-readsBefore)
+	}
+}

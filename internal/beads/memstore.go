@@ -553,6 +553,23 @@ func (m *MemStore) Get(id string) (Bead, error) {
 	return Bead{}, fmt.Errorf("getting bead %q: %w", id, ErrNotFound)
 }
 
+// getExactBatch returns copies of the beads whose id is in ids, in one pass.
+func (m *MemStore) getExactBatch(ids []string) map[string]Bead {
+	want := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		want[id] = struct{}{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	found := make(map[string]Bead, len(want))
+	for _, b := range m.beads {
+		if _, ok := want[b.ID]; ok {
+			found[b.ID] = cloneBead(b)
+		}
+	}
+	return found
+}
+
 // Children returns all non-closed beads whose ParentID matches the given ID,
 // in creation order by default.
 func (m *MemStore) Children(parentID string, opts ...QueryOpt) ([]Bead, error) {
@@ -705,6 +722,50 @@ func (m *MemStore) Delete(id string) error {
 		}
 	}
 	return fmt.Errorf("deleting bead %q: %w", id, ErrNotFound)
+}
+
+// deleteBatch removes every bead whose id is in ids, together with every
+// dependency edge touching one of them, and reports how many beads it removed.
+// Absent and empty ids are ignored. Dependents outside ids are orphaned (only
+// their edge goes), matching the BatchDeleter contract. It builds fresh slices
+// so a snapshot taken for rollback never aliases the mutated state.
+func (m *MemStore) deleteBatch(ids []string) int {
+	set := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			set[id] = struct{}{}
+		}
+	}
+	if len(set) == 0 {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	kept := make([]Bead, 0, len(m.beads))
+	removed := 0
+	for _, b := range m.beads {
+		if _, gone := set[b.ID]; gone {
+			removed++
+			delete(m.localStrings, b.ID)
+			continue
+		}
+		kept = append(kept, b)
+	}
+	if removed == 0 {
+		return 0
+	}
+	deps := make([]Dep, 0, len(m.deps))
+	for _, d := range m.deps {
+		_, fromGone := set[d.IssueID]
+		_, toGone := set[d.DependsOnID]
+		if fromGone || toGone {
+			continue
+		}
+		deps = append(deps, d)
+	}
+	m.beads = kept
+	m.deps = deps
+	return removed
 }
 
 // Ping always succeeds for MemStore (in-memory, always available).

@@ -597,6 +597,38 @@ func (fs *FileStore) Delete(id string) error {
 	return nil
 }
 
+// DeleteBatch removes exactly the given ids in one locked read-modify-write
+// and a single flush, implementing BatchDeleter. Every mutation rewrites the
+// whole store file, so a sweep deleting N beads one at a time rewrites it N
+// times; batching collapses that to one. Dependency edges touching a deleted
+// bead are dropped, external dependents are orphaned rather than deleted, and
+// absent ids are ignored (no flush when nothing matched). A failed flush rolls
+// the in-memory state back, so nothing was committed and the error is returned
+// as is.
+func (fs *FileStore) DeleteBatch(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	fs.fmu.Lock()
+	defer fs.fmu.Unlock()
+	if err := fs.locker.Lock(); err != nil {
+		return err
+	}
+	defer fs.locker.Unlock() //nolint:errcheck // best-effort unlock
+	if err := fs.reloadFromDisk(); err != nil {
+		return err
+	}
+	snap := fs.snapshotLocked()
+	if fs.MemStore.deleteBatch(ids) == 0 {
+		return nil
+	}
+	if err := fs.save(); err != nil {
+		fs.restoreFrom(snap.seq, snap.beads, snap.deps)
+		return err
+	}
+	return nil
+}
+
 // CloseAll closes multiple beads and sets metadata, then flushes once.
 func (fs *FileStore) CloseAll(ids []string, metadata map[string]string) (int, error) {
 	fs.fmu.Lock()
@@ -681,6 +713,25 @@ func (fs *FileStore) Get(id string) (Bead, error) {
 		return Bead{}, err
 	}
 	return fs.MemStore.Get(id)
+}
+
+// GetExactBatch reads many beads by exact id in one pass over the in-memory
+// store, implementing ExactBatchGetter. Ids it does not hold are returned in
+// unresolved, in input order.
+func (fs *FileStore) GetExactBatch(ids []string) (map[string]Bead, []string, error) {
+	fs.fmu.Lock()
+	defer fs.fmu.Unlock()
+	if err := fs.refreshReadStateLocked(); err != nil {
+		return nil, nil, err
+	}
+	found := fs.MemStore.getExactBatch(ids)
+	var unresolved []string
+	for _, id := range ids {
+		if _, ok := found[id]; !ok {
+			unresolved = append(unresolved, id)
+		}
+	}
+	return found, unresolved, nil
 }
 
 // List reloads the on-disk store before listing beads that match the query.
@@ -870,6 +921,7 @@ func (fs *FileStore) save() error {
 		fs.refreshFreshnessCache()
 		return err
 	}
+
 	// ArchiveGen survives archive-less stretches: a later archive must not
 	// reuse a generation some other handle still has cached.
 	fd := fileData{Seq: seq, Beads: beads, Deps: deps, Revisions: beadRevisions(beads), RevisionsSealed: true, Fences: beadFences(beads), ArchiveGen: fs.archive.gen}

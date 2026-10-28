@@ -1300,39 +1300,56 @@ func (c *CachingStore) Delete(id string) error {
 func (c *CachingStore) DeleteBatch(ids []string) error {
 	cd, ok := c.backing.(BatchDeleter)
 	if !ok {
+		// Keep going past a failed id, as the per-bead callers this replaces
+		// did, and report what was removed so the caller's count stays exact.
+		var committed []string
+		var deleteErr error
 		for _, id := range ids {
 			if id == "" {
 				continue
 			}
 			if err := c.deleteOrphaningDeps(id); err != nil {
-				return err
+				deleteErr = errors.Join(deleteErr, err)
+				continue
 			}
+			committed = append(committed, id)
 		}
-		return nil
+		if deleteErr != nil && len(committed) > 0 {
+			return &BatchDeleteError{Committed: committed, Err: deleteErr}
+		}
+		return deleteErr
 	}
 	if len(ids) == 0 {
 		return nil
 	}
 
-	// Snapshot bead.deleted payloads from the cache only. Unlike Delete, which
-	// reads each snapshot from the backing store, forwarding N backing Get calls
-	// here would reintroduce the per-bead subprocess storm this batch path exists
-	// to remove; a bead absent from the cache is still evicted but emits no
-	// event. In practice the wisp GC lists the closure just before deleting it,
-	// so members are warm in the cache.
+	// Snapshot bead.deleted payloads from the cache, then read the ids the
+	// cache does not hold (the cache keeps active beads only, so closed beads
+	// a retention sweep or the wisp GC prunes are usually absent) through the
+	// backing's exact batch read when it has one: one read per chunk, never
+	// one Get per bead, so the subprocess storm this batch path exists to
+	// remove does not come back. A bead neither source answers is still
+	// evicted but emits no event.
 	deleted := make(map[string]struct{}, len(ids))
 	c.mu.RLock()
 	events := make([]Bead, 0, len(ids))
+	var uncached []string
 	for _, id := range ids {
 		if id == "" {
+			continue
+		}
+		if _, dup := deleted[id]; dup {
 			continue
 		}
 		deleted[id] = struct{}{}
 		if b, ok := c.beads[id]; ok {
 			events = append(events, cloneBead(b))
+		} else {
+			uncached = append(uncached, id)
 		}
 	}
 	c.mu.RUnlock()
+	events = append(events, c.prefetchDeleteEventSnapshots(uncached)...)
 
 	if err := cd.DeleteBatch(ids); err != nil {
 		return c.reconcilePartialBatchDelete(err, events)
@@ -1346,6 +1363,38 @@ func (c *CachingStore) DeleteBatch(ids []string) error {
 		c.notifyChange(ChangeLocal, "bead.deleted", b)
 	}
 	return nil
+}
+
+// deleteEventPrefetchChunk bounds one exact batch read of uncached ids
+// snapshotted for bead.deleted events.
+const deleteEventPrefetchChunk = 256
+
+// prefetchDeleteEventSnapshots reads the beads ids names from the backing
+// store, in chunks, when it supports an exact batch read. It is best-effort:
+// a read error or an unsupported backing only means fewer events, never a
+// failed delete.
+func (c *CachingStore) prefetchDeleteEventSnapshots(ids []string) []Bead {
+	if len(ids) == 0 {
+		return nil
+	}
+	getter, ok := c.backing.(ExactBatchGetter)
+	if !ok {
+		return nil
+	}
+	var out []Bead
+	for start := 0; start < len(ids); start += deleteEventPrefetchChunk {
+		chunk := ids[start:min(start+deleteEventPrefetchChunk, len(ids))]
+		found, _, err := getter.GetExactBatch(chunk)
+		if err != nil {
+			continue
+		}
+		for _, id := range chunk {
+			if b, ok := found[id]; ok {
+				out = append(out, cloneBead(b))
+			}
+		}
+	}
+	return out
 }
 
 // evictBatchDeletedLocked removes exactly the ids in deleted from the cache:
