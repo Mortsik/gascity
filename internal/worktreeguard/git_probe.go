@@ -245,8 +245,9 @@ func (g *GitProbe) VerifyQuarantied(headSha string) error {
 //
 // A linked worktree (.git FILE) keeps its shared refs in the rig's common
 // dir, where they survive; only its per-worktree refs (refs/worktree/,
-// refs/bisect/, refs/rewritten/) and repositories nested in its tree die
-// with the directory, so only those are checked. That premise holds because
+// refs/bisect/, refs/rewritten/), the submodule stores in its own admin dir
+// and repositories nested in its tree die with the directory, so only those
+// are checked. That premise holds because
 // callers remove .git-file trees only through the rig's `git worktree
 // remove` (which refuses unregistered paths) and reaper discovery never adds
 // unregistered .git files.
@@ -259,6 +260,16 @@ func (g *GitProbe) UnsecuredRefs(headBranch string) ([]string, error) {
 	if fi, err := os.Lstat(gitDir); err == nil && fi.Mode().IsRegular() {
 		// Linked worktree: shared refs live in the rig's common dir and
 		// survive; per-worktree refs and nested repositories die with it.
+		// Its submodule repositories live in its OWN admin dir
+		// (<common>/worktrees/<name>/modules/), deleted with it.
+		adminOut, err := gitOut(g.repoPath, "rev-parse", "--absolute-git-dir")
+		if err != nil {
+			return nil, fmt.Errorf("linked worktree git dir: %w", err)
+		}
+		unsecured, err := submoduleStores(strings.TrimSpace(adminOut))
+		if err != nil {
+			return nil, err
+		}
 		nested, err := nestedRepos(g.repoPath)
 		if err != nil {
 			return nil, err
@@ -267,7 +278,7 @@ func (g *GitProbe) UnsecuredRefs(headBranch string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		return append(nested, refs...), nil
+		return append(append(unsecured, nested...), refs...), nil
 	}
 	var unsecured []string
 	entries, err := os.ReadDir(filepath.Join(gitDir, "worktrees"))
@@ -277,13 +288,11 @@ func (g *GitProbe) UnsecuredRefs(headBranch string) ([]string, error) {
 	for _, e := range entries {
 		unsecured = append(unsecured, "worktree:"+e.Name())
 	}
-	modules, err := os.ReadDir(filepath.Join(gitDir, "modules"))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("submodule store listing: %w", err)
+	modules, err := submoduleStores(gitDir)
+	if err != nil {
+		return nil, err
 	}
-	for _, e := range modules {
-		unsecured = append(unsecured, "submodule:"+e.Name())
-	}
+	unsecured = append(unsecured, modules...)
 	nested, err := nestedRepos(g.repoPath)
 	if err != nil {
 		return nil, err
@@ -294,6 +303,21 @@ func (g *GitProbe) UnsecuredRefs(headBranch string) ([]string, error) {
 		return nil, err
 	}
 	return append(unsecured, refs...), nil
+}
+
+// submoduleStores names each submodule repository stored under
+// <gitDir>/modules/ as "submodule:<name>" — still present after `git
+// submodule deinit`, with no marker left in the working tree.
+func submoduleStores(gitDir string) ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(gitDir, "modules"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("submodule store listing: %w", err)
+	}
+	var found []string
+	for _, e := range entries {
+		found = append(found, "submodule:"+e.Name())
+	}
+	return found, nil
 }
 
 // perWorktreeRefPrefixes are the ref namespaces git keeps per worktree (in a

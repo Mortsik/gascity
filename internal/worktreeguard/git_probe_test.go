@@ -673,3 +673,33 @@ func TestGitProbeGuardRefusesStandaloneWithSubmoduleStore(t *testing.T) {
 		t.Fatalf("verdict = %+v, want refuse non-head-refs-unsecured: submodule:sub", v)
 	}
 }
+
+// TestGitProbeGuardRefusesLinkedWorktreeWithSubmoduleStore: a linked
+// worktree keeps its submodule repositories in its OWN admin dir
+// (<rig>/.git/worktrees/<name>/modules/), which a forced `git worktree
+// remove` deletes — after `deinit` nothing in the tree marks them (local
+// critic REVIEW-GATE 2026-10-28 round 5 B2).
+func TestGitProbeGuardRefusesLinkedWorktreeWithSubmoduleStore(t *testing.T) {
+	rig := newRig(t)
+	wt := newLinkedWorktree(t, rig, "polecat/ga-lnk06", false)
+	subSrc := filepath.Join(t.TempDir(), "subsrc")
+	if err := os.MkdirAll(subSrc, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	initRepo(t, subSrc)
+	commitFile(t, subSrc, "s.txt")
+	git(t, wt, "-c", "protocol.file.allow=always", "submodule", "add", "-q", subSrc, "sub")
+	git(t, wt, "commit", "-q", "-m", "add sub")
+	sub := filepath.Join(wt, "sub")
+	git(t, sub, "config", "user.email", "test@example.com")
+	git(t, sub, "config", "user.name", "Test")
+	git(t, sub, "checkout", "-q", "-b", "local-only")
+	commitFile(t, sub, "local.txt")
+	git(t, wt, "submodule", "deinit", "-q", "-f", "sub")
+
+	var stderr bytes.Buffer
+	v := GuardRemoval(NewGitProbe(wt, rig), wt, "ga-lnk06", &stderr)
+	if v.Secured || v.Reason != "non-head-refs-unsecured: submodule:sub" {
+		t.Fatalf("verdict = %+v, want refuse non-head-refs-unsecured: submodule:sub", v)
+	}
+}
