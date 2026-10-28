@@ -94,6 +94,17 @@ func (s orderTrackingSweepScopedStore) orderTrackingSweepKey() string {
 	return s.key
 }
 
+// DeleteBatch forwards the batched-delete capability the embedded beads.Store
+// does not promote, so the closed-retention prune reaches a FileStore as one
+// whole-file rewrite instead of one per expired run. A backing without the
+// capability reports ErrBatchDeleteUnsupported, the cue to delete per bead.
+func (s orderTrackingSweepScopedStore) DeleteBatch(ids []string) error {
+	if deleter, ok := s.Store.(beads.BatchDeleter); ok {
+		return deleter.DeleteBatch(ids)
+	}
+	return beads.ErrBatchDeleteUnsupported
+}
+
 func openCityOrderStore(stderr io.Writer, cmdName string) (beads.OrdersStore, int) {
 	cityPath, err := resolveCity()
 	if err != nil {

@@ -10949,3 +10949,203 @@ func TestHasOpenWorkStrictIgnoresAForgedOrderRunLabel(t *testing.T) {
 		t.Fatalf("index summary %+v, want no run of digest", summary)
 	}
 }
+
+// batchDeleteSpyStore records how the retention prune deletes: a FileStore
+// rewrites its whole file per mutation, so the prune must reach the backend
+// as one DeleteBatch instead of one Delete per expired run.
+type batchDeleteSpyStore struct {
+	*beads.MemStore
+	batches       [][]string
+	singleDeletes int
+	batchErr      error
+}
+
+func (s *batchDeleteSpyStore) Delete(id string) error {
+	s.singleDeletes++
+	return s.MemStore.Delete(id)
+}
+
+func (s *batchDeleteSpyStore) DeleteBatch(ids []string) error {
+	s.batches = append(s.batches, slices.Clone(ids))
+	if s.batchErr != nil {
+		return s.batchErr
+	}
+	for _, id := range ids {
+		if err := s.MemStore.Delete(id); err != nil && !errors.Is(err, beads.ErrNotFound) {
+			return err
+		}
+	}
+	return nil
+}
+
+func expiredOrderTrackingSeed(now time.Time, orderNames ...string) []beads.Bead {
+	beadTime := now.Add(-48 * time.Hour)
+	var seed []beads.Bead
+	for _, name := range orderNames {
+		for i := 0; i < minClosedOrderTrackingRetained+2; i++ {
+			seed = append(seed, beads.Bead{
+				ID:        fmt.Sprintf("%s-%02d", name, i),
+				Title:     "order:" + name,
+				Status:    "closed",
+				Type:      "task",
+				CreatedAt: beadTime.Add(time.Duration(i) * time.Minute),
+				Labels:    []string{"order-run:" + name, labelOrderTracking},
+			})
+		}
+	}
+	return seed
+}
+
+func TestSweepClosedOrderTrackingRetentionDeletesInOneBatch(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	seed := expiredOrderTrackingSeed(now, "alpha", "beta")
+	// alpha-00 still owns an open step: it must be held back from the batch.
+	seed = append(seed, beads.Bead{
+		ID: "alpha-00-step", Title: "live step", Status: "open", Type: "task",
+		CreatedAt: now.Add(-48 * time.Hour), Ephemeral: true,
+		Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: "alpha-00"},
+	})
+	store := &batchDeleteSpyStore{MemStore: beads.NewMemStoreFrom(100, seed, nil)}
+
+	deleted, err := sweepClosedOrderTrackingRetention(store, now, orderTrackingRetentionPolicy{
+		deleteAfterClose: 24 * time.Hour,
+		retainLast:       minClosedOrderTrackingRetained,
+	}, nil)
+	if err != nil {
+		t.Fatalf("sweepClosedOrderTrackingRetention: %v", err)
+	}
+	if deleted != 3 {
+		t.Fatalf("deleted = %d, want 3 (alpha-01, beta-00, beta-01)", deleted)
+	}
+	if store.singleDeletes != 0 {
+		t.Fatalf("single deletes = %d, want 0 (BatchDeleter backend)", store.singleDeletes)
+	}
+	if len(store.batches) != 1 {
+		t.Fatalf("batches = %v, want exactly one", store.batches)
+	}
+	got := slices.Sorted(slices.Values(store.batches[0]))
+	if want := []string{"alpha-01", "beta-00", "beta-01"}; !slices.Equal(got, want) {
+		t.Fatalf("batch = %v, want %v", got, want)
+	}
+	if _, err := store.Get("alpha-00"); err != nil {
+		t.Fatalf("alpha-00 owns an open step and must be retained: %v", err)
+	}
+}
+
+func TestSweepClosedOrderTrackingRetentionBoundedBatchHonorsLimit(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	store := &batchDeleteSpyStore{MemStore: beads.NewMemStoreFrom(100, expiredOrderTrackingSeed(now, "alpha", "beta"), nil)}
+
+	deleted, err := sweepClosedOrderTrackingRetentionBounded(store, now, orderTrackingRetentionPolicy{
+		deleteAfterClose: 24 * time.Hour,
+		retainLast:       minClosedOrderTrackingRetained,
+	}, nil, 3)
+	if err != nil {
+		t.Fatalf("sweepClosedOrderTrackingRetentionBounded: %v", err)
+	}
+	if deleted != 3 {
+		t.Fatalf("deleted = %d, want 3 (limit)", deleted)
+	}
+	if store.singleDeletes != 0 || len(store.batches) != 1 || len(store.batches[0]) != 3 {
+		t.Fatalf("batches = %v, single deletes = %d; want one batch of 3", store.batches, store.singleDeletes)
+	}
+}
+
+func TestSweepClosedOrderTrackingRetentionCountsOnlyCommittedOnBatchFailure(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	store := &batchDeleteSpyStore{
+		MemStore: beads.NewMemStoreFrom(100, expiredOrderTrackingSeed(now, "alpha"), nil),
+		batchErr: &beads.BatchDeleteError{Committed: []string{"alpha-00"}, Err: errors.New("disk full")},
+	}
+
+	deleted, err := sweepClosedOrderTrackingRetention(store, now, orderTrackingRetentionPolicy{
+		deleteAfterClose: 24 * time.Hour,
+		retainLast:       minClosedOrderTrackingRetained,
+	}, nil)
+	if err == nil {
+		t.Fatal("err = nil, want the batch failure surfaced")
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted = %d, want 1 (only the committed id)", deleted)
+	}
+}
+
+// A wrapper that advertises BatchDeleter but whose backing lacks it must fall
+// back to the per-bead graph delete, not fail the sweep.
+type unsupportedBatchStore struct{ *beads.MemStore }
+
+func (unsupportedBatchStore) DeleteBatch([]string) error { return beads.ErrBatchDeleteUnsupported }
+
+func TestSweepClosedOrderTrackingRetentionFallsBackWhenBatchUnsupported(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	store := unsupportedBatchStore{MemStore: beads.NewMemStoreFrom(100, expiredOrderTrackingSeed(now, "alpha"), nil)}
+
+	deleted, err := sweepClosedOrderTrackingRetention(store, now, orderTrackingRetentionPolicy{
+		deleteAfterClose: 24 * time.Hour,
+		retainLast:       minClosedOrderTrackingRetained,
+	}, nil)
+	if err != nil {
+		t.Fatalf("sweepClosedOrderTrackingRetention: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted = %d, want 2", deleted)
+	}
+	for _, id := range []string{"alpha-00", "alpha-01"} {
+		if _, err := store.Get(id); !errors.Is(err, beads.ErrNotFound) {
+			t.Fatalf("Get(%s) err = %v, want ErrNotFound", id, err)
+		}
+	}
+}
+
+// The multi-scope sweep wraps each store in orderTrackingSweepScopedStore;
+// its embedded beads.Store must not swallow the batched-delete capability.
+func TestOrderTrackingSweepScopedStoreForwardsBatchDelete(t *testing.T) {
+	spy := &batchDeleteSpyStore{MemStore: beads.NewMemStoreFrom(0, nil, nil)}
+	var store beads.Store = orderTrackingSweepScopedStore{Store: spy, label: "city", key: "city"}
+	deleter, ok := store.(beads.BatchDeleter)
+	if !ok {
+		t.Fatal("orderTrackingSweepScopedStore does not expose BatchDeleter")
+	}
+	if err := deleter.DeleteBatch([]string{"x"}); err != nil {
+		t.Fatalf("DeleteBatch: %v", err)
+	}
+	if len(spy.batches) != 1 {
+		t.Fatalf("backing batches = %v, want the call forwarded", spy.batches)
+	}
+
+	plain := orderTrackingSweepScopedStore{Store: beads.NewMemStore()}
+	if err := plain.DeleteBatch([]string{"x"}); !errors.Is(err, beads.ErrBatchDeleteUnsupported) {
+		t.Fatalf("DeleteBatch over a non-batch backing err = %v, want ErrBatchDeleteUnsupported", err)
+	}
+}
+
+// The cleared set gets one more set-level guard right before the batch: a run
+// that gained an open step after its per-candidate check must not be batch
+// deleted. The guarded per-bead path then retains it and still prunes the rest.
+func TestDeleteClearedOrderTrackingFallsBackWhenSetGuardFails(t *testing.T) {
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	seed := expiredOrderTrackingSeed(now, "alpha")
+	seed = append(seed, beads.Bead{
+		ID: "alpha-00-step", Title: "late step", Status: "open", Type: "task",
+		CreatedAt: now, Ephemeral: true,
+		Metadata: map[string]string{beadmeta.RootBeadIDMetadataKey: "alpha-00"},
+	})
+	store := &batchDeleteSpyStore{MemStore: beads.NewMemStoreFrom(100, seed, nil)}
+
+	deleted, retained, err := deleteClearedOrderTracking(store, []string{"alpha-00", "alpha-01"})
+	if err != nil {
+		t.Fatalf("deleteClearedOrderTracking: %v", err)
+	}
+	if len(store.batches) != 0 {
+		t.Fatalf("batches = %v, want none once the set guard refuses", store.batches)
+	}
+	if deleted != 1 || len(retained) != 1 || retained[0] != "alpha-00" {
+		t.Fatalf("deleted = %d, retained = %v; want 1 deleted and alpha-00 retained", deleted, retained)
+	}
+	if _, err := store.Get("alpha-00"); err != nil {
+		t.Fatalf("alpha-00 owns an open step and must survive: %v", err)
+	}
+	if _, err := store.Get("alpha-01"); !errors.Is(err, beads.ErrNotFound) {
+		t.Fatalf("alpha-01 must still prune: err = %v", err)
+	}
+}
