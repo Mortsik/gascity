@@ -144,11 +144,12 @@ func doStoragePreflight(request storageOperatorRequest, stdout, stderr io.Writer
 	// 3. The expensive one, and the reason this verb most earns its place: a bead
 	// in a rig scope is refused BY NAME and no command this binary carries can
 	// repair it. Finding that out inside a stopped-city window is the worst
-	// possible time. It runs here, ahead of the convergence read, because that is
-	// where the migration runs it — a converged city with rig residue is refused
-	// by the census, so a rehearsal that returned early on the marker would clear
-	// it.
-	if err := censusRigInfraResidue(request.CityPath, request.Cfg); err != nil {
+	// possible time. It runs here, ahead of the convergence verdict, because that
+	// is where the migration runs it — a converged city with rig residue is
+	// refused by the census, so a rehearsal that returned early on the marker
+	// would clear it. It reads the marker the same way the migration does, so a
+	// converged city's live rig graph is let through here as it is there.
+	if err := censusRigInfraResidue(request.CityPath, request.Cfg, infraCityConverged(target)); err != nil {
 		return preflightBlock(stdout, "rig scopes", err)
 	}
 	preflightPass(stdout, "rig scopes", "no infrastructure bead lives outside this city's work store")

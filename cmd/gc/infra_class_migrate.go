@@ -1374,6 +1374,15 @@ const (
 // An error is never a state. Neither a marker that could not be read nor a
 // database that could not be stat'ed says the city failed to converge, and the
 // caller treats both as undecided rather than as absence.
+// infraCityConverged reports whether a run against target finds a converged
+// city — marker and binding database both present — and so copies nothing. A
+// state that cannot be read is reported as not converged: the census then keeps
+// its stricter pre-copy rules, and the run itself reports the read failure.
+func infraCityConverged(target infraBindingTarget) bool {
+	state, err := readInfraConvergenceState(target)
+	return err == nil && state == infraConvergenceMarked
+}
+
 func readInfraConvergenceState(target infraBindingTarget) (infraConvergenceState, error) {
 	marked, err := infraPathExists(target.MarkerPath())
 	if err != nil {

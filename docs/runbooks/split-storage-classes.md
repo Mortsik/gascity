@@ -153,7 +153,12 @@ What the command does, in order:
    and so is a closed one whose id the city work store also holds. Do not
    reopen such a historical rig step after the cutover: those readers cannot
    see it, so it gets no step reminders and never autocloses its root. Run the
-   work again as a new workflow instead.
+   work again as a new workflow instead. On a re-run against a city that has
+   already converged — to finish an interrupted clear, or the clear that
+   `gc storage recover-stranded` asks for — nothing is copied, and a rig that
+   keeps its own ledger has been cooking its workflows there since the
+   cutover, so its graph rows are not counted at all, open ones included. A
+   message, session, order or nudge in a rig is still refused.
 5. Copies every infrastructure bead with its id and within-class dependency
    topology preserved.
 6. Closes the destination, reopens it, and proves field-level equality against

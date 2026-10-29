@@ -417,7 +417,7 @@ func doStorageMigrate(ctx context.Context, request storageOperatorRequest, stdou
 		}
 	}()
 
-	if err := censusRigInfraResidue(request.CityPath, request.Cfg); err != nil {
+	if err := censusRigInfraResidue(request.CityPath, request.Cfg, infraCityConverged(target)); err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", logPrefix, err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -805,6 +805,18 @@ var openStorageScopeStore = openStoreAtForCity
 // those readers, so it neither gets step reminders nor autocloses its root —
 // re-run the work as a new workflow instead.
 //
+// On a city that has already converged (converged: its marker and binding
+// database both exist, so the run only re-proves the copy and clears retained
+// copies) every graph row of such a rig is let through, open ones included.
+// Graph bindings are city-keyed (scopeGraphStore): after the cutover a rig that
+// keeps its own ledger still cooks its workflows there, so a live fleet always
+// has open graph rows in its rigs and a census that refused them would make the
+// clear a recover-stranded asks for unreachable without draining every rig.
+// Nothing is copied on that run, so those rows are not the copy's to strand.
+// Every other class stays refused: messaging, sessions, orders and nudges are
+// routed to the binding for every scope, so a row of theirs in a rig is a stray
+// write no reader will find.
+//
 // So it is refused by name here, before the guard is doing any good, rather
 // than counted or repaired. Repairing it would mean importing rig rows into the
 // city work store, and this binary carries no such importer — naming one in the
@@ -819,7 +831,7 @@ var openStorageScopeStore = openStoreAtForCity
 // (censusRowDiffers)? Such a row is carried by the copy; anything else —
 // absent, or the same id in another state — would be stranded and is refused
 // by name, with the remedy each needs.
-func censusRigInfraResidue(cityPath string, cfg *config.City) error {
+func censusRigInfraResidue(cityPath string, cfg *config.City, converged bool) error {
 	if cfg == nil {
 		return nil
 	}
@@ -839,6 +851,11 @@ func censusRigInfraResidue(cityPath string, cfg *config.City) error {
 		name := fmt.Sprintf("%s (rig %s)", row.bead.ID, row.rig)
 		city, ok := carried[row.bead.ID]
 		switch {
+		case converged && row.rigGraph:
+			// A converged city's rig cooks its graph into its own ledger by
+			// design; this run copies nothing, so there is nothing to strand —
+			// not even when the city work store holds the same id, since what
+			// the binding answers for that id was settled by the first copy.
 		case !ok && row.history:
 			// Finished rig graph history: nothing the cutover moves or routes
 			// shadows it, and nothing live reads it.
@@ -852,12 +869,14 @@ func censusRigInfraResidue(cityPath string, cfg *config.City) error {
 }
 
 // rigInfraRow is one infrastructure row a rig scope lists, with the rig that
-// listed it. history marks a closed graph row in a rig that keeps its own graph
-// ledger: residue only if the city work store holds the same id.
+// listed it. rigGraph marks a graph row in a rig that keeps its own graph
+// ledger, and history the closed ones among them: residue only if the city
+// work store holds the same id.
 type rigInfraRow struct {
-	bead    beads.Bead
-	rig     string
-	history bool
+	bead     beads.Bead
+	rig      string
+	rigGraph bool
+	history  bool
 }
 
 // listRigInfraRows lists the infrastructure rows every bound rig scope holds,
@@ -890,17 +909,15 @@ func listRigInfraRows(cityPath string, rigs []config.Rig) ([]rigInfraRow, error)
 			if class == coordclass.ClassWork {
 				continue
 			}
-			// After a cutover new graph beads land in the city binding
-			// (resolveGraphStore), the rig dispatcher still reads the rig's own
-			// ledger as well (controlGraphExtraLeg), but the one-shot graph
-			// readers (cliGraphStore: wisp step injection, molecule and wisp
-			// autoclose) read the binding only. They act on live workflows, so
-			// an open rig step would lose them and stays refused; a closed one
-			// is history nothing re-reads. A production city carried 45k closed
-			// rig steps, and refusing them asked for a move this binary cannot
-			// make.
-			history := class == coordclass.ClassGraph && rigKeepsGraph && bead.Status == "closed"
-			found = append(found, rigInfraRow{bead: bead, rig: rig.Name, history: history})
+			// The rig dispatcher reads the rig's own ledger (controlGraphExtraLeg),
+			// but the one-shot graph readers (cliGraphStore: wisp step
+			// injection, molecule and wisp autoclose) read the binding only.
+			// They act on live workflows, so before the first copy an open rig
+			// step would lose them and stays refused; a closed one is history
+			// nothing re-reads. A production city carried 45k closed rig steps,
+			// and refusing them asked for a move this binary cannot make.
+			rigGraph := class == coordclass.ClassGraph && rigKeepsGraph
+			found = append(found, rigInfraRow{bead: bead, rig: rig.Name, rigGraph: rigGraph, history: rigGraph && bead.Status == "closed"})
 		}
 	}
 	return found, nil
