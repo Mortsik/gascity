@@ -4,6 +4,7 @@ import (
 	"io"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/session"
@@ -53,6 +54,26 @@ func hookStampSessionCurrentClaim(sessionID, beadID string) error {
 		return err
 	}
 	_, err = sessFront.SetCurrentClaim(sessionID, beadID)
+	return err
+}
+
+// hookStampSessionNoopServe records that the session identified by sessionID
+// re-served the in-progress claim beadID without starting work on it. It is the
+// production implementation of the hookClaimOps.StampSessionNoopServe seam.
+//
+// The write goes through session.Store.RecordClaimNoopServe — the same routed,
+// exact-id front door the claim back-channel uses, so a [beads.classes.sessions]
+// relocation reaches it — which stamps the beadmeta.ClaimNoopServe* pair in one
+// batch. The instant advances on every re-serve by design: the execution-claim
+// backstop holds a seat as waiting on an unblock only while its freshest serve
+// postdates the nudge that seat is answering, so a serve that stops advancing
+// (a wedged or abandoned pane) stops holding.
+func hookStampSessionNoopServe(sessionID, beadID string, at time.Time) error {
+	sessFront, err := sessionCurrentClaimFrontDoor()
+	if err != nil {
+		return err
+	}
+	_, err = sessFront.RecordClaimNoopServe(sessionID, beadID, at)
 	return err
 }
 

@@ -621,6 +621,51 @@ func (s *Store) SetCurrentClaim(id, beadID string) (bool, error) {
 	return true, nil
 }
 
+// RecordClaimNoopServe stamps the no-op re-serve disposition for the claim
+// beadID the session identified by id most recently re-served through `gc hook
+// --claim` without starting work on it (action=work, reason=existing_assignment:
+// the seat woke, re-verified a claim it already holds, and stood by). It writes
+// the beadmeta.ClaimNoopServe* pair — the work bead id and the RFC3339 instant
+// of the serve — in ONE batch, so the pair a reader sees is never half a serve.
+//
+// The instant is the point of the write, so unlike SetCurrentClaim the value is
+// NOT compare-and-skipped across serves: a fresher serve is fresher evidence,
+// and the execution-claim backstop requires exactly that (a serve at or after
+// its last delivered nudge) before it holds a seat as waiting on an unblock.
+// The skip that remains is the same-second one: re-serves within one truncated
+// second are indistinguishable to the reader, so the second one writes nothing.
+//
+// validatedBead resolves the id EXACTLY and refuses a non-session bead, for the
+// same reason SetCurrentClaim does. It reports whether a write was issued.
+func (s *Store) RecordClaimNoopServe(id, beadID string, at time.Time) (bool, error) {
+	b, err := s.validatedBead(id)
+	if err != nil {
+		return false, err
+	}
+	beadID = strings.TrimSpace(beadID)
+	ts := at.UTC().Format(time.RFC3339)
+	if beadID == "" {
+		return false, nil
+	}
+	if strings.TrimSpace(b.Metadata[beadmeta.ClaimNoopServeWorkMetadataKey]) == beadID &&
+		strings.TrimSpace(b.Metadata[beadmeta.ClaimNoopServeAtMetadataKey]) == ts {
+		return false, nil
+	}
+	// The generic batch tier, not ApplyPatch: these are advisory pacing keys,
+	// not lifecycle premises, and R8's ratchet (TestLegacyRawSessionWrites)
+	// reads an ApplyPatch whose keys it cannot resolve — the beadmeta consts
+	// live outside its scan dirs — as a raw session-premise write. The pair
+	// still lands as one SetMetadataBatch, which is all ApplyPatch is here
+	// (store.go: "ApplyPatch == setMetaBatch == store.SetMetadataBatch").
+	if err := s.store.SetMetadataBatch(b.ID, map[string]string{
+		beadmeta.ClaimNoopServeWorkMetadataKey: beadID,
+		beadmeta.ClaimNoopServeAtMetadataKey:   ts,
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // CurrentClaimBeadID returns the id of the work bead this session most recently
 // claimed through `gc hook --claim` ("" when unset). It is the read half of
 // SetCurrentClaim and the front door for `gc hook current`.

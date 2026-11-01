@@ -835,6 +835,163 @@ func TestExecutionBackstopClearsTheLatchTokenWithTheClaim(t *testing.T) {
 	}
 }
 
+// answerNudgeWithNoopServe simulates what the SEAT does when it answers a
+// delivered claim nudge by standing by: it wakes, `gc hook --claim` re-serves
+// the in-progress claim it already holds (action=work reason=existing_assignment),
+// and the hook records that no-op disposition on the session row (the
+// beadmeta.ClaimNoopServe* pair) at the fixture's current clock.
+func (f *executionBackstopFixture) answerNudgeWithNoopServe(t *testing.T) {
+	t.Helper()
+	f.setSessionMeta(t, map[string]string{
+		beadmeta.ClaimNoopServeWorkMetadataKey: f.work.ID,
+		beadmeta.ClaimNoopServeAtMetadataKey:   f.now.UTC().Format(time.RFC3339),
+	})
+}
+
+// TestExecutionBackstopHoldsASeatThatAnswersWithADocumentedNoop is the
+// AutoSearch-w2sy6 regression (bead autosearch-rko): a claimed step with a LIVE
+// executor session that answers a delivered nudge with a documented
+// unsatisfied-conditional disposition — the hook re-serves the existing
+// assignment and the seat stands by, escalating once and deduping every
+// identical directive after that — must not keep re-entering the
+// nudge → exhausted → execution.step_stalled → drain cycle. After the first
+// answered no-op wake the backstop records a NAMED waiting-on outcome (once per
+// claim) and holds: no further nudge, no step_stalled, no drain, for as long as
+// the claim is held and the seat keeps running.
+func TestExecutionBackstopHoldsASeatThatAnswersWithADocumentedNoop(t *testing.T) {
+	f := newExecutionBackstopFixture(t)
+	// Observe, then deliver exactly one nudge past the grace window.
+	f.idleFor(t, 10*time.Minute)
+	f.tick(t)
+	f.now = f.now.Add(idleClaimNudgeGrace + idleClaimNudgeBackoff)
+	f.idleFor(t, 10*time.Minute)
+	f.tick(t)
+	if got := f.nudgeCount(); got != 1 {
+		t.Fatalf("delivered nudges before the answer = %d, want 1; stdout=%s", got, f.stdout.String())
+	}
+
+	// The seat answers that nudge by re-serving its claim and standing by.
+	f.answerNudgeWithNoopServe(t)
+
+	// Every stale tick after the answer: the cycle must not restart. Before the
+	// fix this shape spent the remaining attempts and escalated (one
+	// step_stalled per latch window, forever — the observed journal spam).
+	f.tickStale(t)
+
+	if got := f.nudgeCount(); got != 1 {
+		t.Fatalf("delivered nudges after a documented no-op answer = %d, want no further delivery", got)
+	}
+	if got := f.stalledEvents(); got != 0 {
+		t.Fatalf("execution.step_stalled events after a documented no-op answer = %d, want 0", got)
+	}
+	if len(f.drained) != 0 {
+		t.Fatalf("drain requests after a documented no-op answer = %v, want none", f.drained)
+	}
+	// The hold is NAMED, and the waiting-on outcome is latched once per claim.
+	if got := f.sessionMeta(t, executionClaimHoldKey); !strings.HasPrefix(got, executionHoldWaitingOn+" ") {
+		t.Fatalf("hold breadcrumb = %q, want the named %s gate", got, executionHoldWaitingOn)
+	}
+	if got := f.sessionMeta(t, executionClaimWaitingOnWorkKey); got != f.work.ID {
+		t.Fatalf("waiting-on latch work = %q, want the claimed bead %q", got, f.work.ID)
+	}
+	if f.sessionMeta(t, executionClaimWaitingOnKey) == "" {
+		t.Fatal("waiting-on latch carries no timestamp; the outcome would not be observable")
+	}
+	// The answer is a disposition, not progress: the pacing state it answered
+	// stays spent (the marker is not re-observed, the attempt count unchanged).
+	if got := f.sessionMeta(t, executionClaimNudgeCountKey); got != "1" {
+		t.Fatalf("nudge attempt count after the answer = %q, want the delivered 1 (a no-op serve is not progress)", got)
+	}
+}
+
+// TestExecutionBackstopWaitingOnSurvivesRecyclesOnTheSameClaim pins the
+// incident's refire shape: the wake machinery may recycle the executor while it
+// waits (a fresh instance_token on the same session row re-adopting the same
+// claim), and each recycle used to re-arm the whole nudge cycle. As long as the
+// recycled seat answers its fresh cycle's first nudge with a fresh no-op serve,
+// the backstop holds and never re-escalates — one waiting-on outcome per claim,
+// not one per incarnation.
+func TestExecutionBackstopWaitingOnSurvivesRecyclesOnTheSameClaim(t *testing.T) {
+	f := newExecutionBackstopFixture(t)
+	f.setInstanceToken(t, "incarnation-1")
+	f.idleFor(t, 10*time.Minute)
+	f.tick(t)
+	f.now = f.now.Add(idleClaimNudgeGrace + idleClaimNudgeBackoff)
+	f.idleFor(t, 10*time.Minute)
+	f.tick(t)
+	f.answerNudgeWithNoopServe(t)
+	f.tickStale(t)
+
+	// The seat recycles (fresh token, same session bead, same claim): the marker
+	// resets and the backstop is allowed ONE nudge to re-ask...
+	f.setInstanceToken(t, "incarnation-2")
+	f.now = f.now.Add(idleClaimNudgeBackoff)
+	f.idleFor(t, 10*time.Minute)
+	f.tick(t) // fresh observation for the new incarnation
+	f.now = f.now.Add(idleClaimNudgeGrace + idleClaimNudgeBackoff)
+	f.idleFor(t, 10*time.Minute)
+	f.tick(t) // the one re-ask
+	if got := f.nudgeCount(); got != 2 {
+		t.Fatalf("delivered nudges across the recycle = %d, want exactly one re-ask", got)
+	}
+
+	// ...and the recycled seat answers it the same way. No escalation, ever.
+	f.answerNudgeWithNoopServe(t)
+	f.tickStale(t)
+	if got := f.nudgeCount(); got != 2 {
+		t.Fatalf("delivered nudges after the recycled answer = %d, want no further delivery", got)
+	}
+	if got := f.stalledEvents(); got != 0 {
+		t.Fatalf("execution.step_stalled events across answering recycles = %d, want 0", got)
+	}
+	if len(f.drained) != 0 {
+		t.Fatalf("drain requests across answering recycles = %v, want none", f.drained)
+	}
+}
+
+// TestExecutionBackstopWaitingOnYieldsToASeatThatStopsAnswering is the safety
+// net for the hold above: a recycled seat that does NOT answer its fresh nudge
+// cycle (the serve it carries predates the cycle, as a wedged or abandoned
+// pane would leave it) must fall back to the ordinary bounded stall — nudges
+// spent, one step_stalled, one drain. Waiting-on throttles repetition; it never
+// disarms the backstop for a claim whose holder stopped answering.
+func TestExecutionBackstopWaitingOnYieldsToASeatThatStopsAnswering(t *testing.T) {
+	f := newExecutionBackstopFixture(t)
+	f.setInstanceToken(t, "incarnation-1")
+	f.idleFor(t, 10*time.Minute)
+	f.tick(t)
+	f.now = f.now.Add(idleClaimNudgeGrace + idleClaimNudgeBackoff)
+	f.idleFor(t, 10*time.Minute)
+	f.tick(t)
+	f.answerNudgeWithNoopServe(t)
+	f.tickStale(t)
+	if len(f.drained) != 0 || f.stalledEvents() != 0 {
+		t.Fatalf("precondition: the answering seat was not held; drains=%v stalled=%d", f.drained, f.stalledEvents())
+	}
+
+	// Recycle with NO fresh serve: the stale serve predates the new cycle and
+	// must not hold it.
+	f.setInstanceToken(t, "incarnation-2")
+	f.now = f.now.Add(idleClaimNudgeBackoff)
+	f.idleFor(t, 10*time.Minute)
+	f.tick(t)
+	for i := 0; i < idleClaimNudgeMaxAttempts; i++ {
+		f.now = f.now.Add(idleClaimNudgeGrace + idleClaimNudgeBackoff)
+		f.idleFor(t, 10*time.Minute)
+		f.tick(t)
+	}
+	f.now = f.now.Add(idleClaimNudgeBackoff)
+	f.idleFor(t, 10*time.Minute)
+	f.tick(t)
+
+	if got := f.stalledEvents(); got != 1 {
+		t.Fatalf("execution.step_stalled events for a seat that stopped answering = %d, want the safety-net escalation", got)
+	}
+	if len(f.drained) != 1 || f.drained[0] != f.sessName {
+		t.Fatalf("drain requests for a seat that stopped answering = %v, want exactly one for %s", f.drained, f.sessName)
+	}
+}
+
 // TestExecutionBackstopRecordsWhichGateHeld: a hold leaves a durable
 // breadcrumb naming its gate, so an operator can tell a backstop that is
 // holding from one that is broken. Writes happen on transition only, and the

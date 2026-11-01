@@ -408,6 +408,60 @@ func TestSetCurrentClaimSkipsWhenUnchanged(t *testing.T) {
 	}
 }
 
+// TestRecordClaimNoopServeEmitsOneBatch proves the no-op serve stamp writes the
+// beadmeta.ClaimNoopServe* pair as ONE SetMetadataBatch — a reader never sees
+// half a serve — and that the instant advances across serves while a re-serve
+// within the same truncated second writes nothing.
+func TestRecordClaimNoopServeEmitsOneBatch(t *testing.T) {
+	b := sessionBeadFixture("s-1", "open", nil)
+	is, rec := recordingStore(t, b)
+
+	at := time.Date(2026, 11, 1, 18, 25, 49, 0, time.UTC)
+	wrote, err := is.RecordClaimNoopServe("s-1", "gcg-42", at)
+	if err != nil {
+		t.Fatalf("RecordClaimNoopServe: %v", err)
+	}
+	if !wrote {
+		t.Fatal("RecordClaimNoopServe reported no write for a fresh serve")
+	}
+	calls := rec.CallsForOp("SetMetadataBatch")
+	if len(calls) != 1 {
+		t.Fatalf("SetMetadataBatch calls = %d, want 1", len(calls))
+	}
+	want := map[string]string{
+		beadmeta.ClaimNoopServeWorkMetadataKey: "gcg-42",
+		beadmeta.ClaimNoopServeAtMetadataKey:   at.Format(time.RFC3339),
+	}
+	if calls[0].ID != "s-1" || !reflect.DeepEqual(calls[0].Metadata, want) {
+		t.Errorf("serve batch = (%q,%#v), want (s-1,%#v)", calls[0].ID, calls[0].Metadata, want)
+	}
+
+	// A re-serve in the same truncated second is indistinguishable to a reader.
+	if wrote, err = is.RecordClaimNoopServe("s-1", "gcg-42", at.Add(500*time.Millisecond)); err != nil {
+		t.Fatalf("same-second re-serve: %v", err)
+	}
+	if wrote {
+		t.Error("same-second re-serve reported a write; the value cannot have changed")
+	}
+	if n := len(rec.CallsForOp("SetMetadataBatch")); n != 1 {
+		t.Errorf("same-second re-serve emitted %d batches, want the original 1", n)
+	}
+
+	// A later serve advances the instant — that advancement is the evidence the
+	// execution-claim backstop reads, so it must not be compare-and-skipped.
+	later := at.Add(2 * time.Second)
+	if wrote, err = is.RecordClaimNoopServe("s-1", "gcg-42", later); err != nil {
+		t.Fatalf("later re-serve: %v", err)
+	}
+	if !wrote {
+		t.Error("later re-serve reported no write; the instant must advance")
+	}
+	calls = rec.CallsForOp("SetMetadataBatch")
+	if len(calls) != 2 || calls[1].Metadata[beadmeta.ClaimNoopServeAtMetadataKey] != later.Format(time.RFC3339) {
+		t.Errorf("later batch = %#v, want one advancing %q", calls, later.Format(time.RFC3339))
+	}
+}
+
 // TestSetCurrentClaimClearsWithEmptyValue proves the release side of the stamp:
 // clearing writes an empty value through the same single-key op, so a session
 // that no longer owns work stops naming a bead it cannot close.

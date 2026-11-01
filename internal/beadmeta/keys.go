@@ -440,6 +440,24 @@ const (
 	// step to ask `gc hook current` would close somebody else's bead. Every path
 	// that takes work off a session clears it.
 	CurrentClaimBeadIDMetadataKey = "current_claim_bead_id"
+
+	// ClaimNoopServeWorkMetadataKey records, on the CLAIMING SESSION's bead, the
+	// id of the in-progress claim that session most recently RE-SERVED through
+	// `gc hook --claim` without starting work on it (action=work,
+	// reason=existing_assignment: the seat woke, re-verified the claim it
+	// already holds, and stood by). Together with ClaimNoopServeAtMetadataKey it
+	// is the hook's structured no-op disposition — the fact the
+	// execution-claim backstop reads to tell a seat that answered a nudge and is
+	// deliberately waiting from one that never answered at all. The executor's
+	// own prose trail (dedup notes on the work bead) stays untouched: this pair
+	// is machine-written by the hook, never by the agent.
+	ClaimNoopServeWorkMetadataKey = "execution_claim_noop_work"
+
+	// ClaimNoopServeAtMetadataKey is the RFC3339 UTC instant of that re-serve.
+	// Its value advances on every re-serve by design, so the backstop can
+	// require a serve FRESHER than its last delivered nudge; a serve older than
+	// the current nudge cycle's marker is not an answer and never holds.
+	ClaimNoopServeAtMetadataKey = "execution_claim_noop_at"
 )
 
 // Dispatch metadata keys: a non-"gc."-prefixed family that sling writes onto

@@ -247,6 +247,13 @@ type hookClaimOps struct {
 	// which the step's shell can later learn which bead it is running.
 	// Best-effort.
 	StampSessionClaim hookStampSessionClaimFunc
+	// StampSessionNoopServe records, on the CLAIMING SESSION's own bead, that
+	// this invocation re-served an in-progress claim it already held without
+	// starting work on it (the existing-assignment tier). Together with the
+	// execution-claim backstop's own marker it is what tells a seat that
+	// answered a nudge and is standing by from one that never answered at all.
+	// Best-effort.
+	StampSessionNoopServe hookStampSessionNoopServeFunc
 	// ReadWorkMeta is the post-stamp authoritative readback used only to
 	// establish the durable lifecycle-start emission point.
 	ReadWorkMeta func(context.Context, string, []string, string, string) (beads.Bead, error)
@@ -321,6 +328,12 @@ type (
 	hookResolveSessionWorkDirFunc func(sessionID string) string
 	hookStampWorkMetaFunc         func(ctx context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error
 	hookStampSessionClaimFunc     func(sessionID, beadID string) error
+	// hookStampSessionNoopServeFunc records a no-op re-serve of beadID by the
+	// session identified by sessionID at instant at (action=work,
+	// reason=existing_assignment) — the structured disposition the
+	// execution-claim backstop reads to hold a live, answering seat instead of
+	// re-nudging it.
+	hookStampSessionNoopServeFunc func(sessionID, beadID string, at time.Time) error
 	hookPublishRunMapFunc         func(runID, beadID string, sessionKeys ...string) error
 	hookClaimReleaseFunc          func(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error)
 	// hookClaimReclaimFunc attempts a scoped stale-lease reclaim for exactly
@@ -502,6 +515,10 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 			if restamped, adopt := restampHookAdoption(bead, canonicalAssignee, verdict, *opts, *ops, dir, stderr); adopt {
 				bead = restamped
 				result.Assignee = restamped.Assignee
+				// The re-serve itself is the no-op disposition: record it before
+				// the result write so a seat that stands by on this claim carries
+				// the serve stamp the execution-claim backstop will read.
+				stampHookSessionClaimNoopServe(bead, *opts, *ops, stderr)
 				// minted=false: adoption returns work this session already owned.
 				return hookClaimResult{terminal: true, code: writeHookClaimWorkResultForBead(result, bead, *opts, *ops, dir, false, stdout, stderr)}
 			}
@@ -564,6 +581,9 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.StampSessionClaim == nil {
 		ops.StampSessionClaim = hookStampSessionCurrentClaim
+	}
+	if ops.StampSessionNoopServe == nil {
+		ops.StampSessionNoopServe = hookStampSessionNoopServe
 	}
 	if ops.PublishRunMap == nil {
 		ops.PublishRunMap = writeRunMap
@@ -2339,6 +2359,32 @@ func stampHookSessionCurrentClaim(bead beads.Bead, opts hookClaimOptions, ops ho
 	}
 	if err := ops.StampSessionClaim(sessionID, beadID); err != nil {
 		fmt.Fprintf(stderr, "gc hook --claim: recording current claim %s on session %s: %v\n", beadID, sessionID, err) //nolint:errcheck
+	}
+}
+
+// stampHookSessionClaimNoopServe records that this invocation re-served bead as
+// the session's existing assignment and stood by — the no-op disposition the
+// execution-claim backstop reads (beadmeta.ClaimNoopServe*) to hold a live,
+// answering seat as waiting on an unblock instead of re-entering the nudge →
+// exhausted → step_stalled → drain cycle on it (bead autosearch-rko).
+//
+// Like stampHookSessionCurrentClaim this is best-effort and never fails the
+// claim: the serve stamp is pacing evidence for the backstop, not a claim
+// precondition, and a seat whose serve went unrecorded simply falls back to the
+// ordinary bounded nudge cycle. The instant comes from ops.Now so tests drive
+// it with the same fake clock as the rest of the claim path.
+func stampHookSessionClaimNoopServe(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, stderr io.Writer) {
+	sessionID := hookClaimSessionID(opts.Env)
+	beadID := strings.TrimSpace(bead.ID)
+	if sessionID == "" || beadID == "" || ops.StampSessionNoopServe == nil {
+		return
+	}
+	at := time.Now().UTC()
+	if ops.Now != nil {
+		at = ops.Now().UTC()
+	}
+	if err := ops.StampSessionNoopServe(sessionID, beadID, at); err != nil {
+		fmt.Fprintf(stderr, "gc hook --claim: recording no-op serve of %s on session %s: %v\n", beadID, sessionID, err) //nolint:errcheck
 	}
 }
 

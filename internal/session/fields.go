@@ -443,6 +443,16 @@ var registry = slices.Concat([]Field{
 		"execution_claim_nudge_stalled_token"),
 	same(ClassAdvisory, true, sites(legacy("cmd/gc/execution_backstop.go", "poolExecutionBackstop.observeHold")), "execution_claim_hold"),
 	same(ClassAdvisory, true, sites(legacy("cmd/gc/execution_backstop.go", "poolExecutionBackstop.markStarted")), "execution_claim_started"),
+	// The named waiting-on outcome the execution backstop latches once per
+	// claim when a live assignee answers a delivered nudge with a documented
+	// no-op serve (bead autosearch-rko).
+	same(ClassAdvisory, true, sites(legacy("cmd/gc/execution_backstop.go", "poolExecutionBackstop.recordWaitingOn")),
+		"execution_claim_waiting_on_work", "execution_claim_waiting_on"),
+	// The hook's structured no-op disposition, machine-written on every
+	// existing-assignment re-serve and read by the same backstop to tell a
+	// seat that answered and is waiting from one that never answered.
+	same(ClassAdvisory, false, sites(op("internal/session/store.go", "Store.RecordClaimNoopServe")),
+		beadmeta.ClaimNoopServeWorkMetadataKey, beadmeta.ClaimNoopServeAtMetadataKey),
 	same(ClassAdvisory, false, sites(legacy("cmd/gc/drain_reminder.go", "writeDrainReminderMarker")), "drain_reminder_at", "drain_reminder_count",
 		"drain_reminder_drain", "drain_reminder_failed"),
 	same(ClassAdvisory, false, sites(legacy("cmd/gc/drain_reminder.go", "noteDrainReminderHold")), "drain_reminder_hold"),

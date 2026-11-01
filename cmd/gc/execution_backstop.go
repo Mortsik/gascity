@@ -142,6 +142,21 @@ const (
 	// is written only when the reason changes and cleared once the backstop can
 	// act again or the claim is gone.
 	executionClaimHoldKey = "execution_claim_hold"
+	// executionClaimWaitingOnWorkKey latches, as the work bead id, the claim
+	// this row last reported as waiting-on. With executionClaimWaitingOnKey (the
+	// RFC3339 instant) it is the NAMED waiting-on outcome the backstop records
+	// once per claim when a live assignee answers a delivered nudge with a
+	// documented no-op serve (beadmeta.ClaimNoopServeWorkMetadataKey fresher
+	// than the marker's last attempt) and stands by: the journal spam class
+	// where step_stalled refires every latch window although the executor is
+	// awake, escalated once, and deduping while it awaits an unblock.
+	// Deliberately NOT token-scoped, unlike the stalled latch: a seat that keeps
+	// answering across recycles on the SAME claim is waiting, whatever
+	// incarnation answered; a recycled seat that stops answering loses the hold
+	// because its fresh nudge cycle postdates the serve.
+	executionClaimWaitingOnWorkKey = "execution_claim_waiting_on_work"
+	// executionClaimWaitingOnKey is the RFC3339 instant that latch was written.
+	executionClaimWaitingOnKey = "execution_claim_waiting_on"
 )
 
 // Execution-backstop hold reasons recorded in executionClaimHoldKey, alongside
@@ -158,7 +173,15 @@ const (
 	// (v5.10x, ga-ba7k1f): the claimed bead's step started this incarnation,
 	// so once its nudges are spent, or it has none to send, the seat is held
 	// rather than drained.
-	executionHoldExecuting     = "executing"
+	executionHoldExecuting = "executing"
+	// executionHoldWaitingOn names the gate that holds a seat whose claim never
+	// started but whose assignee is alive and ANSWERING: the hook re-served the
+	// existing assignment (a documented no-op disposition) after the backstop's
+	// last delivered nudge. Nudging it again re-delivers a directive it just
+	// deduped, and draining it throws away a claim it is deliberately holding
+	// while it awaits an unblock, so the seat waits instead — the unblock, a
+	// release, or a dead assignee are the exits, not another nudge.
+	executionHoldWaitingOn     = "waiting_on_unblock"
 	executionHoldSnapshotError = "snapshot_error"
 )
 
@@ -374,6 +397,15 @@ func (p poolExecutionBackstop) resolve(s beads.Bead, _ map[string]beads.Bead, se
 		p.observeHold(p.store, &s, executionHoldExecuting, p.stdout)
 		return backstopTarget{}, backstopResolutionHold
 	}
+	// A seat that ANSWERED the current nudge cycle with a documented no-op
+	// serve is deliberately standing by on this claim; nudging it again
+	// re-delivers a directive it just deduped, and draining it throws the
+	// claim away, so the backstop holds instead (bead autosearch-rko).
+	if p.answeredNoopServeHolds(s, target) {
+		p.observeHold(p.store, &s, executionHoldWaitingOn, p.stdout)
+		p.recordWaitingOn(&s, target)
+		return backstopTarget{}, backstopResolutionHold
+	}
 	return target, backstopResolutionOutstanding
 }
 
@@ -475,6 +507,49 @@ func (p poolExecutionBackstop) state(s beads.Bead, target backstopTarget) (same 
 		strings.TrimSpace(s.Metadata[executionClaimNudgeStoreRefKey]) == target.StoreRef &&
 		strings.TrimSpace(s.Metadata[executionClaimNudgeTokenKey]) == strings.TrimSpace(s.Metadata["instance_token"])
 	return same, atoiOr0(s.Metadata[executionClaimNudgeCountKey]), parseRFC3339OrZero(s.Metadata[executionClaimNudgeAtKey])
+}
+
+// answeredNoopServeHolds reports whether the seat answered the CURRENT nudge
+// cycle for target with a documented no-op serve: the hook re-served this exact
+// claim (beadmeta.ClaimNoopServeWorkMetadataKey) at an instant at or after the
+// cycle's own marker (executionClaimNudgeAtKey — its last delivered attempt, or
+// its observation when none was delivered yet). At-or-after rather than strictly
+// after, because both instants are RFC3339-truncated to seconds: a serve in the
+// same second as the nudge it answers is an answer.
+//
+// The serve is deliberately NOT compared against the instance token: a seat
+// that keeps answering across recycles on the SAME claim is waiting, whatever
+// incarnation answered. What keeps a STALE serve from holding a fresh cycle is
+// the marker side — same requires the marker to belong to this incarnation, and
+// a recycled seat gets a fresh marker (and with it a fresh nudge cycle) before
+// any hold can apply, so a recycled seat that stops answering falls back to the
+// ordinary bounded stall. An unparseable serve instant never holds.
+func (p poolExecutionBackstop) answeredNoopServeHolds(s beads.Bead, target backstopTarget) bool {
+	if strings.TrimSpace(s.Metadata[beadmeta.ClaimNoopServeWorkMetadataKey]) != target.ID {
+		return false
+	}
+	same, _, last := p.state(s, target)
+	if !same || last.IsZero() {
+		return false
+	}
+	serveAt := parseRFC3339OrZero(s.Metadata[beadmeta.ClaimNoopServeAtMetadataKey])
+	return !serveAt.IsZero() && !serveAt.Before(last)
+}
+
+// recordWaitingOn latches the NAMED waiting-on outcome for target, once per
+// claim: the work bead id and the instant the backstop first held it. A
+// standing hold rewrites nothing (the check is the work id it latched), and a
+// recycled incarnation answering again on the same claim adds no second
+// outcome; the next claim this row holds rewrites the pair. Best-effort like
+// every marker write: a failed write costs a retry next tick, never the hold.
+func (p poolExecutionBackstop) recordWaitingOn(s *beads.Bead, target backstopTarget) {
+	if strings.TrimSpace(s.Metadata[executionClaimWaitingOnWorkKey]) == target.ID {
+		return
+	}
+	writeSessionMetadata(p.store, s, map[string]string{
+		executionClaimWaitingOnWorkKey: target.ID,
+		executionClaimWaitingOnKey:     p.now.UTC().Format(time.RFC3339),
+	}, "execution-claim-nudge", p.stdout)
 }
 
 // content is the agent's configured claim nudge. A seat whose stamp shows the
@@ -726,9 +801,9 @@ func writeExecutionClaimMarker(store beads.Store, s *beads.Bead, target backstop
 }
 
 // clearExecutionClaimMarker wipes the state machine — including the escalation
-// latch and the hold breadcrumb — so the next claim this slot takes starts a
-// fresh window. No-op when there is nothing to clear, so steady-state ticks
-// stay write-free.
+// latch, the waiting-on outcome and the hold breadcrumb — so the next claim
+// this slot takes starts a fresh window. No-op when there is nothing to clear,
+// so steady-state ticks stay write-free.
 func clearExecutionClaimMarker(store beads.Store, s *beads.Bead, stdout io.Writer) {
 	keys := []string{
 		executionClaimNudgeWorkKey,
@@ -740,6 +815,8 @@ func clearExecutionClaimMarker(store beads.Store, s *beads.Bead, stdout io.Write
 		executionClaimNudgeStalledKey,
 		executionClaimNudgeStalledTokenKey,
 		executionClaimHoldKey,
+		executionClaimWaitingOnWorkKey,
+		executionClaimWaitingOnKey,
 	}
 	dirty := false
 	for _, key := range keys {

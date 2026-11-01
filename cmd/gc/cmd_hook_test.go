@@ -376,6 +376,74 @@ func TestDoHookClaimReturnsExistingAssignment(t *testing.T) {
 	}
 }
 
+// TestDoHookClaimStampsNoopServeOnExistingAssignment pins the hook half of the
+// waiting-on contract (bead autosearch-rko): re-serving a claim the session
+// already holds (action=work, reason=existing_assignment) is a documented
+// NO-OP serve, so the claim path must record it on the session row — with the
+// instant from the claim path's own clock — for the execution-claim backstop to
+// read. A MINTED claim (the ready-assignment tier) starts work, it is not a
+// seat standing by, so it records no serve.
+func TestDoHookClaimStampsNoopServeOnExistingAssignment(t *testing.T) {
+	existingRunner := func(string, string) (string, error) {
+		return `[{"id":"hw-1","status":"in_progress","assignee":"worker-1","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body"}}]`, nil
+	}
+	readyRunner := func(string, string) (string, error) {
+		return `[{"id":"hw-ready","status":"open","assignee":"worker-1","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body"}}]`, nil
+	}
+	fixedNow := time.Date(2026, 11, 1, 18, 25, 49, 0, time.UTC)
+
+	run := func(runner WorkQueryRunner) (int, []string, [][2]string) {
+		var serves [][2]string
+		var instants []string
+		ops := hookClaimOps{
+			Runner: runner,
+			Claim: func(_ context.Context, _ string, _ []string, _ string, assignee string) (beads.Bead, bool, error) {
+				return beads.Bead{ID: "hw-ready", Status: "in_progress", Assignee: assignee}, true, nil
+			},
+			ListContinuation: func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
+				return nil, nil
+			},
+			StampSessionClaim: func(string, string) error { return nil },
+			StampSessionNoopServe: func(sessionID, beadID string, at time.Time) error {
+				serves = append(serves, [2]string{sessionID, beadID})
+				instants = append(instants, at.UTC().Format(time.RFC3339))
+				return nil
+			},
+			Now: func() time.Time { return fixedNow },
+		}
+		opts := hookClaimOptions{
+			Assignee:           "worker-1",
+			IdentityCandidates: []string{"worker-1"},
+			RouteTargets:       []string{"worker"},
+			JSON:               true,
+			Env:                []string{"GC_SESSION_ID=sess-1"},
+		}
+		var stdout, stderr bytes.Buffer
+		code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr)
+		return code, instants, serves
+	}
+
+	code, instants, serves := run(existingRunner)
+	if code != 0 {
+		t.Fatalf("doHookClaim(existing) = %d, want 0", code)
+	}
+	if len(serves) != 1 || serves[0] != [2]string{"sess-1", "hw-1"} {
+		t.Fatalf("no-op serves = %v, want one (sess-1, hw-1)", serves)
+	}
+	if len(instants) != 1 || instants[0] != fixedNow.Format(time.RFC3339) {
+		t.Fatalf("serve instants = %v, want the claim clock's %s", instants, fixedNow.Format(time.RFC3339))
+	}
+
+	// A minted ready-assignment claim is work STARTING, not a seat standing by.
+	code, _, serves = run(readyRunner)
+	if code != 0 {
+		t.Fatalf("doHookClaim(ready) = %d, want 0", code)
+	}
+	if len(serves) != 0 {
+		t.Fatalf("minted claim recorded no-op serves %v, want none", serves)
+	}
+}
+
 func TestDoHookClaimPromotesReadyAssignment(t *testing.T) {
 	runner := func(string, string) (string, error) {
 		return `[{"id":"hw-ready","status":"open","assignee":"worker-alias","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body"}}]`, nil
