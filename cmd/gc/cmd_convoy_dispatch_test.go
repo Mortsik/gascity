@@ -920,6 +920,18 @@ func TestWorkflowFinalizeRetriesWhenEverySourceWorkflowStoreFailsToOpen(t *testi
 // error — the failure mode the drift/routine split exists to avoid — so the
 // boundary needs a pin of its own, not just an intention in a comment.
 func TestSourceWorkflowStoresListerNoCandidatesStaysTerminal(t *testing.T) {
+	// The empty cityPath is the fixture — this test pins the no-candidates
+	// arm — but two ambient channels can fill candidates in behind its back:
+	// GC_CITY/GC_BEADS inherited from a managed session, and findCity walking
+	// up from a cwd inside a real city (the pre-push gate runs from lifecycle
+	// worktrees under <city>/.gc/worktrees). Either one turns the nil
+	// openStore fixture into a SIGSEGV instead of the terminal error under
+	// test, so pin both off: clearGCEnv for the explicit env, a fresh cwd for
+	// the walk-up (its ceiling is set to the temp parent, so discovery stops
+	// there).
+	clearGCEnv(t)
+	t.Chdir(t.TempDir())
+
 	_, err := makeSourceWorkflowStoresListerWithOpenStore("", nil, nil)()
 	if err == nil {
 		t.Fatal("lister err = nil; want the no-candidates config error surfaced")
