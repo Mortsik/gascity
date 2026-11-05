@@ -19,7 +19,18 @@
 #   replace (                                 (grouped block)
 #       foo => bar v1.0.0-pseudo
 #   )
+#
+# agentforge fork exception (owner decision 2026-11-05): exactly
+#   github.com/steveyegge/beads => github.com/Mortsik/beads v1.3.4-af.1
+# passes — the beads fork keeps the upstream module path, so a replace is the
+# only way to link it. Any other module, source version, path or tag is
+# still checked by the rules below. Twin: forkAllowedReplace in
+# cmd/gc/storage_provider_bundle_boundary_test.go.
 set -euo pipefail
+
+FORK_REPLACE_OLD="github.com/steveyegge/beads"
+FORK_REPLACE_NEW="github.com/Mortsik/beads"
+FORK_REPLACE_VERSION="v1.3.4-af.1"
 
 gomod="${1:-go.mod}"
 
@@ -42,9 +53,20 @@ check_replace_rhs() {
 	path_part="$rhs"
 
 	# Split into path and optional version (last space-separated token).
-	if [[ "$rhs" =~ ^([^ ]+)[[:space:]]+([^ ]+)$ ]]; then
+	if [[ "$rhs" =~ ^([^[:space:]]+)[[:space:]]+([^[:space:]]+)$ ]]; then
 		path_part="${BASH_REMATCH[1]}"
 		version="${BASH_REMATCH[2]}"
+	fi
+
+	# The fork exception: the whole directive must match, source side included.
+	local lhs="${stripped%%=>*}"
+	lhs="${lhs#"${lhs%%[![:space:]]*}"}"
+	lhs="${lhs#replace[[:space:]]}"
+	lhs="${lhs#"${lhs%%[![:space:]]*}"}"
+	lhs="${lhs%"${lhs##*[![:space:]]}"}"
+	if [[ "$lhs" == "$FORK_REPLACE_OLD" && "$path_part" == "$FORK_REPLACE_NEW" &&
+		"$version" == "$FORK_REPLACE_VERSION" ]]; then
+		return 0
 	fi
 
 	# Local filesystem paths are always unreleased.
@@ -81,16 +103,20 @@ check_replace_rhs() {
 failed=0
 in_replace_block=0
 while IFS= read -r line; do
-	stripped="${line#"${line%%[! ]*}"}"
+	# Go accepts any blank (space or tab) between tokens; normalize the edges
+	# and match the verb with [[:space:]] so a tab-separated directive is never
+	# skipped as "not a replace".
+	stripped="${line#"${line%%[![:space:]]*}"}"
+	stripped="${stripped%"${stripped##*[![:space:]]}"}"
 
 	# Detect opening of a grouped block: replace (
-	if [[ "$stripped" == "replace (" ]]; then
+	if [[ "$stripped" =~ ^replace[[:space:]]*\([[:space:]]*(//.*)?$ ]]; then
 		in_replace_block=1
 		continue
 	fi
 
 	# Detect closing of a grouped block.
-	if [[ $in_replace_block -eq 1 && "$stripped" == ")" ]]; then
+	if [[ $in_replace_block -eq 1 && "$stripped" =~ ^\)[[:space:]]*(//.*)?$ ]]; then
 		in_replace_block=0
 		continue
 	fi
@@ -100,16 +126,17 @@ while IFS= read -r line; do
 		[[ -z "$stripped" || "$stripped" == //* ]] && continue
 		[[ "$stripped" == *"=>"* ]] || continue
 		rhs="${stripped#*=>}"
-		rhs="${rhs#"${rhs%%[! ]*}"}"
+		rhs="${rhs#"${rhs%%[![:space:]]*}"}"
 		check_replace_rhs "$stripped" "$rhs" || failed=1
 		continue
 	fi
 
-	# Single-line replace: starts with "replace " but is not "replace ("
-	[[ "$stripped" == replace\ * && "$stripped" != "replace (" ]] || continue
+	# Single-line replace: the verb followed by a blank (the block opener was
+	# handled above).
+	[[ "$stripped" =~ ^replace[[:space:]]+ ]] || continue
 	[[ "$stripped" == *"=>"* ]] || continue
 	rhs="${stripped#*=>}"
-	rhs="${rhs#"${rhs%%[! ]*}"}"
+	rhs="${rhs#"${rhs%%[![:space:]]*}"}"
 	check_replace_rhs "$stripped" "$rhs" || failed=1
 done < "$gomod"
 

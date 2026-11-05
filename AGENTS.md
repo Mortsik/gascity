@@ -274,6 +274,13 @@ and policy targets, and a green `go test` is not evidence a change passes CI.
 - **Go-native twins** (`make test-go`, `make check-go`, `make
   test-acceptance-go`, `make test-integration-go`, `make test-fast-parallel`)
   exist for offline work and hosts Bazel does not serve (macOS jobs).
+- **Module graph.** `go.mod` pins released `vX.Y.Z` dependencies and carries
+  no `replace` (guards: `scripts/check-gomod-replace.sh`,
+  `TestModuleGraphCarriesNoReplaceDirective`). agentforge fork exception
+  (owner decision 2026-11-05): exactly `github.com/steveyegge/beads =>
+  github.com/Mortsik/beads v1.3.4-af.1`, the beads fork with the ids-first
+  counts/ready query fixes; it keeps the upstream module path, so only a
+  replace can link it. Both guards admit that one directive and nothing else.
 - **Never run `go clean -cache`** — it corrupts shared build caches.
   `go clean -testcache` is fine. Maintainers on the shared build hosts: read
   `engdocs/contributors/maintainer-environment.md` before touching `GOCACHE`
