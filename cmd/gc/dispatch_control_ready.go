@@ -413,12 +413,14 @@ func controlReadyLegReady(dir string, binding beads.Store, includeEphemeral bool
 // loudly: a work query has nowhere to say "this answer is short", so a partial
 // union must not read as a complete queue.
 //
-// Every call reads afresh; nothing is reused by a later scan. The serve loop
-// re-scans only after it has written (processed a control bead) or after it has
-// waited for another writer (idle re-poll, event wake, follow sweep), so a
-// reused answer is stale on both arms: it re-offers the control bead the loop
-// just closed, and it hides the control bead a worker's close just made ready
-// (ga-vnycm2.9).
+// Every call reads afresh unless the scope database is provably unchanged.
+// The serve loop re-scans only after it has written (processed a control bead)
+// or after it has waited for another writer (idle re-poll, event wake, follow
+// sweep), so an answer reused across a write is stale on both arms: it
+// re-offers the control bead the loop just closed, and it hides the control
+// bead a worker's close just made ready (ga-vnycm2.9). The one reuse allowed is
+// keyed on the database content hash, which every such write changes — see
+// dispatch_control_ready_reuse.go.
 //
 // One Ready read per leg is the whole cost of a scan (ga-vnycm2.19): one
 // `bd ready` call on a bd leg, in-process on file, SQLite and native legs. Each
@@ -452,10 +454,20 @@ func controlReadyLegsReady(dir, cityPath string, cfg *config.City) (ready []bead
 		}
 	}()
 	legs := make([][]beads.Bead, 0, len(sources))
-	for _, source := range sources {
+	for i, source := range sources {
 		// Read the engine, not the one-shot emitter around a binding leg: the
 		// scan never writes, so the emitter adds nothing.
-		leg, err := controlReadyLegReady(dir, bindingEngine(source), true)
+		engine := bindingEngine(source)
+		var leg []beads.Bead
+		var err error
+		if i == 0 && len(owned) == 1 {
+			// controlReadyLegSources puts the scope's own (owned) leg first;
+			// only that leg may be answered by change-token-gated reuse (see
+			// dispatch_control_ready_reuse.go). Binding legs always read afresh.
+			leg, err = controlReadyReadScopedLeg(dir, cityPath, cfg, engine)
+		} else {
+			leg, err = controlReadyLegReady(dir, engine, true)
+		}
 		if err != nil {
 			return nil, true, err
 		}
