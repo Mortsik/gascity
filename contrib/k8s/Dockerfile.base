@@ -29,9 +29,9 @@ ARG GRPC_VERSION=1.83.2
 # Each build applies these in ascending-constraint order: a later `go get` can
 # roll an earlier one back, and only the rolled-back module's own assertion
 # would catch it. XMOD_VERSION is the newest constraint, so it goes last.
-ARG XCRYPTO_VERSION=0.57.0
-ARG XNET_VERSION=0.60.0
-ARG XTEXT_VERSION=0.42.0
+ARG XCRYPTO_VERSION=0.58.0
+ARG XNET_VERSION=0.62.0
+ARG XTEXT_VERSION=0.43.0
 ARG XMOD_VERSION=0.41.0
 ARG THRIFT_VERSION=0.24.0
 ARG DOLT_TOOLCHAIN_RELEASE=20260611_0.0.5_trixie

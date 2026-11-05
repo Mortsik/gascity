@@ -204,7 +204,8 @@ func TestStorageSurfaceCompilesIdenticallyWithAndWithoutCGO(t *testing.T) {
 
 // TestModuleGraphCarriesNoReplaceDirective is the module-graph guarantee a
 // downstream fork builds on: this repo's dependencies are exactly what its
-// manifest names, at released versions, with nothing redirected. It is the
+// manifest names, at released versions, with nothing redirected — save the
+// agentforge fork's single beads exception (forkAllowedReplace). It is the
 // tree-side companion to scripts/check-gomod-replace.sh's released-semver-only
 // policy — that script gates what a change adds, this arm gates the result.
 //
@@ -221,11 +222,46 @@ func TestModuleGraphCarriesNoReplaceDirective(t *testing.T) {
 		t.Fatalf("go.mod has replace directives this guard cannot parse (lines %v); a manifest we cannot read is a violation, not a pass", malformed)
 	}
 	for _, directive := range directives {
+		if forkAllowedReplace(directive) {
+			continue
+		}
 		t.Errorf("go.mod line %d replaces %q with %q; this module graph carries no replace directive, so a build resolves the dependencies the manifest names and nothing else",
 			directive.line, directive.oldPath, directive.newPath)
 	}
 	if anyGoWorkFile(t, root) {
 		t.Error("the tree commits a go.work; a workspace redirects the module graph for every go invocation started at or below it")
+	}
+}
+
+// forkAllowedReplace is the agentforge fork's one owner-approved exception
+// (2026-11-05): beads is redirected to the Mortsik/beads fork tag, which keeps
+// the steveyegge/beads module path and carries the ids-first counts/ready
+// query fixes the embedded native store needs. Only that exact pair at that
+// exact tag passes; anything else — another module, a path, a branch, a
+// different tag — is still a violation.
+func forkAllowedReplace(d replaceDirective) bool {
+	return d.oldPath == "github.com/steveyegge/beads" && d.oldVersion == "" &&
+		d.newPath == "github.com/Mortsik/beads" && d.newVersion == "v1.3.4-af.1"
+}
+
+func TestForkAllowedReplaceAdmitsOnlyTheExactDirective(t *testing.T) {
+	cases := map[string]bool{
+		"replace github.com/steveyegge/beads => github.com/Mortsik/beads v1.3.4-af.1":         true,
+		"replace (\n\tgithub.com/steveyegge/beads => github.com/Mortsik/beads v1.3.4-af.1\n)": true,
+		"replace github.com/steveyegge/beads => github.com/Mortsik/beads v1.3.4-af.2":         false,
+		"replace github.com/steveyegge/beads v1.3.1 => github.com/Mortsik/beads v1.3.4-af.1":  false,
+		"replace github.com/steveyegge/beads => github.com/example/beads v1.3.4-af.1":         false,
+		"replace github.com/example/other => github.com/Mortsik/beads v1.3.4-af.1":            false,
+		"replace github.com/steveyegge/beads => ../beads":                                     false,
+	}
+	for body, want := range cases {
+		directives, malformed := replaceDirectives("module example.com/m\n\n" + body + "\n")
+		if len(malformed) > 0 || len(directives) != 1 {
+			t.Fatalf("%q: parsed %d directives, malformed lines %v", body, len(directives), malformed)
+		}
+		if got := forkAllowedReplace(directives[0]); got != want {
+			t.Errorf("%q: forkAllowedReplace = %v, want %v", body, got, want)
+		}
 	}
 }
 

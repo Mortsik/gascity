@@ -231,6 +231,42 @@ func TestCheckGomodReplaceGuard(t *testing.T) {
 		})
 	}
 
+	// The agentforge fork's single owner-approved exception: exactly this
+	// directive passes; every near miss stays blocked.
+	forkExceptionCases := []struct {
+		name     string
+		block    string
+		wantFail bool
+	}{
+		{"fork_exception_single_line", "replace github.com/steveyegge/beads => github.com/Mortsik/beads v1.3.4-af.1", false},
+		{"fork_exception_block", "replace (\n\tgithub.com/steveyegge/beads => github.com/Mortsik/beads v1.3.4-af.1\n)", false},
+		{"fork_exception_inline_comment", "replace github.com/steveyegge/beads => github.com/Mortsik/beads v1.3.4-af.1 // perf fork", false},
+		{"fork_exception_tab_separated", "replace\tgithub.com/steveyegge/beads\t=>\tgithub.com/Mortsik/beads\tv1.3.4-af.1", false},
+		{"fork_exception_tab_block", "replace\t(\n\tgithub.com/steveyegge/beads\t=>\tgithub.com/Mortsik/beads\tv1.3.4-af.1\n)", false},
+		{"fork_exception_other_tag", "replace github.com/steveyegge/beads => github.com/Mortsik/beads v1.3.4-af.2", true},
+		{"fork_exception_tab_separated_other_tag", "replace\tgithub.com/steveyegge/beads => github.com/Mortsik/beads v1.3.4-af.2", true},
+		{"fork_exception_tab_block_prerelease", "replace\t(\n\tgithub.com/steveyegge/beads => github.com/Mortsik/beads v1.3.4-rc.1\n\t)", true},
+		{"fork_exception_prerelease", "replace github.com/steveyegge/beads => github.com/Mortsik/beads v1.3.4-rc.1", true},
+		{"fork_exception_pseudo_version", "replace github.com/steveyegge/beads => github.com/Mortsik/beads v1.3.5-0.20261105170600-28021b55b134", true},
+		{"fork_exception_branch", "replace github.com/steveyegge/beads => github.com/Mortsik/beads af/v1.3.4-perf", true},
+		{"fork_exception_versioned_source", "replace github.com/steveyegge/beads v1.3.1 => github.com/Mortsik/beads v1.3.4-af.1", true},
+		{"fork_exception_other_source", "replace github.com/example/other => github.com/Mortsik/beads v1.3.4-af.1", true},
+		{"fork_exception_other_target", "replace github.com/steveyegge/beads => github.com/example/beads v1.3.4-af.1", true},
+		{"fork_exception_local_path", "replace github.com/steveyegge/beads => ../beads", true},
+	}
+	for _, tc := range forkExceptionCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			out, code := runScript(t, "module github.com/example/mod\n\ngo 1.22\n\n"+tc.block+"\n")
+			if tc.wantFail && code == 0 {
+				t.Fatalf("expected non-zero exit for fork-exception case %q, got 0\n%s", tc.name, out)
+			}
+			if !tc.wantFail && code != 0 {
+				t.Fatalf("expected exit 0 for fork-exception case %q, got %d\n%s", tc.name, code, out)
+			}
+		})
+	}
+
 	t.Run("failure_message_mentions_policy", func(t *testing.T) {
 		gomod := "module github.com/example/mod\n\ngo 1.22\n\nreplace github.com/steveyegge/beads => ./local/beads\n"
 		out, code := runScript(t, gomod)
